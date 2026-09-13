@@ -484,6 +484,18 @@ class NodeClient:
         """Cancel a running WDA job."""
         return await self._rpc("IosCancelWdaJob", {"nodeId": node_id, "jobId": job_id})
 
+    async def ios_runner_control(
+        self, node_id: str, device_id: str, udid: str, action: str
+    ) -> dict[str, Any]:
+        """Start/stop/restart the persistent device-control runner loop on a
+        claimed device (no re-claim, no credential change). action ∈
+        {"start","stop","restart"}.
+        """
+        return await self._rpc(
+            "IosRunnerControl",
+            {"nodeId": node_id, "deviceId": device_id, "udid": udid, "action": action},
+        )
+
     async def get_ios_wda_job_status(self, node_id: str, job_id: str) -> dict[str, Any]:
         """Query WDA job status from registry snapshot."""
         return await self._rpc("GetIosWdaJobStatus", {"nodeId": node_id, "jobId": job_id})

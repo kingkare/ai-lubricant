@@ -322,6 +322,149 @@ def _submit_trusted(adsid: str, idms_token: str, code: str, headers: dict[str, s
 
 
 # --------------------------------------------------------------------------- #
+# SMS 2FA（移植自 isideload apple_account.rs：trusted-phone JSON 流程）
+# --------------------------------------------------------------------------- #
+# isideload 的 SMS 路径走 gsa.apple.com/auth 的 JSON IDMS 端点（与 trusted-device
+# 的 plist 端点不同）。三步：列号码 → PUT /auth/verify/phone 发短信 →
+# POST /auth/verify/phone/securitycode 验码。Content-Type 是 application/json，
+# 不是 text/x-xml-plist——_sms_headers 单独构造。
+_GS_AUTH = "https://gsa.apple.com/auth"
+_GS_SMS_SEND = "https://gsa.apple.com/auth/verify/phone"
+_GS_SMS_VERIFY = "https://gsa.apple.com/auth/verify/phone/securitycode"
+
+
+def _sms_headers(adsid: str, idms_token: str, headers: dict[str, str]) -> dict[str, str]:
+    """isideload get_sms/post_sms/put_sms：JSON 端点的 2FA 头。"""
+    out = _base_request_headers()
+    # base 的 plist Accept/Content-Type 改成 JSON（与 isideload base_headers(sms=True) 一致）
+    out["Content-Type"] = "application/json"
+    out["Accept"] = "application/json"
+    for key in ("X-Mme-Device-Id", "X-Apple-I-MD", "X-Apple-I-MD-M"):
+        out[key] = headers.get(key, "")
+    out["X-Apple-Identity-Token"] = _identity_token(adsid, idms_token)
+    out["X-Apple-I-MD-RINFO"] = headers.get("X-Apple-I-MD-RINFO", "")
+    return out
+
+
+class _SmsServiceError(GsaError):
+    """Apple SMS 端点返回的 serviceErrors（可携带可重试/终止信号）。"""
+
+    def __init__(self, code: str, title: str, message: str) -> None:
+        super().__init__(f"{code}: {title} - {message}")
+        self.code = code
+
+
+def _parse_sms_service_errors(text: str) -> list[dict[str, str]]:
+    """isideload parse_sms_service_error：从 serviceErrors 数组抽 {code,title,message}。"""
+    try:
+        import json as _json
+        payload = _json.loads(text)
+    except Exception:  # noqa: BLE001 — 非 JSON 错误体不是 SMS 服务错误
+        return []
+    errors = payload.get("serviceErrors") if isinstance(payload, dict) else None
+    if not isinstance(errors, list) or not errors:
+        return []
+    out: list[dict[str, str]] = []
+    for entry in errors:
+        if not isinstance(entry, dict):
+            continue
+        out.append({
+            "code": str(entry.get("code") or "unknown"),
+            "title": str(entry.get("title") or ""),
+            "message": str(entry.get("message") or ""),
+        })
+    return out
+
+
+def list_trusted_phone_numbers(adsid: str, idms_token: str, headers: dict[str, str]) -> list[dict[str, Any]]:
+    """GET gsa.apple.com/auth → trustedPhoneNumbers（isideload get_trusted_numbers）。
+
+    返回 [{"id": int, "number_with_dial_code": str, ...}]；空列表意味着账号无受信
+    电话号码，SMS 2FA 不可用。
+    """
+    status, _hdrs, content = _http(
+        "GET", _GS_AUTH, _sms_headers(adsid, idms_token, headers), b""
+    )
+    if status != 200:
+        raise GsaError(f"Apple 未返回受信电话号码 (HTTP {status})：{content[:200]!r}")
+    try:
+        import json as _json
+        payload = _json.loads(content)
+    except Exception as exc:  # noqa: BLE001
+        raise GsaError(f"受信电话号码响应无法解析：{exc}") from exc
+    numbers = payload.get("trustedPhoneNumbers") if isinstance(payload, dict) else None
+    if not isinstance(numbers, list):
+        return []
+    return [{"id": n.get("id"), "number_with_dial_code": n.get("numberWithDialCode")} for n in numbers if isinstance(n, dict)]
+
+
+# SMS 错误码分类（isideload apple_account.rs）：
+#   -21669      验证码错误 → 可重试（保留 pending）
+#   -22979/-22981 短信重发受限，但上一条码仍有效 → 仍进输码态
+#   -28248      未知 2FA / 人工处理 → 终止
+SMS_RETRYABLE_CODES = {"-21669"}
+SMS_CODE_STILL_VALID_CODES = {"-22979", "-22981"}
+SMS_TERMINAL_CODES = {"-28248"}
+
+
+def _raise_sms_error(status: int, content: bytes) -> None:
+    """把 SMS 端点的错误体映射成可分类的 GsaError（保留码供路由层判定重试）。"""
+    text = content.decode("utf-8", "replace") if isinstance(content, (bytes, bytearray)) else str(content)
+    for entry in _parse_sms_service_errors(text):
+        code = entry["code"]
+        if code in SMS_TERMINAL_CODES:
+            raise GsaError(f"Apple 要求额外的二次认证步骤 ({code})：{entry['message']}")
+        # 可重试/旧码仍有效的错误统一标 GsaError；路由层按 code 决定保留 pending。
+        raise _SmsServiceError(code, entry["title"], entry["message"])
+    raise GsaError(f"Apple SMS 请求失败 (HTTP {status})：{text[:200]}" )
+
+
+def send_sms_code(adsid: str, idms_token: str, phone_id: int, headers: dict[str, str]) -> None:
+    """PUT gsa.apple.com/auth/verify/phone {phoneNumber:{id},mode:"sms"}（isideload send_sms_2fa）。
+
+    -22979/-22981：Apple 拒发新短信但旧码仍有效，**不算失败**——路由层让用户继续输码。
+    """
+    import json as _json
+    body = _json.dumps({"phoneNumber": {"id": phone_id}, "mode": "sms"}).encode()
+    status, _hdrs, content = _http(
+        "PUT", _GS_SMS_SEND, _sms_headers(adsid, idms_token, headers), body
+    )
+    if status in (200, 412):
+        return  # 412 = 已有活跃 challenge（旧码仍有效），isideload 也判成功
+    if status >= 400:
+        text = content.decode("utf-8", "replace") if isinstance(content, (bytes, bytearray)) else str(content)
+        for entry in _parse_sms_service_errors(text):
+            if entry["code"] in SMS_CODE_STILL_VALID_CODES:
+                return  # 旧码仍有效，继续进输码态
+            raise _SmsServiceError(entry["code"], entry["title"], entry["message"])
+    # 非预期状态也按失败
+    raise GsaError(f"Apple SMS 发送失败 (HTTP {status})：{content[:200]!r}")
+
+
+def verify_sms_code(adsid: str, idms_token: str, phone_id: int, code: str, headers: dict[str, str]) -> None:
+    """POST gsa.apple.com/auth/verify/phone/securitycode（isideload verify_sms_2fa）。
+
+    -21669 验证码错误 → 抛 _SmsServiceError(code="-21669")，路由层保留 pending 让用户重输。
+    其他 serviceErrors 终止当前 pending。
+    """
+    import json as _json
+    body = _json.dumps({
+        "securityCode": {"code": code},
+        "phoneNumber": {"id": phone_id},
+        "mode": "sms",
+    }).encode()
+    status, _hdrs, content = _http(
+        "POST", _GS_SMS_VERIFY, _sms_headers(adsid, idms_token, headers), body
+    )
+    if status == 200:
+        return
+    text = content.decode("utf-8", "replace") if isinstance(content, (bytes, bytearray)) else str(content)
+    for entry in _parse_sms_service_errors(text):
+        raise _SmsServiceError(entry["code"], entry["title"], entry["message"])
+    raise GsaError(f"Apple SMS 验证失败 (HTTP {status})：{text[:200]}")
+
+
+# --------------------------------------------------------------------------- #
 # App-token 交换（developer services 用的按服务 Xcode token）
 # --------------------------------------------------------------------------- #
 _XCODE_AUTH_APP = "com.apple.gs.xcode.auth"
@@ -398,8 +541,10 @@ def begin_login(email: str, password: str) -> dict[str, Any]:
     - ``{"status": "authenticated", "session": {email, adsid, GsIdmsToken,
        auth_token, auth_token_expiry}}``
     - ``{"status": "2fa_required", "method": "trusteddevice"|"sms",
-       "pending": {"email", "adsid", "idms", "method"}}``
-      （pending 由路由层存 TTL dict，SMS 未实现——iPASide 也没实现。）
+       "pending": {"email", "adsid", "idms", "method"},
+       "phone_numbers": [{"id","number_with_dial_code"}]}``（仅 SMS 路径带
+       phone_numbers；路由层存 phone_numbers 供前端选号。trusted-device 路径推送
+       一次即让受信设备弹码，无号码列表。）
     """
     headers = anisette.get_headers()
     spd, secondary = _authenticate_once(email, password, headers)
@@ -408,13 +553,24 @@ def begin_login(email: str, password: str) -> dict[str, Any]:
 
     adsid, idms = spd["adsid"], spd["GsIdmsToken"]
     method = "trusteddevice" if secondary == "trustedDeviceSecondaryAuth" else "sms"
-    if method == "trusteddevice":
-        _trigger_trusted(adsid, idms, anisette.get_headers())
-    return {
+    result: dict[str, Any] = {
         "status": "2fa_required",
         "method": method,
         "pending": {"email": email, "adsid": adsid, "idms": idms, "method": method},
     }
+    if method == "trusteddevice":
+        _trigger_trusted(adsid, idms, anisette.get_headers())
+    else:
+        # SMS：列出受信电话号码供前端选号。失败不阻塞登录——路由层在前端选号
+        # 时再调 list_trusted_phone_numbers 端点（pending 已含 adsid/idms）。
+        try:
+            result["phone_numbers"] = list_trusted_phone_numbers(
+                adsid, idms, anisette.get_headers()
+            )
+        except GsaError:
+            # 号码列表拿不到（网络/权限），让前端在选号时重试；pending 已带身份。
+            result["phone_numbers"] = []
+    return result
 
 
 def complete_2fa(
@@ -423,15 +579,21 @@ def complete_2fa(
     """提交 2FA 码后**重新认证**拿 session token（密码必须重发，见模块 docstring）。
 
     pending 是 begin_login 返回的 ``pending`` dict（路由层存取）。码错 → GsaError。
+    SMS 路径（method=="sms"，phone_id 非空）走 gsa.apple.com/auth 的 JSON IDMS
+    流程；trusted-device 路径走 GsService2/validateCode 的 plist 流程。
     """
-    if pending.get("method") == "trusteddevice":
-        _submit_trusted(
-            pending["adsid"], pending["idms"], code, anisette.get_headers()
-        )
-    else:
-        raise GsaError("SMS 2FA 提交未实现")
-
+    method = pending.get("method")
     headers = anisette.get_headers()
+    if method == "trusteddevice":
+        _submit_trusted(pending["adsid"], pending["idms"], code, headers)
+    elif method == "sms":
+        phone_id = pending.get("phone_id")
+        if not phone_id:
+            raise GsaError("SMS 2FA 缺少 phone_id（请先调用 list_trusted_phone_numbers 选号）")
+        verify_sms_code(pending["adsid"], pending["idms"], int(phone_id), code, headers)
+    else:
+        raise GsaError(f"未知 2FA 方法: {method!r}")
+
     spd, secondary = _authenticate_once(email, password, headers)
     if secondary:
         raise GsaError(f"2FA 后仍要求二次认证: {secondary}")

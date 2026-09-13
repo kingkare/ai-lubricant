@@ -119,6 +119,36 @@ def test_build_manifest_uses_configured_summary_or_blank():
     assert validate_manifest("channels", manifest) == []
 
 
+def test_build_manifest_carries_code_and_builtin_type_for_code_channel():
+    """代码渠道：spec 源码与 builtin_type 必须随模板往返，否则导入端只剩空壳。"""
+    base = {
+        "remark": "我的代码渠道",
+        "base_url": "https://api.example.com/v1",
+        "billing_mode": "token",
+        "builtin_type": "code",
+        "code": "class MyChannel:\n    @staticmethod\n    async def init_auth(p, is_check=False):\n        return True\n",
+        "chat_protocols": [{"protocol": "openai", "path": "/v1/chat/completions"}],
+    }
+    channel = build_manifest("my-code", base, {})["resource"]["channel"]
+    assert channel["builtin_type"] == "code"
+    assert "MyChannel" in channel["code"]
+    assert validate_manifest("channels", build_manifest("my-code", base, {})) == []
+
+
+def test_build_manifest_omits_code_for_non_code_channel():
+    """普通渠道不带 code 键（避免空串字段污染模板）；builtin_type 仍按配置带出。"""
+    base = {
+        "remark": "普通渠道",
+        "base_url": "https://api.example.com/v1",
+        "billing_mode": "token",
+        "builtin_type": "cloudflare",
+        "chat_protocols": [{"protocol": "openai", "path": "/v1/chat/completions"}],
+    }
+    channel = build_manifest("plain", base, {})["resource"]["channel"]
+    assert channel["builtin_type"] == "cloudflare"
+    assert "code" not in channel
+
+
 def test_channel_summary_is_optional_but_mcp_summary_remains_required():
     channel = _channel_manifest()
     channel.pop("summary")

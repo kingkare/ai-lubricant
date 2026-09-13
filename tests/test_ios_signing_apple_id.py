@@ -180,8 +180,9 @@ async def test_materialize_apple_id_cache_hit(monkeypatch):
         provision, "ensure_signing_assets",
         lambda *a, **k: pytest.fail("cache hit must not call ensure_signing_assets"),
     )
-
-    secret = _apple_secret(expires_at=NOW + timedelta(days=5))
+    # 用相对当前时间的未来值，避免固定 NOW+5d 随日历推进变成已过期 profile，
+    # 使「缓存命中」测试在 2026-09-12 后永久误报 cache miss。
+    secret = _apple_secret(expires_at=datetime.now(timezone.utc) + timedelta(days=5))
     profile = {"id": 3, "kind": "apple_id", "secret_data": secret}
     material, final_id = await routes_ios._materialize_apple_id(
         profile, owner_user_id="u1", udid=UDID, wda_bundle_id="com.wda.base"

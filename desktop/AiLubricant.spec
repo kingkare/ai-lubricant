@@ -47,12 +47,10 @@ datas = [
     _tree("agent/sop"),
     # Vendored built-in MCP plugins.
     _tree("mcp_builtin"),
-    # Startup configuration template. The former root-level JSON configs
-    # (config.json / model_metadata.json / channel_remarks.json) are gone: main
-    # config and model metadata now live in PostgreSQL (app_config / model_groups).
-    # The live env.ini (real credentials) is intentionally NOT shipped; the
+    # Startup configuration. The former root-level JSON configs (config.json /
+    # model_metadata.json / channel_remarks.json) and the legacy env.ini(.example)
+    # template are gone: main config lives in PostgreSQL (app_config) and the
     # packaged app writes its .env into the per-user data dir at first run.
-    (str(PROJECT_ROOT / "env.ini.example"), "."),
 ]
 
 hiddenimports = [

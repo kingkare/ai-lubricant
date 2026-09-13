@@ -28,7 +28,9 @@ router = APIRouter(prefix="/api/v1/users/ios", tags=["ios-management"])
 # WDA runner 的官方默认 bundle id。付费（ASC / 他人 P12）可直接用；免费 personal-team
 # 的描述文件只覆盖使用者自己在 Xcode 创建的 App ID——prepare 时必须传使用者自己的
 # bundle id（节点重签会把 app id 改写成它，profile 不匹配则安装失败）。
-DEFAULT_WDA_BUNDLE_ID = "com.facebook.WebDriverAgentRunner.xctrunner"
+# DeviceKit 是 go-ios 1.3.2 的默认 UI runner；历史字段/路径仍称 wda，
+# 以保持 API/数据库兼容。
+DEFAULT_WDA_BUNDLE_ID = "com.deviceboxhq.goios.devicekit.runner"
 
 
 class CreateSigningProfileReq(BaseModel):
@@ -79,9 +81,25 @@ class AppleIdVerify2faReq(BaseModel):
     password: str
     code: str
     profile_id: int | None = None
+    # SMS 2FA：选中的受信电话号码 id（前端从 login 返回的 phone_numbers 里选）。
+    # trusted-device 路径忽略此字段。
+    phone_id: int | None = None
     # 与 login 同口径：2FA 完成那步请求也经同一代理出网。
     proxy_config_id: str = ""
     # 与 login 同口径：远程 anisette 服务器（2FA 完成那步也用它取真实指纹）。
+    anisette_server: str = ""
+
+
+class AppleIdSmsReq(BaseModel):
+    """触发短信 2FA 发送（method=="sms" 时前端选号后调用）。
+
+    与 verify-2fa 分离：选号 + 发码是一个语义阶段，验码是另一个。
+    login_token / email / phone_id 定位 pending；proxy/anisette 同口径。
+    """
+    login_token: str
+    email: str
+    phone_id: int
+    proxy_config_id: str = ""
     anisette_server: str = ""
 
 
@@ -645,6 +663,9 @@ async def apple_id_login(body: AppleIdLoginReq, user: User = Depends(get_current
             "status": "2fa_required",
             "method": result.get("method"),
             "login_token": token,
+            # SMS 路径带受信电话号码列表（trusted-device 为 None）。前端据此决定
+            # 渲染选号 UI 还是受信设备弹码 UI。
+            "phone_numbers": result.get("phone_numbers"),
         }
     return await _apple_finalize_login(
         engine, result, user=user, name=body.name.strip(), profile_id=body.profile_id
@@ -653,19 +674,31 @@ async def apple_id_login(body: AppleIdLoginReq, user: User = Depends(get_current
 
 @router.post("/signing-profiles/apple-id/verify-2fa")
 async def apple_id_verify_2fa(body: AppleIdVerify2faReq, user: User = Depends(get_current_user)) -> dict:
-    """Apple ID 登录第二步：提交受信设备验证码（密码随请求重发，见 login 端点 docstring）。
+    """Apple ID 登录第二步：提交 2FA 验证码（密码随请求重发，见 login 端点 docstring）。
 
-    pending 用后即焚（pop）；login_token 错/过期/换人 400。
+    两条路径：
+    * trusted-device：受信设备弹码，验码走 GsService2/validateCode。
+    * SMS：手机短信码，验码走 gsa.apple.com/auth/verify/phone/securitycode，需
+      body.phone_id（前端从 login 返回的 phone_numbers 里选）。
+
+    pending 的生命周期：**只有成功才删**。码错（-21669）保留 pending 让用户重输
+    （同 login_token 重发验证码即可），其它不可重试错误才清理。
     """
     engine = _load_apple_engine()
-    entry = _APPLE_2FA_PENDING.pop(body.login_token, None)
+    # 先取不删：码错要保留 pending 让用户重试，不能一提交就丢。
+    entry = _APPLE_2FA_PENDING.get(body.login_token)
     if not entry or datetime.now(timezone.utc) >= entry["expires_at"]:
+        _APPLE_2FA_PENDING.pop(body.login_token, None)
         _prune_apple_2fa_pending(datetime.now(timezone.utc))
         raise HTTPException(status_code=400, detail="登录会话已过期，请重新登录")
     if entry.get("owner_user_id") != str(user.id):
         raise HTTPException(status_code=403, detail="验证码不属于当前用户")
     if str(entry.get("email") or "") != body.email.strip():
         raise HTTPException(status_code=400, detail="邮箱与登录时不一致")
+
+    method = entry.get("method")
+    if method == "sms" and not body.phone_id:
+        raise HTTPException(status_code=400, detail="SMS 2FA 需要选择受信电话号码（phone_id）")
 
     # 与 login 同口径出口代理；2FA 完成那步请求同样要经同一代理出网。
     await _apple_gsa_egress(body.proxy_config_id)
@@ -680,18 +713,68 @@ async def apple_id_verify_2fa(body: AppleIdVerify2faReq, user: User = Depends(ge
         "email": entry.get("email"),
         "adsid": entry.get("adsid"),
         "idms": entry.get("idms"),
-        "method": entry.get("method"),
+        "method": method,
+        "phone_id": body.phone_id,
     }
     try:
         result = await asyncio.to_thread(
             engine.gsa.complete_2fa, body.email.strip(), body.password, body.code.strip(), pending
         )
     except Exception as exc:  # noqa: BLE001
-        # 码错时 pending 已被 pop——用户要重来整个登录（Apple 侧推送码也只一次）。
+        # 码错（GsaError 含 -21669）保留 pending：用户可同 login_token 重发码重试，
+        # 不必整登录重来。其它不可重试错误（如 -28248）才清 pending。
+        msg = str(exc)
+        if "-21669" in msg:
+            raise HTTPException(
+                status_code=400, detail="验证码错误，请重新输入受信设备上弹出的 6 位码"
+            ) from exc
+        # 未知/不可重试错误：清 pending，用户必须重新登录（Apple 侧推送码也只一次）。
+        _APPLE_2FA_PENDING.pop(body.login_token, None)
         raise _apple_engine_error_to_http(exc) from exc
-    return await _apple_finalize_login(
+
+    # 成功：先持久化配置，落库成功后再清 pending；持久化异常时保留 token 便于
+    # 服务端重试（Apple 侧 session 已完成，但密码不会落库）。
+    result = await _apple_finalize_login(
         engine, result, user=user, name="", profile_id=body.profile_id
     )
+    _APPLE_2FA_PENDING.pop(body.login_token, None)
+    return result
+
+
+@router.post("/signing-profiles/apple-id/2fa/sms")
+async def apple_id_send_sms(body: AppleIdSmsReq, user: User = Depends(get_current_user)) -> dict:
+    """SMS 2FA：前端选好受信号码后触发发送（isideload PUT /auth/verify/phone）。
+
+    仅在 method=="sms" 时调用（login 返回 phone_numbers 时）。Apple 拒发新短信
+    但旧码仍有效（-22979/-22981）也判成功——前端继续进输码态。pending 不动。
+    """
+    engine = _load_apple_engine()
+    entry = _APPLE_2FA_PENDING.get(body.login_token)
+    if not entry or datetime.now(timezone.utc) >= entry["expires_at"]:
+        raise HTTPException(status_code=400, detail="登录会话已过期，请重新登录")
+    if entry.get("owner_user_id") != str(user.id):
+        raise HTTPException(status_code=403, detail="验证码不属于当前用户")
+    if str(entry.get("email") or "") != body.email.strip():
+        raise HTTPException(status_code=400, detail="邮箱与登录时不一致")
+    if entry.get("method") != "sms":
+        raise HTTPException(status_code=400, detail="当前登录不要求 SMS 2FA")
+
+    await _apple_gsa_egress(body.proxy_config_id)
+    try:
+        from .apple_signing import anisette as _anisette_mod
+        _anisette_mod.set_remote_server(body.anisette_server or "")
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        await asyncio.to_thread(
+            engine.gsa.send_sms_code,
+            entry["adsid"], entry["idms"], int(body.phone_id),
+            engine.gsa.anisette.get_headers(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_engine_error_to_http(exc) from exc
+    return {"login_token": body.login_token, "phone_id": int(body.phone_id), "sms_sent": True}
 
 
 # ── apple_id 物化（派发前现算成 p12 形状，节点零改动）──────────────────────────

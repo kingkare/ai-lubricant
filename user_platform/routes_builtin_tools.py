@@ -286,6 +286,112 @@ async def list_ios_hosts(user: User = Depends(get_current_user)) -> dict:
     return {"ios_hosts": hosts}
 
 
+@router.post("/resources/ios-hosts/all/scan")
+async def scan_all_ios_devices(user: User = Depends(get_current_user)) -> dict:
+    """Ask every online iOS host to refresh its device inventory.
+
+    Discovery is asynchronous on the node (the ack only means the frame was
+    accepted). The frontend follows this with a short polling read of the
+    aggregate inventory; this endpoint returns per-host dispatch failures so a
+    broken host does not hide successful scans elsewhere.
+    """
+    import asyncio
+
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+    from .nodes_service import nodes_service
+
+    my_nodes = (await nodes_service.list_my_nodes(user.id)).get("nodes") or []
+    hosts = [n for n in my_nodes if n.get("role") == "ios_host"]
+    client = get_node_client()
+
+    async def _one(host: dict) -> dict:
+        node_id = str(host.get("node_id") or "")
+        result = {"node_id": node_id, "dispatched": False, "error": None}
+        if not host.get("online"):
+            result["error"] = "节点离线"
+            return result
+        if not await nodes_service.user_can_use_node(user.id, node_id):
+            result["error"] = "无权访问该节点"
+            return result
+        try:
+            await client.ios_discover(node_id)
+            result["dispatched"] = True
+        except (NodeServerUnavailable, RPCError) as exc:
+            result["error"] = str(exc) or exc.__class__.__name__
+        return result
+
+    return {"hosts": await asyncio.gather(*(_one(h) for h in hosts))}
+
+
+@router.get("/resources/ios-hosts/all/devices")
+async def list_all_ios_devices(user: User = Depends(get_current_user)) -> dict:
+    """Aggregate device inventory across every ios_host the user can access.
+
+    Returns per-node results so one offline host doesn't hide the rest:
+    ``{"hosts": [{"node_id","node_name","online","devices":[...],"error":?}, ...],
+       "devices": [...]}`` — the flat ``devices`` list is the union with node_id/
+    node_name stamped on each entry for the scan UI's grouping.
+    """
+    import asyncio
+
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+    from .nodes_service import nodes_service
+
+    my_nodes = (await nodes_service.list_my_nodes(user.id)).get("nodes") or []
+    hosts = [n for n in my_nodes if n.get("role") == "ios_host"]
+
+    async def _one(host: dict) -> dict:
+        node_id = str(host.get("node_id") or "")
+        entry = {
+            "node_id": node_id,
+            "node_name": host.get("name") or node_id,
+            "online": bool(host.get("online")),
+            "devices": [],
+            "error": None,
+        }
+        if not entry["online"]:
+            entry["error"] = "节点离线"
+            return entry
+        if not await nodes_service.user_can_use_node(user.id, node_id):
+            entry["error"] = "无权访问该节点"
+            return entry
+        try:
+            inv = await get_node_client().get_ios_devices(node_id)
+        except (NodeServerUnavailable, RPCError) as exc:
+            entry["error"] = str(exc) or exc.__class__.__name__
+            return entry
+        devices = []
+        for d in inv.get("devices") or []:
+            stamped = dict(d)
+            stamped["node_id"] = node_id
+            stamped["node_name"] = entry["node_name"]
+            devices.append(stamped)
+        entry["devices"] = devices
+        return entry
+
+    results = await asyncio.gather(*(_one(h) for h in hosts))
+    flat: list[dict] = []
+    for r in results:
+        flat.extend(r["devices"])
+    return {"hosts": results, "devices": flat}
+
+
+@router.post("/resources/ios-hosts/{node_id}/scan")
+async def scan_ios_devices(node_id: str, user: User = Depends(get_current_user)) -> dict:
+    """Ask one online iOS host to refresh its asynchronous inventory."""
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+    from .nodes_service import nodes_service
+
+    if not await nodes_service.user_can_use_node(user.id, node_id):
+        raise HTTPException(status_code=403, detail="您无权访问此节点")
+    try:
+        return await get_node_client().ios_discover(node_id)
+    except NodeServerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RPCError as exc:
+        raise HTTPException(status_code=500, detail=exc.message) from exc
+
+
 @router.get("/resources/ios-hosts/{node_id}/devices")
 async def list_ios_devices(node_id: str, user: User = Depends(get_current_user)) -> dict:
     """Retrieve the cached device inventory for one ios_host node."""
@@ -364,6 +470,47 @@ async def claim_ios_device(
         raise HTTPException(status_code=500, detail=exc.message) from exc
 
     return result
+
+
+@router.post("/resources/{resource_id}/runner-control")
+async def ios_runner_control(resource_id: int, body: dict, user: User = Depends(get_current_user)) -> dict:
+    """Start/stop/restart the persistent device-control runner loop on a claimed
+    iOS device (no re-claim, no credential change).
+
+    body: {"action": "start"|"stop"|"restart"}。装 runner 走既有 WDA job
+    （prepare/renew/reinstall，见 routes_ios.py）；这里只管常驻守护循环。
+    """
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+
+    action = (body.get("action") or "").strip().lower()
+    if action not in ("start", "stop", "restart"):
+        raise HTTPException(status_code=400, detail="action 必须是 start|stop|restart")
+
+    resource = await _owned_resource(resource_id, user, resource_type="device")
+    data = resource.get("data") or {}
+    ios_info = data.get("ios") or {}
+    node_id = ios_info.get("node_id") or ""
+    udid = ios_info.get("udid") or ""
+    device_id = data.get("device_id") or ""
+
+    if not node_id or not udid:
+        raise HTTPException(status_code=400, detail="此设备缺少 iOS 节点绑定信息")
+
+    client = get_node_client()
+    try:
+        return await client.ios_runner_control(node_id, device_id, udid, action)
+    except NodeServerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RPCError as exc:
+        if exc.code == "not_found":
+            raise HTTPException(status_code=404, detail=exc.message) from exc
+        if exc.code == "permission_denied":
+            raise HTTPException(status_code=403, detail=exc.message) from exc
+        if exc.code == "failed_precondition":
+            raise HTTPException(status_code=412, detail=exc.message) from exc
+        if exc.code == "deadline_exceeded":
+            raise HTTPException(status_code=504, detail=exc.message) from exc
+        raise HTTPException(status_code=500, detail=exc.message) from exc
 
 
 @router.post("/resources/{resource_id}/release-device")
