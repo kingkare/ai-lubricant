@@ -44,10 +44,13 @@
 cp .env.example .env
 #   至少填 [marketplace] repo_url（可选）、确认 node_control_token（两进程同值即可，留空自动生成）
 
-# 2. 一键起依赖 + 两进程
+# 2. 生成 compose 启动前必须固定的共享密钥（NODE_CONTROL_TOKEN 等）
+python script/init_compose_env.py
+
+# 3. 一键起依赖 + 两进程
 docker compose up -d                  # postgres + redis + ai-lubricant + node-server
 
-# 3.（可选）启用 ClickHouse
+# 4.（可选）启用 ClickHouse
 docker compose --profile clickhouse up -d
 ```
 
@@ -107,6 +110,43 @@ Linux 容器或 systemd，沿用形态 B 的配置方式（.env 指向生产 PG/
 - `node_credential_encryption_key` 一旦生成不得轮换，否则已加密节点凭据全部失效；建议在 .env 显式预置并在两进程同值。
 - `node_control_token` 两进程必须同值。
 - 数据服务前端产物需单独构建（见下），随镜像/部署包分发。
+
+## 形态 D / E / F：无 Docker 原生启动
+
+`native_deps/` 包可在无 Docker 时首次运行下载并拉起 PostgreSQL / Redis / ClickHouse + 三个 app 服务。三种形态共用同一套下载/初始化/健康检查逻辑：
+
+| 形态 | 入口 | 适用 |
+|------|------|------|
+| D. exe 内嵌 webview | `AiLubricant.exe`（桌面打包，见 `desktop/README.md`） | Windows 双击 |
+| E. supervisord | `bash script/native_launch.sh supervisord-conf && supervisord -c <生成配置> -n` | Linux 生产裸跑 |
+| F. Linux 单脚本 | `bash script/native_launch.sh up` | VPS / 单机一键 |
+
+首次运行自动下载 PostgreSQL/Redis/ClickHouse 二进制到用户数据目录（Windows `%LOCALAPPDATA%\AiLubricant\native-deps`、Linux `~/.local/share/ai-lubricant/native-deps`，`NATIVE_DEPS_ROOT` 可覆盖），`initdb` 初始化 PG、生成 Redis/ClickHouse 配置，并写入 `.env` 的连接键（本地 `127.0.0.1` + 非默认端口 15432/6479，避免与系统 PG/Redis 冲突）。
+
+```bash
+# 形态 F：Linux 单脚本一键起
+bash script/native_launch.sh up        # 下载+起 PG/Redis/CH + main/node/tunnel，前台
+# 形态 E：supervisord
+bash script/native_launch.sh supervisord-conf   # 生成 conf（含 6 个 program）
+supervisord -c <生成的 conf 路径> -n
+```
+
+环境变量覆盖（airgapped/镜像/版本锁定）：
+
+| 变量 | 作用 |
+|------|------|
+| `NATIVE_POSTGRES_VERSION` / `NATIVE_REDIS_VERSION` / `NATIVE_CLICKHOUSE_VERSION` | 锁定版本 |
+| `NATIVE_<PG\|REDIS\|CLICKHOUSE>_DOWNLOAD_URL` + `NATIVE_<...>_SHA256` | 覆盖下载源（内网镜像/自建）；必须同时给 SHA256，拒绝无校验下载 |
+| `NATIVE_DEPS_PROXY` | 下载走 HTTP 代理（如 `http://127.0.0.1:7890`） |
+| `NATIVE_DEPS_ROOT` | 二进制/数据/配置根目录 |
+| `CLICKHOUSE_REQUEST_PAYLOAD_ENABLED` | `true` 才下载并拉起 ClickHouse（默认不拉，省 200MB+） |
+
+**Windows Redis 硬约束**：官方无 Redis 6+ Windows 版（本系统强制 RESP3，Redis ≥6.0）。Windows 形态默认走社区 Redis 7 构建（非官方），生产建议 Memurai 或 WSL2。用 `NATIVE_REDIS_DOWNLOAD_URL` + `NATIVE_REDIS_SHA256` 指向你的 Redis 7 Windows zip。检测到 <6.0 会明确报错而非静默起坏实例。
+
+**已知限制**：
+- ClickHouse 首次下载 ~200MB+；国内走 `NATIVE_DEPS_PROXY` 或用系统 clickhouse（命中 PATH 则跳下载）。
+- Linux supervisord/单脚本在 musl/Alpine 上无法运行官方 glibc 二进制，用 glibc 发行版。
+- PG 主版本固定 16（与 compose 一致），不自动跨版本升级。
 
 ## 前端产物
 

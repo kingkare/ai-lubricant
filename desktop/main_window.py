@@ -111,6 +111,64 @@ def _error_window(title: str, message: str) -> None:
     webview.start()
 
 
+def _auto_provision_flow(window_title: str) -> "DepsRuntime | None":
+    """Download + start local PG/Redis/ClickHouse with a blocking status window.
+
+    Returns the live :class:`DepsRuntime` for the caller to tear down on exit,
+    or ``None`` if provisioning failed or was cancelled.
+    """
+    import webview
+
+    from native_deps import lifecycle
+
+    html = (
+        "<html><head><meta charset='utf-8'><style>"
+        "body{font:14px/1.7 'Segoe UI','Microsoft YaHei',sans-serif;padding:30px;"
+        "background:#f6f7f9;color:#1a1d21}"
+        "@media(prefers-color-scheme:dark){body{background:#16181d;color:#e5e7eb}}"
+        "</style></head><body>"
+        "<h2>正在准备本地数据库</h2>"
+        "<p>首次启动需下载 PostgreSQL / Redis / ClickHouse 并初始化，"
+        "可能需要数分钟。进度见日志目录 native-deps/。</p>"
+        "<p style='color:#666'>请勿关闭此窗口…</p></body></html>"
+    )
+    window = webview.create_window(window_title, html=html, width=620, height=360)
+
+    result: dict[str, object] = {"runtime": None, "error": None}
+
+    def _worker() -> None:
+        try:
+            cfg = asyncio.run(lifecycle.ensure_all())
+            from desktop import paths
+
+            lifecycle.write_env_file(paths.env_file_path(), lifecycle.env_updates(cfg))
+            runtime = lifecycle.DepsRuntime(cfg)
+            if asyncio.run(runtime.start_all()):
+                result["runtime"] = runtime
+            else:
+                runtime.stop_all()
+                result["error"] = "依赖服务启动失败"
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = f"{type(exc).__name__}: {exc}"
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    def _watch() -> None:
+        import time
+
+        while result["runtime"] is None and result["error"] is None:
+            time.sleep(0.4)
+        time.sleep(0.8)  # let the final status render briefly
+        with contextlib.suppress(Exception):
+            window.destroy()
+
+    threading.Thread(target=_watch, daemon=True).start()
+    webview.start()
+    if result["error"]:
+        _error_window(window_title, str(result["error"]))
+    return result["runtime"]  # type: ignore[return-value]
+
+
 def main() -> None:
     from desktop import env_bootstrap, paths
 
@@ -122,15 +180,24 @@ def main() -> None:
     # ── 1. dependency check ───────────────────────────────────────────────
     from desktop import config_wizard
 
+    deps_runtime = None
     ready = asyncio.run(config_wizard.env_is_ready())
     if not ready:
-        if not _wizard_flow(f"{title} — 首次配置"):
-            return  # user closed the wizard without saving
-        # Reload the freshly written .env into this process.
-        env_bootstrap.apply_env()
-        from dotenv import load_dotenv
+        # Prefer auto-provisioning local PG/Redis/ClickHouse; fall back to the
+        # manual external-config wizard if the user declines or it fails.
+        deps_runtime = _auto_provision_flow(f"{title} — 准备依赖")
+        if deps_runtime is not None:
+            env_bootstrap.apply_env()
+            from dotenv import load_dotenv
 
-        load_dotenv(dotenv_path=paths.env_file_path(), override=True)
+            load_dotenv(dotenv_path=paths.env_file_path(), override=True)
+        else:
+            if not _wizard_flow(f"{title} — 首次配置"):
+                return  # user closed the wizard without saving
+            env_bootstrap.apply_env()
+            from dotenv import load_dotenv
+
+            load_dotenv(dotenv_path=paths.env_file_path(), override=True)
 
     # ── 2. start services ─────────────────────────────────────────────────
     from desktop.supervisor import Supervisor
@@ -162,6 +229,8 @@ def main() -> None:
         webview.start()
     finally:
         supervisor.stop_all()
+        if deps_runtime is not None:
+            deps_runtime.stop_all()
 
 
 if __name__ == "__main__":

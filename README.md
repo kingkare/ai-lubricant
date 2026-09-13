@@ -54,10 +54,15 @@ cp .env.example .env
 # AI_LUBRICANT_COMPAT_ENABLED=true（管理端与用户门户必需）、
 # AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL / AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD
 
-# 3. 启动（PostgreSQL、Redis 由 Compose 自带，无需单独安装）
+# 3. 生成跨容器共享密钥（NODE_CONTROL_TOKEN / NODE_CREDENTIAL_ENCRYPTION_KEY /
+#    AGENT_ATTACHMENT_SIGNING_KEY），compose 创建容器前必须固定，否则主服务与
+#    node-server 取不到一致的 token，节点页报「未配置控制面 .../token」
+python script/init_compose_env.py
+
+# 4. 启动（PostgreSQL、Redis 由 Compose 自带，无需单独安装）
 docker compose up -d --build
 
-# 4. 初始化数据库（幂等，可重复执行）
+# 5. 初始化数据库（幂等，可重复执行）
 docker compose exec ai-lubricant python server/init_db.py
 ```
 

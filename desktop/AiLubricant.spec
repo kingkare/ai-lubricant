@@ -119,7 +119,7 @@ hiddenimports = [
 
 # uvicorn resolves its loop/protocol implementations by name at runtime;
 # coredis and tortoise have plenty of lazily imported submodules.
-for pkg in ("uvicorn", "coredis", "tortoise", "hypercorn", "clickhouse_connect"):
+for pkg in ("uvicorn", "coredis", "tortoise", "hypercorn", "clickhouse_connect", "native_deps"):
     hiddenimports += collect_submodules(pkg)
 
 # Trim obvious build-time-only weight. Nothing in the runtime path needs these.
