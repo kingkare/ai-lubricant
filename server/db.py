@@ -63,6 +63,12 @@ class PostgresClient:
         if lightweight:
             logger.info("postgres 连接成功 (lightweight: 跳过回填/规范化/迁移)")
             return
+        # 全新部署兜底：app_config 无 main 行时写入空主配置。主配置真相源在 DB
+        # （CONFIG_STORE.refresh_cache 要求该行存在），421fc880 把它从 config.json 迁
+        # 到 DB 后，全新库再没有任何路径会写它——不兜底则 init_shared_services 里
+        # 的 CONFIG_STORE.init 必抛 ConfigurationError 阻断启动。空配置由管理端首次
+        # 保存补全；老库已存在 main 行时幂等跳过。
+        await cls.ensure_main_config()
         await cls._normalize_legacy_usage_tokens()
         await cls.migrate_provider_configs_from_app_config(delete_legacy=True)
         await cls.migrate_provider_models_from_legacy_columns()
@@ -74,8 +80,10 @@ class PostgresClient:
         await cls.remove_legacy_account_rpd_overrides()
         await cls.migrate_freeze_policy_data()
         await cls.migrate_freeze_object_period_data()
-        await cls.migrate_orphan_agents_owner()
-        await cls.migrate_orphan_scheduled_tasks_owner()
+        # 孤儿 agent/定时任务归属迁移（migrate_orphan_*）依赖兼容层的 mc_users 表，
+        # 而该表由 user_platform.init() 在 PostgresClient.init() 之后才创建。放在这里
+        # 会让全新部署 + 兼容层开启时因 mc_users 不存在而启动失败。改由 main.py 在
+        # user_platform.init() 之后显式调用（见 main.py lifespan）。
         logger.info("postgres 连接成功")
 
     @classmethod
@@ -108,8 +116,10 @@ class PostgresClient:
                     applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
-            await conn.execute("ALTER TABLE provider_configs ADD COLUMN IF NOT EXISTS billing_mode TEXT NOT NULL DEFAULT 'token'")
-            await conn.execute("ALTER TABLE provider_configs ADD COLUMN IF NOT EXISTS error_rate_threshold REAL NOT NULL DEFAULT 0.3")
+            # provider_configs 建表（表体已含 billing_mode/error_rate_threshold 两列），
+            # 建表后再跑幂等 ADD COLUMN 兜底老库升级。此前这里有两行前置 ALTER——
+            # 空库上表还不存在，ALTER 先于 CREATE 执行直接抛 UndefinedTableError，
+            # 全新部署起不来（老库表已存在所以侥幸通过）。
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS provider_configs (
                     name TEXT PRIMARY KEY,
@@ -2944,6 +2954,20 @@ class PostgresClient:
         if isinstance(value, str):
             return json.loads(value)
         return dict(value)
+
+    @classmethod
+    async def ensure_main_config(cls) -> None:
+        """确保 app_config['main'] 存在，缺则写入空主配置。
+
+        主配置（渠道/模型组/API Key 等的真相源）历史上由 config.json 迁移而来；迁移到
+        DB 后（421fc880）全新库无任何路径会写它，而 CONFIG_STORE.refresh_cache 要求
+        该行存在，缺则抛 ConfigurationError 阻断启动。空配置由管理端首次保存补全。
+        幂等：已存在不动。
+        """
+        if await cls.get_config("main") is not None:
+            return
+        await cls.set_config("main", {})
+        logger.warning("[init] app_config['main'] 缺失，已写入空主配置；请通过管理端完成初始配置")
 
     @classmethod
     async def set_config(cls, key: str, data: dict):
@@ -8868,6 +8892,12 @@ class PostgresClient:
             return
         owner = cls._ORPHAN_OWNER_USER_ID
         async with cls.pool.acquire() as conn:
+            # mc_users 由兼容层（user_platform）建表。兼容层关闭时该表永不存在，
+            # 或建表尚未执行；不存在即按本函数约定「owner 不存在则跳过」，不抛
+            # UndefinedTableError 阻断启动。
+            if await conn.fetchval("SELECT to_regclass('public.mc_users')") is None:
+                logger.warning("[migrate] mc_users table absent; skip orphan agents reparent")
+                return
             exists = await conn.fetchval(
                 "SELECT 1 FROM mc_users WHERE id::text=$1 AND is_deleted=FALSE", owner
             )
@@ -8912,6 +8942,18 @@ class PostgresClient:
 
             # 2) 剩余孤儿（无 agent_id 或 Agent 本身也是平台 Agent）挂到配置 owner
             owner = cls._ORPHAN_OWNER_USER_ID
+            # mc_users 由兼容层建表；表不存在（兼容层关闭或建表尚未执行）即按约定
+            # 「owner 不存在则跳过」，不抛 UndefinedTableError 阻断启动。
+            if await conn.fetchval("SELECT to_regclass('public.mc_users')") is None:
+                remaining = await conn.fetchval(
+                    "SELECT COUNT(*) FROM agent_scheduled_tasks WHERE user_id IS NULL"
+                )
+                if remaining:
+                    logger.warning(
+                        "[migrate] %s orphan scheduled tasks remain; mc_users table absent",
+                        remaining,
+                    )
+                return
             exists = await conn.fetchval(
                 "SELECT 1 FROM mc_users WHERE id::text=$1 AND is_deleted=FALSE", owner
             )

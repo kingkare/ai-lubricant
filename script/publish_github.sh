@@ -20,6 +20,10 @@
 #   RELEASE_TAG  标签名（默认 v + 日期，如 v260909）
 #   NO_TAG=1     不打标签
 #   STRICT=1     不自动提交：任一仓工作树脏则报错退出（默认 0=自动提交）
+#   COMMITTED_ONLY=1 只发布已提交内容：先定向提交 user-frontend/dist，跳过其余脏改动
+#                     的自动提交；快照只从各仓 HEAD 生成。适用于并发会话在途时发布。
+#                     为避免源码与 dist 不一致，构建前端时 user-frontend 除 dist 外必须干净；
+#                     也可配合 SKIP_FRONTEND_BUILD=1 直接发布现有已提交 HEAD。
 #
 # 安全前提：GitHub 仓库只收快照（每次发布 1 个 commit，不带开发历史）；
 #   ⚠ 永远不要 git push github master——github 远端只接受 public-snapshot。
@@ -31,6 +35,7 @@ GH_BASE="${GH_BASE:-https://github.com/wuxin-gh}"
 RELEASE_TAG="${RELEASE_TAG:-v$(date +%y%m%d)}"
 NO_TAG="${NO_TAG:-0}"
 STRICT="${STRICT:-0}"
+COMMITTED_ONLY="${COMMITTED_ONLY:-0}"
 REMOTE=github
 PUB=public-snapshot
 
@@ -132,12 +137,15 @@ publish_snapshot() {
     new="$(git -C "$p" commit-tree "$tree" "${PARENT_FLAGS[@]}" -m "$msg")"
     made_commit=1
   fi
-  git -C "$p" branch -f "$PUB" "$new"
+  git -C "$p" branch -f "$PUB" "$new" 1>&2
   if [ "$made_commit" = "1" ]; then
     push_with_retry git -C "$p" push "$REMOTE" "$PUB:main"
   fi
   if [ "$NO_TAG" != "1" ]; then
-    git -C "$p" tag -f "$RELEASE_TAG" "$new"
+    # tag -f 在 force 更新已存在 tag 时往 stdout 打印 "Updated tag ... (was ...)"，
+    # 会污染本函数 stdout（调用方用 $() 只期望 SHA）。重定向到 stderr：提示仍上屏，
+    # stdout 保持干净只输出最后那行 echo "$new"。
+    git -C "$p" tag -f "$RELEASE_TAG" "$new" 1>&2
     push_with_retry git -C "$p" push -f "$REMOTE" "refs/tags/${RELEASE_TAG}"
   fi
   echo "$new"
@@ -163,16 +171,32 @@ fi
 
 # ── 第 0.5 步：构建前端产物（dist 随库）──────────────────────────────────
 # 升级链路在部署机上 git clone GitHub 公开仓（--recurse-submodules），部署机没有
-# Node 工具链——前端产物必须随库发布。放在 DIRTY 检测之前，dist 变动才能被第 1 步
-# 的自动提交带上。直跑 vite（绕开 tsc -b 的存量报错），edition 与 pnpm build 默认
-# 一致（online）。SKIP_FRONTEND_BUILD=1 跳过（应急用：保留上次构建的 dist）。
+# Node 工具链——前端产物必须随库发布。直跑 vite（绕开 tsc -b 的存量报错），edition 与
+# pnpm build 默认一致（online）。SKIP_FRONTEND_BUILD=1 跳过（应急用：保留上次构建的 dist）。
 if [ "${SKIP_FRONTEND_BUILD:-0}" != "1" ]; then
   echo "=== 0.5/3 构建前端 dist（随库发布） ==="
+  if [ "$COMMITTED_ONLY" = "1" ] && [ -n "$(git -C user-frontend status --porcelain -- . ':(exclude)dist')" ]; then
+    echo "✗ COMMITTED_ONLY=1 时 user-frontend 除 dist 外必须干净；检测到未提交源码，拒绝构建以免混入快照。" >&2
+    echo "  如需只发布现有已提交 HEAD，请设置 SKIP_FRONTEND_BUILD=1。" >&2
+    exit 1
+  fi
   (
     cd user-frontend &&
     pnpm install --frozen-lockfile &&
     pnpm exec vite build --mode online
   ) || { echo "✗ 前端构建失败，中止发布（可 SKIP_FRONTEND_BUILD=1 应急跳过）" >&2; exit 1; }
+fi
+
+# 安全快照模式：前端 dist 是唯一允许由本流程提交的内容。其余在途改动（尤其是
+# 并发会话正在编辑的源码/子模块）原样保留，绝不自动提交。
+if [ "$COMMITTED_ONLY" = "1" ]; then
+  if [ -n "$(git -C user-frontend status --porcelain -- dist)" ]; then
+    git -C user-frontend add -A -- dist
+    git -C user-frontend commit -qm "chore: 发布前构建前端 dist（publish_github.sh）"
+    echo "· user-frontend：仅 dist 构建产物已提交（COMMITTED_ONLY=1）"
+  else
+    echo "· user-frontend：dist 无变化，不新增构建提交"
+  fi
 fi
 
 ALL_REPOS=("${SUBS[@]}" .)
@@ -200,15 +224,21 @@ echo "  标签       : ${RELEASE_TAG}$([ "$NO_TAG" = 1 ] && echo '（跳过）')
 echo "  自动提交   : $([ "$STRICT" = 1 ] && echo '关（STRICT=1）' || echo '开')"
 echo ""
 
-# ── 第 1 步：六仓自动提交在途改动 + 推内网 origin ────────────────────────
+# ── 第 1 步：提交（默认所有在途改动；COMMITTED_ONLY 仅已定向提交 dist）+ 推内网 origin ──
 
-echo "=== 1/3 提交在途改动并推内网 Gitea ==="
+if [ "$COMMITTED_ONLY" = "1" ]; then
+  echo "=== 1/3 仅推送已提交 HEAD 到内网 Gitea（跳过其余在途改动） ==="
+else
+  echo "=== 1/3 提交在途改动并推内网 Gitea ==="
+fi
 for p in "${ALL_REPOS[@]}"; do
   label="$p"; [ "$p" = "." ] && label="主仓"
-  if [ -n "${DIRTY[$p]:-}" ]; then
+  if [ "$COMMITTED_ONLY" != "1" ] && [ -n "${DIRTY[$p]:-}" ]; then
     git -C "$p" add -A
     git -C "$p" commit -qm "chore: 发布前自动提交在途改动（publish_github.sh）"
     echo "· $label：在途改动已自动提交"
+  elif [ -n "${DIRTY[$p]:-}" ]; then
+    echo "· $label：保留未提交改动，不纳入发布"
   else
     echo "· $label：工作树干净"
   fi

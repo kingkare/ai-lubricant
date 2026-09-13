@@ -28,6 +28,11 @@ def _isolate_from_real_env(monkeypatch):
         "MONKEYCODE_SYSTEM_USER_NAME",
         "MONKEYCODE_SYSTEM_USER_EMAIL",
         "MONKEYCODE_DATABASE_URL",
+        # 国内镜像源开关及其覆盖项（避免真实 .env 干扰默认值契约）。
+        "MIRROR_MODE",
+        "DOCKER_REGISTRY_PREFIX",
+        "NPM_REGISTRY",
+        "APK_MIRROR",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -77,3 +82,44 @@ def test_conflicting_new_and_legacy_env_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="MONKEYCODE_COMPAT_ENABLED"):
         importlib.reload(cfg)
+
+
+def test_cn_mirror_settings_use_domestic_defaults(monkeypatch):
+    """MIRROR_MODE=cn selects domestic defaults for all deployment consumers."""
+    _isolate_from_real_env(monkeypatch)
+    monkeypatch.setenv("MIRROR_MODE", "cn")
+    import user_platform.config as cfg
+
+    importlib.reload(cfg)
+    assert cfg.settings.mirror_settings() == {
+        "docker_registry_prefix": "docker.1ms.run/",
+        "npm_registry": "https://registry.npmmirror.com",
+        "apk_mirror": "mirrors.aliyun.com",
+    }
+
+
+def test_mirror_settings_are_empty_without_cn_mode(monkeypatch):
+    """Leaving the switch unset keeps upstream behavior and emits no mirror config."""
+    _isolate_from_real_env(monkeypatch)
+    monkeypatch.delenv("MIRROR_MODE", raising=False)
+    import user_platform.config as cfg
+
+    importlib.reload(cfg)
+    assert cfg.settings.mirror_settings() == {}
+
+
+def test_cn_mirror_settings_allow_registry_overrides(monkeypatch):
+    """Private registry values override only their corresponding domestic default."""
+    _isolate_from_real_env(monkeypatch)
+    monkeypatch.setenv("MIRROR_MODE", "CN")
+    monkeypatch.setenv("DOCKER_REGISTRY_PREFIX", "registry.example.com")
+    monkeypatch.setenv("NPM_REGISTRY", "https://npm.example.com")
+    monkeypatch.setenv("APK_MIRROR", "apk.example.com")
+    import user_platform.config as cfg
+
+    importlib.reload(cfg)
+    assert cfg.settings.mirror_settings() == {
+        "docker_registry_prefix": "registry.example.com/",
+        "npm_registry": "https://npm.example.com",
+        "apk_mirror": "apk.example.com",
+    }

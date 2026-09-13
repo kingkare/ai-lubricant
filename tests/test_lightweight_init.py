@@ -27,6 +27,7 @@ _TABLE_STEPS = ["create_tables", "create_agent_tables", "create_multi_agent_tabl
 # 主服务专属重活（仅完整模式应调用）。仪表盘小时聚合不在此列：启动不做任何
 # 回填/重建（聚合纯增量，见 rate_limiter._hourly_stats_loop）。
 _HEAVY_STEPS = [
+    "ensure_main_config",
     "_normalize_legacy_usage_tokens",
     "migrate_provider_configs_from_app_config",
     "migrate_provider_models_from_legacy_columns",

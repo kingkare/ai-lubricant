@@ -74,10 +74,14 @@ def test_windows_installer_uses_one_fixed_entry_and_migrates_legacy_tasks():
     assert 'set "RUNNER=%ROOT%\\start-node.cmd"' in body
     assert "agent-compose-node-node-" in body  # legacy task migration matcher
     assert 'run-node-*.bat' in body
-    assert "Agent Compose Node.lnk" in body
+    # 桌面快捷方式经 PowerShell -EncodedCommand（UTF-16LE Base64）创建，中文名不进
+    # cmd 源码（OEM codepage 会乱码）。断言该编码命令存在即代表 shortcut 链路在。
+    assert "-EncodedCommand" in body
     assert "--install --install-only --yes" in body
     assert "schtasks.exe /Create /F /SC ONLOGON" in body
     assert "StartsWith($root" in body  # process cleanup is path-scoped
+    # 海外默认（不传 mirror_fields）不得烘焙任何国内镜像源。
+    assert "NPM_CONFIG_REGISTRY" not in body
 
 
 def test_windows_runner_and_task_do_not_embed_secret():
@@ -233,7 +237,12 @@ def test_unix_standalone_persists_config_and_has_fixed_launcher():
     assert '--work-root "$work_root"' in body
     assert 'start-node.sh' in body
     assert "agent-compose-node.service" in body
-    assert "@reboot" in body
+    # crontab @reboot 已移除：无 systemd 用户会话时不装 cron 行，节点二进制在下次
+    # 交互式启动时自行管理自启（launchd / crontab-free）。
+    assert "@reboot" not in body
+    assert "未配置 — 首次交互式启动节点时会询问是否开启开机自启" in body
+    # 海外默认（不传 mirror_fields）不得烘焙任何国内镜像源。
+    assert "NPM_CONFIG_REGISTRY" not in body
     # launcher 导出 AGENT_COMPOSE_NODE_STATE_DIR（state 目录不走持久化 config，
     # Go 侧读环境变量，所以 launcher 必须导出），占位符 sed 注入实际路径。
     assert 'export AGENT_COMPOSE_NODE_STATE_DIR="__STATE_DIR__"' in body
@@ -433,3 +442,79 @@ def _async(value):
         return value
 
     return _coro()
+
+
+# ── 国内镜像源烘焙（MIRROR_MODE=cn）──────────────────────────────────────────
+# 三个渲染形态只在显式传入非空 mirror_fields 时才注入国内源；不传（海外）时
+# 渲染结果不含任何镜像字样。这些用例如实覆盖这两条契约。
+
+_MIRROR = {
+    "docker_registry_prefix": "docker.1ms.run/",
+    "npm_registry": "https://registry.npmmirror.com",
+    "apk_mirror": "mirrors.aliyun.com",
+}
+
+_LINUX_ASSETS = {
+    ("linux", "amd64"): {"url": "https://github.com/o/r/d/node-execution-linux-amd64", "sha256": "a" * 64},
+    ("linux", "arm64"): {"url": "https://github.com/o/r/d/node-execution-linux-arm64", "sha256": "b" * 64},
+}
+
+
+def test_docker_installer_bakes_mirror_build_args_and_env():
+    body = render_install_script(
+        {**BOOTSTRAP, "startup_method": "docker"},
+        public_base_url="https://model.example.test",
+        agent_image="example/node:latest",
+        execution_assets=_LINUX_ASSETS,
+        management_assets=_LINUX_ASSETS,
+        mirror_fields=_MIRROR,
+    )
+    # 节点镜像三层海外源各注入一个 build-arg（本地 build 时生效）。
+    assert "--build-arg ALPINE_BASE='docker.1ms.run/alpine:3.22'" in body
+    assert "--build-arg APK_MIRROR='mirrors.aliyun.com'" in body
+    assert "--build-arg NPM_REGISTRY='https://registry.npmmirror.com'" in body
+    # 容器运行时注入 npm 源，manageEditor 装/升级编辑器 CLI 才走国内源。
+    assert '-e NPM_CONFIG_REGISTRY="https://registry.npmmirror.com"' in body
+
+
+def test_standalone_installer_exports_npm_registry_in_launcher():
+    body = render_install_script(
+        BOOTSTRAP,
+        public_base_url="https://model.example.test",
+        agent_image="example/node:latest",
+        assets=_LINUX_ASSETS,
+        mirror_fields=_MIRROR,
+    )
+    # launcher 持久化导出（重启后由 systemd/后台拉起的节点进程也继承 npm 源）。
+    assert "export NPM_CONFIG_REGISTRY='https://registry.npmmirror.com'" in body
+    # standalone 不 docker build，因此不含 build-arg。
+    assert "--build-arg" not in body
+
+
+def test_windows_installer_persists_npm_registry_in_runner():
+    body = render_install_bat(
+        BOOTSTRAP,
+        public_base_url="https://model.example.test",
+        mirror_fields=_MIRROR,
+    )
+    assert 'set "NPM_CONFIG_REGISTRY=https://registry.npmmirror.com"' in body
+    # 该 set 行必须写进固定 runner（重启后由计划任务拉起），不是临时 set。
+    assert '>>"%RUNNER%" echo set "NPM_CONFIG_REGISTRY=https://registry.npmmirror.com"' in body
+
+
+def test_overseas_default_omits_all_mirror_lines():
+    # 不传 mirror_fields（海外默认）：三种形态都不得出现任何镜像源字样。
+    for method in ("standalone", "docker", "docker-compose"):
+        body = render_install_script(
+            {**BOOTSTRAP, "startup_method": method},
+            public_base_url="https://model.example.test",
+            agent_image="example/node:latest",
+            assets=_LINUX_ASSETS,
+            execution_assets=_LINUX_ASSETS,
+            management_assets=_LINUX_ASSETS,
+        )
+        for token in ("docker.1ms.run", "npmmirror", "mirrors.aliyun.com", "NPM_CONFIG_REGISTRY", "--build-arg"):
+            assert token not in body, f"{method} leaked {token}"
+    bat = render_install_bat(BOOTSTRAP, public_base_url="https://model.example.test")
+    for token in ("docker.1ms.run", "npmmirror", "mirrors.aliyun.com", "NPM_CONFIG_REGISTRY"):
+        assert token not in bat, f"bat leaked {token}"

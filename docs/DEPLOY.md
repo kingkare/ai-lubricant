@@ -51,9 +51,33 @@ docker compose up -d                  # postgres + redis + ai-lubricant + node-s
 docker compose --profile clickhouse up -d
 ```
 
-compose 内 `ai-lubricant` 与 `node-server` 共用同一镜像（`build: .`），分别 `CMD python main.py` / `python -m node_server`，PG/Redis 通过环境变量指向容器服务名 `postgres`/`redis`，`node_control_token` 由 .env 传递（两容器读同一文件）。
+compose 内 `ai-lubricant` / `node-server` / `tunnel-server` 共用同一镜像 `ai-lubricant:<TAG>`：**只由 `ai-lubricant` 服务 `build:` 一次**，另两个服务仅 `image:` 引用（`pull_policy: never`）——避免同 tag 并行构建互踩、以及被当成远程镜像去 pull。三者分别 `CMD python main.py` / `python -m node_server` / `python -m tunnel_server`，PG/Redis 通过环境变量指向容器服务名 `postgres`/`redis`，`node_control_token` 由 .env 传递（容器读同一文件）。
 
 端口映射：宿主 `3006 → 8001`（数据服务）、`8003 → 8003`（控制服务）、`15432 → 5432`（PG）、`6479 → 6379`（Redis）。
+
+#### 国内部署加速（可选）
+
+国内网络直连 Docker Hub / npmjs / Alpine CDN 很慢。在 `.env` 里设：
+
+```bash
+MIRROR_MODE=cn                            # 节点镜像 build + 运行时 npm 全走国内源
+DOCKER_REGISTRY_PREFIX=docker.1ms.run/    # compose 拉基础镜像走加速器（含结尾 /）
+```
+
+- `MIRROR_MODE=cn`：服务端渲染节点安装脚本时自动为节点镜像 build 注入
+  `--build-arg`（Alpine 基础镜像 / apk / npm 三层海外源换国内），并给节点进程
+  导出 `NPM_CONFIG_REGISTRY`，使其装/升级编辑器 CLI（claude/codex/gemini 等）走
+  npmmirror。**无需改节点侧任何配置**。
+- `DOCKER_REGISTRY_PREFIX`：compose 的镜像插值不认 `MIRROR_MODE`，所以这一行
+  要单独设（主服务 `FROM` + postgres/redis/clickhouse 拉取都吃它）。
+- 两行**都留空 = 直连海外**，行为与不开完全一致。
+
+三个地址均可覆盖（指向私有镜像 / 阿里云个人加速器 `<id>.mirror.aliyuncs.com/` /
+自建反代）：`DOCKER_REGISTRY_PREFIX` / `NPM_REGISTRY` / `APK_MIRROR`，默认值
+`docker.1ms.run/`、`https://registry.npmmirror.com`、`mirrors.aliyun.com`。
+
+> 注意：`docker.1ms.run` 是公共加速器，可用性可能变动；生产建议换成阿里云个人
+> 加速器或自建 registry proxy。
 
 ### 形态 B：宿主机裸跑（指向远端 PG/Redis）
 

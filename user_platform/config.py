@@ -243,6 +243,50 @@ class UserPlatformSettings:
     # Env-driven global default so it can be tuned for the host without a
     # per-webhook knob; the worker drains the rest of the queue past this.
     review_project_max_concurrency: int
+    # China-deployment mirror switch. Empty (default) = direct to upstream
+    # (Docker Hub / npmjs). "cn" = route the Docker Hub base images and the
+    # node editor-CLI npm installs through domestic mirrors, so a China deploy
+    # does not stall on python:3.11-slim / postgres / redis / npmjs.org.
+    # Resolved into concrete addresses by ``mirror_settings()``.
+    mirror_mode: str
+
+    def mirror_settings(self) -> dict[str, str]:
+        """Concrete domestic mirror addresses when ``MIRROR_MODE=cn``, else ``{}``.
+
+        Single source of truth for every China-mirroring consumer (the compose
+        base-image pull, the main Dockerfile FROM, and the install.sh renderer
+        that bakes ``--build-arg``/``NPM_CONFIG_REGISTRY`` into a node install).
+        An empty dict means "direct to upstream" — callers must append nothing,
+        so an overseas deploy renders byte-for-byte as before.
+
+        Each address has a dedicated env override so an operator can point at a
+        private mirror without flipping the whole mode (e.g. a self-hosted
+        registry proxy or an Alibaba Cloud personal accelerator).
+        """
+        if (self.mirror_mode or "").strip().lower() != "cn":
+            return {}
+        return {
+            # Prepended to a Docker Hub image ref. Trailing slash is included so
+            # ``f"{prefix}python:3.11-slim"`` reads naturally; a bare name like
+            # ``docker.1ms.run`` is normalized to carry the slash.
+            "docker_registry_prefix": _normalize_registry_prefix(
+                _resolve("DOCKER_REGISTRY_PREFIX", "docker.1ms.run/")
+            ),
+            # npm registry for the node editor-CLI installs (build-time
+            # ``npm i -g`` in the node image + runtime ``manageEditor``).
+            "npm_registry": _resolve("NPM_REGISTRY", "https://registry.npmmirror.com"),
+            # Alpine package mirror host swapped into /etc/apk/repositories
+            # inside the node image build (path layout matches the official CDN).
+            "apk_mirror": _resolve("APK_MIRROR", "mirrors.aliyun.com"),
+        }
+
+
+def _normalize_registry_prefix(value: str) -> str:
+    """Ensure a Docker registry prefix ends with ``/`` (empty stays empty)."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    return value if value.endswith("/") else value + "/"
 
 
 def _resolve_float(env_name: str, default: float) -> float:
@@ -329,6 +373,7 @@ def load_settings() -> UserPlatformSettings:
         session_cookie_secure=_resolve_bool("AI_LUBRICANT_SESSION_SECURE", False, legacy_name="MONKEYCODE_SESSION_SECURE"),
         webhook_public_origin=_resolve("AI_LUBRICANT_WEBHOOK_PUBLIC_ORIGIN", "", legacy_name="MONKEYCODE_WEBHOOK_PUBLIC_ORIGIN"),
         review_project_max_concurrency=max(1, _resolve_int("AI_LUBRICANT_REVIEW_PROJECT_MAX_CONCURRENCY", 2, legacy_name="MONKEYCODE_REVIEW_PROJECT_MAX_CONCURRENCY")),
+        mirror_mode=_resolve("MIRROR_MODE", ""),
     )
 
 

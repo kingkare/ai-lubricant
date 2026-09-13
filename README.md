@@ -73,7 +73,7 @@ docker compose exec ai-lubricant python server/init_db.py
 | 8004 | Tunnel Runtime，仅 Compose 内网可达，不对外发布 |
 | 8123 / 9000 | ClickHouse（可选，`--profile clickhouse` 启用） |
 
-数据持久化：PostgreSQL、Redis 与主服务的 Agent 运行时数据（记忆/工作区/SOP/技能归档）、附件、删除前备份、资源镜像、日志、隧道二进制缓存分别落在独立命名卷中，`docker compose down` 保留全部数据；**除非已确认备份完成，否则不要执行 `docker compose down -v`**。备份示例：
+数据持久化：PostgreSQL、Redis 与主服务的 Agent 运行时数据（记忆/工作区/SOP/技能归档）、附件、删除前备份、资源镜像、日志、隧道二进制缓存分别 bind mount 到宿主 `./data/` 下的独立子目录（`pg_data`/`redis_data`/`ai_data` 等，已 gitignore），`docker compose down` 保留全部数据（`down -v` 也不影响 bind mount 数据，清数据 = 直接删对应子目录）。备份示例：
 
 ```bash
 docker compose exec -T postgres pg_dump -U ai_lubricant -d ai-lubricant -Fc > ai-lubricant.dump
@@ -161,5 +161,7 @@ print(response.choices[0].message.content)
 本仓库自研部分采用 **Business Source License 1.1（BSL 1.1）**。在 Change Date 到来前，个人、学习研究、内部评估和非商业使用按 LICENSE 约定进行；商业产品、商业服务、经营性活动或向第三方提供营利服务，需要事先取得著作权人的商业授权。Change Date 和 Change License 以 [`LICENSE`](LICENSE) 为准。
 
 GitHub 发布使用 [`script/publish_github.sh`](script/publish_github.sh) 生成快照。内部开发仓库保留完整历史，公开仓库只接收选定版本的发布快照。
+
+并发会话在途、需要只发布已提交内容时，加 `COMMITTED_ONLY=1`：仅 `user-frontend/dist` 会被定向构建并提交，其余工作树脏改动原样保留不纳入快照（前端除 dist 外必须干净，否则中止；或配合 `SKIP_FRONTEND_BUILD=1` 直接发布当前各仓 HEAD）。
 
 独立 submodule 具有自己的许可证和归属声明，使用或再分发时必须同时遵守各自目录中的 LICENSE、NOTICE 以及上游项目要求。根目录 [`NOTICE`](NOTICE) 记录本仓库与独立组件的来源边界。

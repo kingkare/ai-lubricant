@@ -123,6 +123,7 @@ async def install_script(node_id: str, request: Request, method: str | None = No
         ios_host_assets=ios_host_assets,
         runtime_assets=runtime_assets,
         proxy_fields=proxy_fields,
+        mirror_fields=config.settings.mirror_settings(),
     )
     # text/plain so `curl ... | bash` streams it straight into the shell.
     return PlainTextResponse(script, media_type="text/x-shellscript; charset=utf-8")
@@ -162,6 +163,7 @@ async def install_bat(node_id: str, request: Request):
         assets=role_assets,
         runtime_assets=runtime_assets,
         proxy_fields=proxy_fields,
+        mirror_fields=config.settings.mirror_settings(),
     )
     # CRLF + a .bat content type so a browser download / curl -o yields a runnable file.
     body = script.replace("\r\n", "\n").replace("\n", "\r\n")

@@ -340,6 +340,17 @@ async def lifespan(_app: FastAPI):
     except Exception:
         logger.exception("[user-platform] init failed; main service continues")
 
+    # 孤儿 agent/定时任务归属迁移：依赖兼容层的 mc_users 表，必须在 user_platform.init()
+    # 建表之后执行（此前挂在 PostgresClient.init 的迁移链里，早于兼容层建表，全新部署
+    # 会因 mc_users 不存在而启动失败）。兼容层关闭时 mc_users 永不建表，迁移内部按
+    # 「表/owner 不存在则跳过」优雅返回；失败只 log 不阻断启动。
+    try:
+        from db import PostgresClient
+        await PostgresClient.migrate_orphan_agents_owner()
+        await PostgresClient.migrate_orphan_scheduled_tasks_owner()
+    except Exception:
+        logger.exception("[startup] orphan owner reparent migration failed; main service continues")
+
     # 通知出站 worker：回灌未推送 outbox → set Event → 消费循环。独立于 compat 开关，
     # 用 db pool 原生 SQL（node-server 进程也能 emit，主进程统一消费推送）。
     try:

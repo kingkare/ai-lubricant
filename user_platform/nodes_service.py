@@ -406,6 +406,7 @@ def render_install_script(
     ios_host_assets: dict[tuple[str, str], dict] | None = None,
     runtime_assets: dict[tuple[str, str], dict] | None = None,
     proxy_fields: dict | None = None,
+    mirror_fields: dict | None = None,
 ) -> str:
     """Render a self-contained bash installer for a node from its bootstrap record.
 
@@ -447,6 +448,13 @@ def render_install_script(
     proxy_mode = str(proxy_fields.get("proxy_mode") or "")
     proxy_url = str(proxy_fields.get("proxy_url") or "")
     proxy_url_prefix = str(proxy_fields.get("proxy_url_prefix") or "")
+    # 镜像源（MIRROR_MODE=cn 时非空）：docker 形态给 build/run 传参，standalone 给
+    # launcher 注 NPM_CONFIG_REGISTRY。海外全空 = 渲染结果与改前逐字节一致。
+    mirror_fields = mirror_fields or {}
+    m_docker_prefix = str(mirror_fields.get("docker_registry_prefix") or "")
+    m_npm_registry = str(mirror_fields.get("npm_registry") or "")
+    m_apk_mirror = str(mirror_fields.get("apk_mirror") or "")
+    m_alpine_base = f"{m_docker_prefix}alpine:3.22" if m_docker_prefix else ""
     if assets is not None:
         role_assets = assets
     elif role == "management":
@@ -506,6 +514,22 @@ def render_install_script(
     ])
     docker_exec_lines = _platform_lines("linux", execution_assets)
     docker_mgmt_lines = _platform_lines("linux", management_assets, prefix="MGMT_")
+
+    # 国内镜像源只在 MIRROR_MODE=cn 时非空：把 build-arg 与容器 env 拼成命令片段，
+    # 海外（全空）时各片段为空字符串，渲染结果与改前逐字节一致。
+    q_m_alpine = _sh_squote(m_alpine_base)
+    q_m_apk = _sh_squote(m_apk_mirror)
+    q_m_npm = _sh_squote(m_npm_registry)
+    docker_build_args = "".join(filter(None, [
+        f" --build-arg ALPINE_BASE={q_m_alpine}" if m_alpine_base else "",
+        f" --build-arg APK_MIRROR={q_m_apk}" if m_apk_mirror else "",
+        f" --build-arg NPM_REGISTRY={q_m_npm}" if m_npm_registry else "",
+    ]))
+    docker_run_npm_env = f'  -e NPM_CONFIG_REGISTRY="{m_npm_registry}" \\\n' if m_npm_registry else ""
+    standalone_npm_env = (
+        f"export NPM_CONFIG_REGISTRY={_sh_squote(m_npm_registry)}\n"
+        if m_npm_registry else ""
+    )
 
     if method in ("docker", "docker-compose"):
         # Container form: the image is built LOCALLY on the host from the two
@@ -612,7 +636,7 @@ if [ "${{AGENT_COMPOSE_NODE_REBUILD:-}}" = "1" ] || ! docker image inspect "$IMA
   curl -fsSL "$BASE/api/v1/public/nodes/docker/entrypoint.sh" -o "$build_dir/entrypoint.sh"
 
   echo "building node image $IMAGE (bakes runtime + editor CLIs; first build may take minutes) ..."
-  docker build -t "$IMAGE" "$build_dir"
+  docker build{docker_build_args} -t "$IMAGE" "$build_dir"
   rm -rf "$build_dir"
   trap - EXIT
 else
@@ -642,7 +666,7 @@ docker run -d \\
   -e AGENT_COMPOSE_NODE_SECRET="$NODE_SECRET" \\
   -e AGENT_COMPOSE_NODE_ROLE="$NODE_ROLE" \\
   -e AGENT_COMPOSE_AGENT_IMAGE="$IMAGE" \\
-  "$IMAGE"
+{docker_run_npm_env}  "$IMAGE"
 echo "agent-compose node container '$CONTAINER' started (docker logs -f $CONTAINER)"
 """
 
@@ -832,7 +856,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 # Fixed Agent Compose node launcher. Credentials are read from the saved config.
 export AGENT_COMPOSE_NODE_STATE_DIR="__STATE_DIR__"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting node: cwd=$PWD state=$AGENT_COMPOSE_NODE_STATE_DIR config=$AGENT_COMPOSE_NODE_STATE_DIR/config.json" >&2
+{standalone_npm_env}echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting node: cwd=$PWD state=$AGENT_COMPOSE_NODE_STATE_DIR config=$AGENT_COMPOSE_NODE_STATE_DIR/config.json" >&2
 if [ ! -f "$AGENT_COMPOSE_NODE_STATE_DIR/config.json" ]; then
   echo "node launcher: config missing: $AGENT_COMPOSE_NODE_STATE_DIR/config.json" >&2
   exit 2
@@ -890,7 +914,7 @@ if [ -d "$desktop_dir" ]; then
     cat > "$desktop_dir/Ai Lubricant 节点.command" <<'ENTRY'
 #!/bin/bash
 # Ai Lubricant 节点 — 桌面服务入口：启动 / 关闭 / 重启节点服务。
-exec "{root}/bin/{binary_name}" service
+exec "{{root}}/bin/{binary_name}" service
 ENTRY
     chmod +x "$desktop_dir/Ai Lubricant 节点.command"
   else
@@ -899,7 +923,7 @@ ENTRY
 Type=Application
 Name=Ai Lubricant 节点
 Comment=启动 / 关闭 / 重启节点服务
-Exec={root}/bin/{binary_name} service
+Exec={{root}}/bin/{binary_name} service
 Terminal=true
 ENTRY
     chmod +x "$desktop_dir/ai-lubricant-node.desktop"
@@ -922,6 +946,7 @@ def render_install_bat(
     assets: dict[tuple[str, str], dict] | None = None,
     runtime_assets: dict[tuple[str, str], dict] | None = None,
     proxy_fields: dict | None = None,
+    mirror_fields: dict | None = None,
 ) -> str:
     """Render a Windows batch installer for a credentialed node.
 
@@ -971,6 +996,16 @@ def render_install_bat(
     proxy_mode = str(proxy_fields.get("proxy_mode") or "")
     proxy_url = str(proxy_fields.get("proxy_url") or "")
     proxy_url_prefix = str(proxy_fields.get("proxy_url_prefix") or "")
+    # 镜像源（MIRROR_MODE=cn 时非空）：Windows 节点不 docker build，只给固定 runner
+    # 注 NPM_CONFIG_REGISTRY（运行时装/升级编辑器 CLI 走国内 npm 源）。海外为空 =
+    # 渲染结果与改前逐字节一致。
+    mirror_fields = mirror_fields or {}
+    m_npm_registry = str(mirror_fields.get("npm_registry") or "")
+    # 写进固定 runner 的 set 行：runner 是重启后由计划任务拉起的进程环境，镜像源必须
+    # 持久化在那里，不能只在安装进程里 set。
+    win_npm_runner_line = (
+        f'>>"%RUNNER%" echo set "NPM_CONFIG_REGISTRY={m_npm_registry}"\n' if m_npm_registry else ""
+    )
 
     # Values are generated from UUID/base32/HTTP inputs. Keep them in `set "..."`
     # assignments so spaces in a deployment URL do not split the command.
@@ -1229,7 +1264,7 @@ rem One fixed, secret-free launcher. Reinstalling with a different role overwrit
 rem it so the single desktop entry/task always starts the current node.
 >"%RUNNER%" echo @echo off
 >>"%RUNNER%" echo rem Fixed Agent Compose node launcher. Credentials are read from the saved config.
->>"%RUNNER%" echo "%BINARY%"
+{win_npm_runner_line}>>"%RUNNER%" echo "%BINARY%"
 
 rem Replace every old per-node task with one stable per-user login task.
 schtasks.exe /Create /F /SC ONLOGON /RL LIMITED /TN "%TASK%" /TR "cmd.exe /d /c call \\\"%RUNNER%\\\"" >nul
