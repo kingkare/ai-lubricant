@@ -43,7 +43,8 @@ Ai Lubricant 是面向团队与个人的 AI 开发平台。模型中转、Agent�
 ```bash
 # 1. 拉代码（主仓 + 全部子模块，一条命令）
 # .gitmodules 使用相对地址，子模块会自动解析到同组织的 ai-lubricant-* 仓库
-git clone --recurse-submodules https://github.com/wuxin-gh/ai-lubricant.git
+# 国内直连 GitHub 慢，用 gh-proxy 加速：
+git clone --recurse-submodules https://gh-proxy.org/https://github.com/wuxin-gh/ai-lubricant.git
 cd ai-lubricant
 # 若此前已普通 clone，可补拉子模块：
 # git submodule sync --recursive && git submodule update --init --recursive
