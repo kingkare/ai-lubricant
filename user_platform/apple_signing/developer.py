@@ -89,14 +89,18 @@ def _request(
             raise DeveloperServicesError(f"developer services HTTP {status}")
         result = plistlib.loads(content)
     else:
-        resp = requests.post(
-            f"{_BASE}{endpoint}?clientId={_CLIENT_ID}",
-            headers=_headers(session, anisette.get_headers()),
-            data=plistlib.dumps(body),
-            timeout=_TIMEOUT,
-            verify=tls.ca_bundle(),
-            proxies=gsa.current_proxies(),
-        )
+        # trust_env=False：不吃环境变量代理——developer services 的出口与 GSA
+        # 同口径（显式 proxy_config_id / 节点隧道），环境变量代理只会添乱。
+        with requests.Session() as direct:
+            direct.trust_env = False
+            resp = direct.post(
+                f"{_BASE}{endpoint}?clientId={_CLIENT_ID}",
+                headers=_headers(session, anisette.get_headers()),
+                data=plistlib.dumps(body),
+                timeout=_TIMEOUT,
+                verify=tls.ca_bundle(),
+                proxies=gsa.current_proxies(),
+            )
         resp.raise_for_status()
         result = plistlib.loads(resp.content)
 

@@ -21,6 +21,12 @@ async def init() -> bool:
     if _initialized:
         return True
     if not settings.enabled:
+        # 与 mount_routes 的 disabled 日志同因：无声跳过导致 mc_* 表不建、
+        # bootstrap admin 不播种，排障时日志里一片空白。
+        logger.warning(
+            "[user-platform] 兼容层未启用 (AI_LUBRICANT_COMPAT_ENABLED=false)："
+            "mc_* 表不初始化、bootstrap admin 不播种。"
+        )
         return False
     if not settings.database_url:
         logger.warning("[user-platform] enabled but database URL is empty; skipped")
@@ -86,6 +92,13 @@ def mount_routes(app) -> bool:
     holds a live Registry.
     """
     if not settings.enabled:
+        # 无声跳过曾让「console 登录失败 + 全部 /api/v1/* 404」无从排障——
+        # 部署 .env 常从 .env.example 复制（默认 false），必须留一行可见日志。
+        logger.warning(
+            "[user-platform] 兼容层未启用 (AI_LUBRICANT_COMPAT_ENABLED=false)："
+            "/console、/api/v1/users|teams|server 全部路由不挂载；管理端不受影响。"
+            "如需用户门户请在 .env 设 AI_LUBRICANT_COMPAT_ENABLED=true 并重建容器。"
+        )
         return False
     try:
         from .routes import router as user_router

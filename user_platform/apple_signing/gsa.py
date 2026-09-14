@@ -122,7 +122,12 @@ def current_transport() -> Any | None:
 
 
 def _http(method: str, url: str, headers: dict[str, str], body: bytes) -> tuple[int, dict[str, str], bytes]:
-    """统一的 HTTP 出口：transport 优先（节点隧道），否则 requests 直连/代理。"""
+    """统一的 HTTP 出口：transport 优先（节点隧道），否则 requests 直连/显式代理。
+
+    直连分支 trust_env=False：不吃 HTTP(S)_PROXY 环境变量——出口代理由
+    routes 层的 proxy_config_id 显式选择（set_gsa_proxies/set_gsa_transport），
+    环境变量代理只会把 GSA 请求绕进 Clash 抖动里（实测 22s/请求）。
+    """
     if _transport is not None:
         try:
             return _transport(method, url, headers, body)
@@ -130,15 +135,17 @@ def _http(method: str, url: str, headers: dict[str, str], body: bytes) -> tuple[
             raise
         except Exception as exc:  # noqa: BLE001 — 隧道失败统一成可读错误
             raise GsaTransportError(f"节点隧道请求失败：{exc}") from exc
-    resp = requests.request(
-        method,
-        url,
-        headers=headers,
-        data=body,
-        timeout=_TIMEOUT,
-        verify=tls.ca_bundle(),
-        proxies=_proxies,
-    )
+    with requests.Session() as session:
+        session.trust_env = False
+        resp = session.request(
+            method,
+            url,
+            headers=headers,
+            data=body,
+            timeout=_TIMEOUT,
+            verify=tls.ca_bundle(),
+            proxies=_proxies,
+        )
     return resp.status_code, dict(resp.headers), resp.content
 
 _PLIST_PROLOG = (

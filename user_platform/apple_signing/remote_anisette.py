@@ -100,9 +100,22 @@ def _base_request_headers() -> dict[str, str]:
     }
 
 
+def _direct_session() -> "requests.Session":
+    """不读代理环境变量的 requests 会话。
+
+    requests 默认 trust_env=True，会吃 HTTP(S)_PROXY——主服务进程带着 Clash 等
+    代理环境变量启动时，anisette/Apple 的 HTTPS 调用会被代理绕一道（抖动时
+    22 秒一次请求、直接把 provisioning 拖到服务器超时）。anisette 链路默认
+    **直连**；出口代理由 routes 层的 proxy_config_id 显式选择，不走环境变量。
+    """
+    s = requests.Session()
+    s.trust_env = False
+    return s
+
+
 def _fetch_url_bag() -> dict:
     """GET GsService2/lookup，返回 URL bag dict（mid 端点都在里面）。"""
-    r = requests.get(_GS_LOOKUP, headers=_base_request_headers(), timeout=_TIMEOUT, verify=_ca_bundle())
+    r = _direct_session().get(_GS_LOOKUP, headers=_base_request_headers(), timeout=_TIMEOUT, verify=_ca_bundle())
     r.raise_for_status()
     d = plistlib.loads(r.content)
     urls = d.get("urls") if isinstance(d, dict) else None
@@ -115,7 +128,7 @@ def _plist_post(url: str, body: dict, extra_headers: dict | None = None) -> dict
     headers = _base_request_headers()
     if extra_headers:
         headers.update(extra_headers)
-    r = requests.post(url, headers=headers,
+    r = _direct_session().post(url, headers=headers,
                     data=plistlib.dumps(body), timeout=_TIMEOUT, verify=_ca_bundle())
     r.raise_for_status()
     d = plistlib.loads(r.content)
@@ -128,7 +141,15 @@ def _plist_post(url: str, body: dict, extra_headers: dict | None = None) -> dict
 
 
 def provision(state: dict, anisette_server: str) -> dict:
-    """WebSocket provisioning，拿到 adi_pb。state 原地更新并持久化。"""
+    """WebSocket provisioning，拿到 adi_pb。state 原地更新并持久化。
+
+    稳定性两件事：
+    1. ``proxy=None``——websockets >= 14 默认读 HTTPS_PROXY 等环境变量，主服务
+       进程带着 Clash 等代理环境变量启动时，WSS 会被代理断成
+       "no close frame received or sent"。anisette 走直连（TUN 透明接管也照常）。
+    2. 整轮重试 3 次（瞬断/服务端抖动常见；每次重试都重新走完整 provisioning，
+       因为失败时 session 已废）。
+    """
     import websockets
     import asyncio
 
@@ -144,7 +165,7 @@ def provision(state: dict, anisette_server: str) -> dict:
         raise RuntimeError("URL bag 缺 mid 端点")
 
     async def _do() -> bytes:
-        async with websockets.connect(ws_url, max_size=None, open_timeout=30) as ws:
+        async with websockets.connect(ws_url, max_size=None, open_timeout=30, proxy=None) as ws:
             while True:
                 msg = await ws.recv()
                 data = json.loads(msg)
@@ -173,7 +194,23 @@ def provision(state: dict, anisette_server: str) -> dict:
                     msg_text = data.get("message", "")
                     raise RuntimeError("anisette provisioning 失败: %s %s" % (kind, msg_text))
 
-    adi_pb = asyncio.run(_do())
+    adi_pb: bytes | None = None
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            adi_pb = asyncio.run(_do())
+            break
+        except Exception as exc:  # noqa: BLE001 — 网络/服务端瞬断统一重试
+            last_exc = exc
+            if "InvalidIdentifier" in str(exc) or "超时" in str(exc):
+                raise  # 协议性错误重试无意义
+            import time
+            time.sleep(1.5 * (attempt + 1))
+    if adi_pb is None:
+        raise RuntimeError(
+            f"anisette 服务器 WebSocket 连接失败（重试 3 次）：{last_exc}。"
+            "请重试或换一个 anisette 服务器（前端登录弹框里可改，如 ani.sidestore.io 的备用源）。"
+        )
     state["adi_pb"] = adi_pb
     _save_state(state)
     return state
@@ -188,7 +225,7 @@ def get_headers(anisette_server: str) -> dict:
         state = provision(state, anisette_server)
     ident_b64 = base64.b64encode(state["keychain_identifier"]).decode()
     adi_b64 = base64.b64encode(state["adi_pb"]).decode()
-    r = requests.post(anisette_server.rstrip("/") + "/v3/get_headers",
+    r = _direct_session().post(anisette_server.rstrip("/") + "/v3/get_headers",
                       headers={"Content-Type": "application/json"},
                       data=json.dumps({"identifier": ident_b64, "adi_pb": adi_b64}),
                       timeout=_TIMEOUT, verify=_ca_bundle())

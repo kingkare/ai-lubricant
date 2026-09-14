@@ -344,13 +344,18 @@ def load_settings() -> UserPlatformSettings:
         # database (additive mc_* tables only).
         database_url = _derive_main_database_url()
     return UserPlatformSettings(
-        enabled=_resolve_bool("AI_LUBRICANT_COMPAT_ENABLED", legacy_name="MONKEYCODE_COMPAT_ENABLED"),
+        # 默认启用：用户门户/console、节点页、团队等 C 端功能是主部署形态；
+        # 纯网关部署显式设 AI_LUBRICANT_COMPAT_ENABLED=false 关闭（此前默认 false
+        # 曾让全新部署的 console 全 404 且日志无声，排障成本高）。
+        enabled=_resolve_bool("AI_LUBRICANT_COMPAT_ENABLED", default=True, legacy_name="MONKEYCODE_COMPAT_ENABLED"),
         database_url=database_url,
         user_adapter_enabled=_resolve_bool("AI_LUBRICANT_USER_ADAPTER_ENABLED", legacy_name="MONKEYCODE_USER_ADAPTER_ENABLED"),
         system_user_id=_resolve("AI_LUBRICANT_SYSTEM_USER_ID", "00000000-0000-0000-0000-000000000001", legacy_name="MONKEYCODE_SYSTEM_USER_ID"),
         system_user_name=_resolve("AI_LUBRICANT_SYSTEM_USER_NAME", "system", legacy_name="MONKEYCODE_SYSTEM_USER_NAME"),
         system_user_email=_resolve("AI_LUBRICANT_SYSTEM_USER_EMAIL", "system@ai-lubricant.local", legacy_name="MONKEYCODE_SYSTEM_USER_EMAIL"),
-        agent_compose_base_url=_resolve("AGENT_COMPOSE_BASE_URL", ""),
+        # 单机兜底默认指向本机 node_server（:8003）；compose 部署由容器环境变量
+        # 硬编码 http://node-server:8003 覆盖。空值曾让节点页报「未配置控制面」。
+        agent_compose_base_url=_resolve("AGENT_COMPOSE_BASE_URL", "http://127.0.0.1:8003"),
         node_control_token=_resolve_first(("NODE_CONTROL_TOKEN", "AGENT_COMPOSE_NODE_API_TOKEN"), ""),
         agent_compose_timeout=_resolve_int("AGENT_COMPOSE_TIMEOUT", 30),
         agent_compose_node_bin_dir=_resolve("AGENT_COMPOSE_NODE_BIN_DIR", ""),

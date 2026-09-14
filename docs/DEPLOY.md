@@ -31,7 +31,7 @@
 
 优先级铁律：**环境变量 > `.env` 字段 > 内置默认值**。`.env` 含明文密码已 gitignore，用 `.env.example` 作模板复制。
 
-至少要配置：PG 连接（host/port/user/password/database）、Redis 连接（host/port/db/prefix_key/max_connections）、`node_control_token`（两进程同值，缺失会自动生成回写）。
+至少要配置：PG 连接（host/port/user/password/database）、Redis 连接（host/port/db/prefix_key/max_connections）、`node_control_token` / `node_credential_encryption_key` / `agent_attachment_signing_key`（**容器创建前必须手填非空值**，生成方式见下方形态 A 第 2 步；留空时控制服务会尝试「生成后写回 `.env`」，在 Docker 单文件挂载上会因文件重命名报 EBUSY 而拒启）。
 
 ## 部署形态
 
@@ -42,13 +42,20 @@
 ```bash
 # 1. 复制配置模板并填值（compose 起本机中间件，PG/Redis 地址用环境变量指向容器服务名）
 cp .env.example .env
-#   至少填 [marketplace] repo_url（可选）、确认 node_control_token（两进程同值即可，留空自动生成）
+#   必填：POSTGRES_PASSWORD、AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL/_PASSWORD
+#   必填：NODE_CONTROL_TOKEN / NODE_CREDENTIAL_ENCRYPTION_KEY / AGENT_ATTACHMENT_SIGNING_KEY
+#         （第 2 步生成后填入；留空会导致控制服务写回 .env 失败而拒启）
 
-# 2. 生成 compose 启动前必须固定的共享密钥（NODE_CONTROL_TOKEN 等）
-python script/init_compose_env.py
+# 2. 生成三个共享密钥并写入 .env（三选一，任意一种即可，不需要 Python）：
+#    a) 有 python：   python script/init_compose_env.py     # 自动写入，幂等
+#    b) 有 openssl：  openssl rand -base64 32  → NODE_CONTROL_TOKEN=
+#                     openssl rand -hex 32     → NODE_CREDENTIAL_ENCRYPTION_KEY=
+#                     openssl rand -base64 48  → AGENT_ATTACHMENT_SIGNING_KEY=
+#    c) 都没有：      浏览器搜「random hex generator」生成随机串填入
 
 # 3. 一键起依赖 + 两进程
-docker compose up -d                  # postgres + redis + ai-lubricant + node-server
+docker compose up -d --build          # postgres + redis + ai-lubricant + node-server
+#   改了 .env 必须 up 重建，restart 不重新解析 env_file（改密钥后无效）
 
 # 4.（可选）启用 ClickHouse
 docker compose --profile clickhouse up -d
@@ -108,7 +115,7 @@ Linux 容器或 systemd，沿用形态 B 的配置方式（.env 指向生产 PG/
 
 - **切换控制服务：先停旧控制进程再启新进程**，绝不让两个 Registry 同时对同一批节点下发命令。
 - `node_credential_encryption_key` 一旦生成不得轮换，否则已加密节点凭据全部失效；建议在 .env 显式预置并在两进程同值。
-- `node_control_token` 两进程必须同值。
+- `node_control_token` 两进程必须同值；`node_control_token` / `node_credential_encryption_key` / `agent_attachment_signing_key` 均须启动前手填非空（生成后不可更改，多实例必须同值）。
 - 数据服务前端产物需单独构建（见下），随镜像/部署包分发。
 
 ## 形态 D / E / F：无 Docker 原生启动

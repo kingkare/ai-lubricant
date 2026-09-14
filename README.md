@@ -50,16 +50,28 @@ cd ai-lubricant
 
 # 2. 配置环境
 cp .env.example .env
-# 至少修改：POSTGRES_PASSWORD（强密码）、
-# AI_LUBRICANT_COMPAT_ENABLED=true（管理端与用户门户必需）、
-# AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL / AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD
+# 必须手填的项（其余键保持默认即可）：
+#   POSTGRES_PASSWORD                  数据库密码（强密码）
+#   AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL    登录账号（邮箱）
+#   AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD 登录密码
+#   NODE_CONTROL_TOKEN                 见下方第 3 步生成后填入
+#   NODE_CREDENTIAL_ENCRYPTION_KEY     见下方第 3 步生成后填入
+#   AGENT_ATTACHMENT_SIGNING_KEY       见下方第 3 步生成后填入
 
-# 3. 生成跨容器共享密钥（NODE_CONTROL_TOKEN / NODE_CREDENTIAL_ENCRYPTION_KEY /
-#    AGENT_ATTACHMENT_SIGNING_KEY），compose 创建容器前必须固定，否则主服务与
-#    node-server 取不到一致的 token，节点页报「未配置控制面 .../token」
-python script/init_compose_env.py
+# 3. 生成三个跨容器共享密钥并填回 .env（任意一种方式，不需要 Python）：
+#    a) 本机有 python：  python script/init_compose_env.py   # 自动写入 .env
+#    b) 只有 openssl：
+#         openssl rand -base64 32   → 填入 NODE_CONTROL_TOKEN=
+#         openssl rand -hex 32      → 填入 NODE_CREDENTIAL_ENCRYPTION_KEY=
+#         openssl rand -base64 48   → 填入 AGENT_ATTACHMENT_SIGNING_KEY=
+#    c) 都没有：浏览器打开任意 "random token generator"，
+#       32 字节随机串即可（三个值互相独立、各不相同）。
+#    这三个值必须在容器创建前就写在 .env 里——node-server 首启读到非空值
+#    才会跳过「生成后写回 .env」（单文件挂载上写回会失败并拒启）。
+#    多实例部署三个值必须各实例一致。
 
 # 4. 启动（PostgreSQL、Redis 由 Compose 自带，无需单独安装）
+#    注意：改了 .env 后必须 up 重建，restart 不重新解析 env_file
 docker compose up -d --build
 
 # 5. 初始化数据库（幂等，可重复执行）

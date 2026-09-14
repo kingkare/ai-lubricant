@@ -94,8 +94,8 @@
 <tr><td><code>agent_compose_base_url</code></td><td><code>AGENT_COMPOSE_BASE_URL</code></td><td>数据</td><td>空</td><td>数据服务访问独立节点控制服务的内部地址，例如 <code>http://127.0.0.1:8003</code>。</td></tr>
 <tr><td><code>agent_compose_timeout</code></td><td><code>AGENT_COMPOSE_TIMEOUT</code></td><td>数据</td><td>30 秒</td><td>数据服务调用节点控制服务的超时。</td></tr>
 <tr><td><code>review_project_max_concurrency</code></td><td>无</td><td>数据</td><td>2</td><td>每项目 review 任务池最大并发；全局默认，整主机统一调。</td></tr>
-<tr><td><code>node_control_token</code></td><td><code>NODE_CONTROL_TOKEN</code>（兼容 <code>AGENT_COMPOSE_NODE_API_TOKEN</code>）</td><td><strong>两</strong></td><td>缺失时控制服务生成</td><td>数据服务→控制服务内部 Bearer token；<strong>两个进程必须完全一致</strong>。旧名仅兼容读取，新部署使用此名称。</td></tr>
-<tr><td><code>node_credential_encryption_key</code></td><td><code>NODE_CREDENTIAL_ENCRYPTION_KEY</code></td><td>控制</td><td>缺失时控制服务生成</td><td>AES-256 凭据加密密钥，接受 64 位 hex 或解码后 32 字节的 Base64；<strong>生成后不可轮换</strong>，否则已加密节点凭据全部失效。</td></tr>
+<tr><td><code>node_control_token</code></td><td><code>NODE_CONTROL_TOKEN</code>（兼容 <code>AGENT_COMPOSE_NODE_API_TOKEN</code>）</td><td><strong>两</strong></td><td>必填（手填）</td><td>数据服务→控制服务内部 Bearer token；<strong>两个进程必须完全一致</strong>。生成：<code>openssl rand -base64 32</code>，必须在容器创建前写进 <code>.env</code>。旧名仅兼容读取，新部署使用此名称。</td></tr>
+<tr><td><code>node_credential_encryption_key</code></td><td><code>NODE_CREDENTIAL_ENCRYPTION_KEY</code></td><td>控制</td><td>必填（手填）</td><td>AES-256 凭据加密密钥，接受 64 位 hex 或解码后 32 字节的 Base64；生成：<code>openssl rand -hex 32</code>。<strong>生成后不可轮换</strong>，否则已加密节点凭据全部失效。</td></tr>
 <tr><td><code>node_server_public_url</code></td><td><code>AGENT_COMPOSE_NODE_SERVER_PUBLIC_URL</code></td><td>控制</td><td>空</td><td>Go 节点实际拨号地址；留空时部分引导链接会从当前请求 origin 推导。</td></tr>
 <tr><td><code>node_server_enabled</code></td><td><code>AGENT_COMPOSE_NODE_SERVER_ENABLED</code></td><td>控制</td><td>true</td><td>节点功能紧急停用开关；不等于进程角色选择。</td></tr>
 <tr><td><code>node_control_host</code></td><td><code>NODE_CONTROL_HOST</code></td><td>控制</td><td>0.0.0.0</td><td>Hypercorn 监听地址。</td></tr>

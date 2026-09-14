@@ -30,6 +30,13 @@ x-app-image: &app-image
   logging: *logging
   networks:
     - ai-lubricant-net
+  # 三个 app 服务统一挂载宿主 .env（单文件 bind mount）。node-server/tunnel-server
+  # 首启自动生成的 NODE_CONTROL_TOKEN / NODE_CREDENTIAL_ENCRYPTION_KEY 必须写回
+  # 宿主文件，main 才能读到——不挂载的话 node-server 只会写进自己容器层，main
+  # 永远读到空 token（节点页报「未配置控制面」）。单文件 bind mount 下写回的
+  # rename 会报 EBUSY，由 dotenv_loader 的原地重写 fallback 落盘。
+  volumes:
+    - ./.env:/app/.env
 
 # 主服务独有：build 定义（Docker Hub 基础镜像前缀，国内部署经 MIRROR_MODE=cn 的
 # DOCKER_REGISTRY_PREFIX 注入；空 = 直连 Docker Hub）。
@@ -148,8 +155,7 @@ services:
       # 局域网发现通告的 HTTP 端口 = 宿主映射端口（手机从容器外连，不是容器内 8001）。
       LAN_DISCOVERY_HTTP_PORT: "${AI_LUBRICANT_HOST_PORT:-3006}"
       # 主服务调用节点控制面（编辑器工作区、终端、任务下发等 user_platform 路由都走它）。
-      AGENT_COMPOSE_BASE_URL: http://node-server:8003
-      NODE_CONTROL_TOKEN: "${NODE_CONTROL_TOKEN:-}"
+      AGENT_COMPOSE_BASE_URL: "${AGENT_COMPOSE_BASE_URL:-http://node-server:8003}"
       # ClickHouse 数据源（可选；未启用时主链路照常运行，仅跳过 payload 双写）。
       CLICKHOUSE_ADDR: clickhouse:8123
       CLICKHOUSE_DATABASE: "${CLICKHOUSE_DATABASE:-ai_lubricant_logs}"
@@ -203,7 +209,6 @@ services:
       <<: *db-env
       NODE_CONTROL_HOST: 0.0.0.0
       NODE_CONTROL_PORT: "8003"
-      NODE_CONTROL_TOKEN: "${NODE_CONTROL_TOKEN:-}"
     ports:
       - "${NODE_CONTROL_PUBLIC_PORT:-8003}:8003"
     depends_on:
@@ -234,8 +239,7 @@ services:
     environment:
       <<: *db-env
       # 节点穿透经独立 node-server 控制面下发。
-      AGENT_COMPOSE_BASE_URL: http://node-server:8003
-      NODE_CONTROL_TOKEN: "${NODE_CONTROL_TOKEN:-}"
+      AGENT_COMPOSE_BASE_URL: "${AGENT_COMPOSE_BASE_URL:-http://node-server:8003}"
       TUNNEL_RUNTIME_HOST: 0.0.0.0
       TUNNEL_RUNTIME_PORT: "8004"
       TUNNEL_RUNTIME_ENABLED: "${TUNNEL_RUNTIME_ENABLED:-true}"
@@ -247,6 +251,9 @@ services:
       MC_TUNNEL_BIN_DIR: /data/mc-tunnel-bins
     volumes:
       - ./data/ai_tunnel_bins:/data/mc-tunnel-bins
+      # tunnel 的启停要带 token 调 node-server；自有的 volumes 覆盖了锚点，这里补上
+      # 宿主 .env 挂载（node-server 首启写回的 token 由本服务启动时读到）。
+      - ./.env:/app/.env
     expose:
       - "8004"
     depends_on:

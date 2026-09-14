@@ -37,8 +37,8 @@ def _isolate_from_real_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def test_compat_disabled_by_default(monkeypatch):
-    """Without env flags the layer must be disabled and init must be a no-op."""
+def test_compat_enabled_by_default(monkeypatch):
+    """默认启用兼容层：用户门户/节点页是主部署形态；纯网关部署显式设 false 关闭。"""
     _isolate_from_real_env(monkeypatch)
     for key in (
         "AI_LUBRICANT_COMPAT_ENABLED",
@@ -48,8 +48,28 @@ def test_compat_disabled_by_default(monkeypatch):
     import user_platform.config as cfg
 
     importlib.reload(cfg)
-    assert cfg.settings.enabled is False
+    assert cfg.settings.enabled is True
     assert cfg.settings.user_adapter_enabled is False
+
+
+def test_compat_explicit_false_still_disables(monkeypatch):
+    """显式 false 必须仍生效（纯网关部署路径不被默认翻转破坏）。"""
+    _isolate_from_real_env(monkeypatch)
+    monkeypatch.setenv("AI_LUBRICANT_COMPAT_ENABLED", "false")
+    import user_platform.config as cfg
+
+    importlib.reload(cfg)
+    assert cfg.settings.enabled is False
+
+
+def test_agent_compose_base_url_default_is_loopback(monkeypatch):
+    """未配置时兜底指向本机 node_server，避免节点页报「未配置控制面」。"""
+    _isolate_from_real_env(monkeypatch)
+    monkeypatch.delenv("AGENT_COMPOSE_BASE_URL", raising=False)
+    import user_platform.config as cfg
+
+    importlib.reload(cfg)
+    assert cfg.settings.agent_compose_base_url == "http://127.0.0.1:8003"
 
 
 def test_system_user_id_is_deterministic(monkeypatch):

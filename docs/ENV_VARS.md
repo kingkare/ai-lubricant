@@ -60,8 +60,8 @@
 | `AI_LUBRICANT_SYSTEM_USER_ID` | `system_user_id` | 数据 | 否 | `00000000-...001` | 系统用户 UUID |
 | `AI_LUBRICANT_SYSTEM_USER_NAME` | `system_user_name` | 数据 | 否 | system | 系统用户名 |
 | `AI_LUBRICANT_SYSTEM_USER_EMAIL` | `system_user_email` | 数据 | 否 | system@ai-lubricant.local | 系统用户邮箱 |
-| `NODE_CONTROL_TOKEN`（legacy `AGENT_COMPOSE_NODE_API_TOKEN`） | `node_control_token` | **两** | 否* | — | 数据服务→控制服务内部 Bearer；**两进程必须同值**。缺失时控制服务首启自动生成并回写 |
-| `NODE_CREDENTIAL_ENCRYPTION_KEY` | `node_credential_encryption_key` | 控制 | 否* | — | 节点 TOTP 凭据 AES-256 密钥，**生成后不可轮换**，否则已加密节点凭据全部失效。缺失自动生成回写 |
+| `NODE_CONTROL_TOKEN`（legacy `AGENT_COMPOSE_NODE_API_TOKEN`） | `node_control_token` | **两** | 是 | — | 数据服务→控制服务内部 Bearer；**两进程必须同值**。生成：`openssl rand -base64 32`（或任意 32 字节随机串）。必须在容器创建前写进 `.env` |
+| `NODE_CREDENTIAL_ENCRYPTION_KEY` | `node_credential_encryption_key` | 控制 | 是 | — | 节点 TOTP 凭据 AES-256 密钥，**生成后不可轮换**，否则已加密节点凭据全部失效。生成：`openssl rand -hex 32` |
 | `AGENT_COMPOSE_NODE_SERVER_PUBLIC_URL` | `node_server_public_url` | 控制 | 否 | — | 节点拨号地址（含端口），如 `http://<控制服务地址>:8003` |
 | `AGENT_COMPOSE_BASE_URL` | `agent_compose_base_url` | 数据 | 否 | `http://127.0.0.1:8003` | 数据面→控制面地址 |
 | `AGENT_COMPOSE_TIMEOUT` | `agent_compose_timeout` | 数据 | 否 | 30 | 控制面调用超时秒数 |
@@ -70,7 +70,7 @@
 | `NODE_CONTROL_PORT` | `node_control_port` | 控制 | 否 | 8003 | 控制服务监听端口 |
 | `AGENT_COMPOSE_AGENT_IMAGE` | `agent_compose_agent_image` | 控制 | 否 | `ai-lubricant-node:local` | 节点 agent 镜像 |
 | `AGENT_COMPOSE_NODE_BIN_DIR` | `agent_compose_node_bin_dir` | 控制 | 否 | — | 节点二进制目录 |
-| `AGENT_ATTACHMENT_SIGNING_KEY` | — | 数据 | 否* | — | Agent 附件签名临时 URL 的 HMAC 密钥；**多实例必须同值**。附件 `content`/`thumbnail` 端点接受 `exp`+`sig` 免登录访问，消息 serve 时为每个 media part 注入 2h 短时签名 URL。缺失时启动自动生成随机值并回写 `.env`（多实例部署须显式配置同一值，否则各实例签发的 URL 互不通过） |
+| `AGENT_ATTACHMENT_SIGNING_KEY` | — | 数据 | 是 | — | Agent 附件签名临时 URL 的 HMAC 密钥；**多实例必须同值**。附件 `content`/`thumbnail` 端点接受 `exp`+`sig` 免登录访问，消息 serve 时为每个 media part 注入 2h 短时签名 URL。生成：`openssl rand -base64 48` |
 | `NODE_DEFAULT_SESSION_CPU` | `node_default_session_cpu` | 控制 | 否 | 1.0 | 节点会话默认 CPU（核） |
 | `NODE_DEFAULT_SESSION_MEMORY` | `node_default_session_memory` | 控制 | 否 | 1073741824 | 节点会话默认内存（字节，1Gi） |
 | `NODE_TERMINAL_MAX_ACTIVE_PER_NODE` | `node_terminal_max_active_per_node` | 控制 | 否 | 10 | 单节点最大活跃终端数，>=1 |
@@ -80,7 +80,7 @@
 | — | `bootstrap_admin_password` | 数据 | 否 | 空 | 首启管理员密码（ini-only） |
 | — | `bootstrap_admin_name` | 数据 | 否 | admin | 首启管理员显示名（ini-only） |
 
-> \* `node_control_token` / `node_credential_encryption_key` 虽非启动必填（控制服务会自动生成回写），但**一旦生成不得更改**；两进程共用同一份 .env 即可天然一致。
+> \* `node_control_token` / `node_credential_encryption_key` / `agent_attachment_signing_key` **必须在容器创建前手填非空值**（生成方式见上表）。留空时控制服务会尝试「生成后写回 `.env`」，而 Docker 单文件挂载上写回会因文件重命名报 `EBUSY` 而拒启。三者一旦生成不得更改；多实例部署必须同值。
 
 ### `[clickhouse]` 请求 payload 双写（可选，默认关闭）
 

@@ -60,7 +60,24 @@ git submodule status</code></pre>
 <tr><td><code>POSTGRES_USER</code> / <code>POSTGRES_PASSWORD</code> / <code>POSTGRES_DATABASE</code></td><td>同时是 Compose 建库参数和应用连接参数，一处改两边生效。密码必须换成强密码。</td></tr>
 <tr><td><code>AI_LUBRICANT_COMPAT_ENABLED</code></td><td>要用 Web 管理端（<code>/manager</code>）和用户门户（<code>/console</code>）必须设 <code>true</code>。</td></tr>
 <tr><td><code>AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL</code> / <code>_PASSWORD</code></td><td>首次启动幂等创建平台管理员；创建完成后从 .env 移除明文密码。</td></tr>
+<tr><td><code>NODE_CONTROL_TOKEN</code></td><td>数据服务→控制服务的内部 Bearer，<strong>两进程必须同值</strong>。见下方「生成三个共享密钥」。</td></tr>
+<tr><td><code>NODE_CREDENTIAL_ENCRYPTION_KEY</code></td><td>节点 TOTP 凭据 AES-256 密钥，<strong>生成后不可轮换</strong>，否则已加密的节点凭据全部失效。见下方生成方式。</td></tr>
+<tr><td><code>AGENT_ATTACHMENT_SIGNING_KEY</code></td><td>Agent 附件签名临时 URL 的 HMAC 密钥，多实例必须同值。见下方生成方式。</td></tr>
 </tbody></table></div>
+<h3 id="secrets">生成三个共享密钥（插入 .env，容器创建前必须有值）</h3>
+<p>容器创建时才会解析 <code>.env</code>，所以这三个值必须在 <code>docker compose up</code> 之前就写进 <code>.env</code>。任选一种生成方式（<strong>不需要 Python</strong>）：</p>
+<pre><code># a) 有 openssl（Linux/macOS 自带）：
+openssl rand -base64 32   →  填入 NODE_CONTROL_TOKEN=
+openssl rand -hex 32      →  填入 NODE_CREDENTIAL_ENCRYPTION_KEY=
+openssl rand -base64 48   →  填入 AGENT_ATTACHMENT_SIGNING_KEY=
+
+# b) 有 Python：
+python script/init_compose_env.py    # 自动写入 .env，幂等
+
+# c) 都没有：浏览器搜 “random hex generator”，生成 32 字节随机串填入即可
+#    三个值互相独立、各不相同；系统不校验格式，任意随机串均可。</code></pre>
+<div class="danger"><strong>留空会拒启</strong>这三个键若留空，node-server 首启会尝试「生成后写回 .env」；而在 Docker 单文件挂载（<code>./.env:/app/.env</code>）上文件重命名会报 <code>[Errno 16] Device or resource busy</code>，导致控制服务直接拒启（容器 unhealthy）。<strong>先在宿主 .env 填好非空值</strong>，node-server 读到值就跳过写回，不会触发该错误。</div>
+<div class="warn"><strong>改完 .env 必须 up 重建，restart 无效</strong><code>docker compose restart</code> 只重启进程，不重新解析 <code>env_file</code>——容器环境变量是创建那一刻的快照，之后改 <code>.env</code> 一个字节都不会进容器。改密钥后请用 <code>docker compose up -d --force-recreate</code>（或带 <code>--build</code>）。</div>
 <div class="warn"><strong>不要提交 .env</strong>里面有数据库密码、内部 token 和管理员密码。生产环境敏感值走 Secret 注入，全量字段见 <a href="env-vars.html">环境变量清单</a>。</div>
 <div class="info"><strong>Compose 暴露的调试端口</strong>PostgreSQL 映射到宿主 <code>15432</code>、Redis 到 <code>6479</code>，仅本机调试用；生产环境把它们从对外映射里去掉，只留内网。</div>
 
@@ -107,6 +124,7 @@ docker compose exec -T postgres \
 
 # 停止（保留数据卷）
 docker compose down</code></pre>
+<div class="warn"><strong>升级必须一起更新子模块</strong>只 <code>git pull</code> 主仓，<code>node_server/</code> 等子模块的工作树仍停在旧代码，<code>docker compose up --build</code> 用的还是旧源码。已部署升级后若节点页报「未配置控制面」，先 <code>git submodule update --init --recursive</code> 再重建镜像。</div>
 <div class="danger"><strong>down -v 会删除数据卷</strong>除非已确认备份完成，否则不要执行 <code>docker compose down -v</code>。</div>
 
 <h2 id="clickhouse">8. 可选：ClickHouse</h2>
@@ -146,7 +164,7 @@ docker run -d --name ai-lubricant-tunnel-server \
   -e TUNNEL_RUNTIME_HOST=0.0.0.0 -e TUNNEL_RUNTIME_PORT=8004 \
   -e TUNNEL_RUNTIME_ENABLED=true \
   ai-lubricant-api python -m tunnel_server</code></pre>
-<div class="danger"><strong>两个容器必须读同一份 .env</strong><code>NODE_CONTROL_TOKEN</code> 是数据服务→控制服务的内部 Bearer，两边必须完全一致；控制服务缺 token/密钥时会回写 .env，所以挂载的 .env 必须可写且持久化。Tunnel Runtime 经 <code>AGENT_COMPOSE_BASE_URL</code> 调控制服务，URL 错就启停不了隧道。</div>
+<div class="danger"><strong>两个容器必须读同一份 .env</strong><code>NODE_CONTROL_TOKEN</code> 是数据服务→控制服务的内部 Bearer，两边必须完全一致，且必须在启动前就写进 <code>.env</code>（见第 3 步「生成三个共享密钥」）。<strong>不要依赖控制服务自动生成回写</strong>：单文件挂载的 <code>.env</code> 上写回会因文件重命名报 EBUSY 而拒启。Tunnel Runtime 经 <code>AGENT_COMPOSE_BASE_URL</code> 调控制服务，URL 错就启停不了隧道。</div>
 <p>完整 Web 前端需要先构建产物：<code>cd user-frontend &amp;&amp; pnpm install &amp;&amp; pnpm build</code>，再把 <code>/api</code>、<code>/admin</code>、<code>/v1</code>、<code>/agent</code>、<code>/mcp</code> 前缀反代到数据服务（支持 WebSocket 与 SSE）。仓库用 pnpm（<code>pnpm-lock.yaml</code> 锁定），不要换成 npm。</p>
 
 <h2 id="checklist">10. 生产上线清单</h2>
