@@ -149,6 +149,22 @@ def test_build_manifest_omits_code_for_non_code_channel():
     assert "code" not in channel
 
 
+def test_build_manifest_omits_builtin_type_for_custom_channel():
+    """自定义渠道的 type='custom' 绝不能当成 builtin_type 带出，否则新建时报
+    「未知的内置渠道类型: custom」。"""
+    base = {
+        "remark": "自定义渠道",
+        "type": "custom",
+        "custom_channel": True,
+        "base_url": "https://api.example.com/v1",
+        "billing_mode": "token",
+        "chat_protocols": [{"protocol": "openai", "path": "/v1/chat/completions"}],
+    }
+    channel = build_manifest("custom-chan", base, {})["resource"]["channel"]
+    assert "builtin_type" not in channel
+    assert "code" not in channel
+
+
 def test_channel_summary_is_optional_but_mcp_summary_remains_required():
     channel = _channel_manifest()
     channel.pop("summary")
@@ -381,7 +397,9 @@ def _patch_channel_import_env(monkeypatch):
         return {"module": module, "item_id": str(manifest.get("id")), "manifest": manifest, "summary": {}}
 
     async def fake_list_summaries(module):
-        return []
+        # 形状必须与 store.list_summaries 一致：是 manifest 抽出的 summary 行（键为 "id"），
+        # 不是 DB 列（"item_id"）。导入 job 用它对已有模板做 skip 判定，用错键会 KeyError。
+        return [{"id": item_id} for (mod, item_id) in stored["items"] if mod == module]
 
     async def fake_is_populated():
         return stored["populated"]
@@ -394,6 +412,38 @@ def _patch_channel_import_env(monkeypatch):
     monkeypatch.setattr(channel_catalog, "apply_authoritative_manifests", must_not_apply)
     monkeypatch.setattr(channel_catalog, "refresh", must_not_refresh)
     return stored
+
+
+def test_channel_import_job_skips_already_published_channel(monkeypatch):
+    """store 里已有同 id 模板且 overwrite=False → 该渠道 skip。
+
+    回归：existing 集合从 summary 行取 id，曾误用 DB 列名 row["item_id"]，
+    store 非空时必 KeyError（store 空时被掩盖）。
+    """
+    import asyncio
+
+    from user_platform.marketplace import channel_import_jobs as jobs
+    from user_platform.marketplace import routes
+
+    stored = _patch_channel_import_env(monkeypatch)
+    # 预置一条已发布模板：模拟真实 store 非空，触发 existing 集合的读取。
+    stored["items"][("channels", "local.agnes")] = {"id": "local.agnes"}
+
+    job_id, conflict = jobs.create_job(["agnes"], overwrite=False)
+    assert job_id and conflict is None
+    asyncio.run(routes._run_channel_import_job(job_id, ["agnes"], False))
+
+    job = jobs.get_job(job_id)
+    assert job["status"] == "done"
+    # skipped 记的是渠道 provider 名；模板 id 在 items 里。
+    assert job["skipped"] == ["agnes"]
+    assert job["written"] == []
+    assert job["items"][0]["state"] == "skipped"
+    assert job["items"][0]["template_id"] == "local.agnes"
+
+    jobs._jobs.clear()
+    jobs._tasks.clear()
+    jobs._active_job_id = None
 
 
 def test_channel_import_job_writes_store_without_github_or_raw_refresh(monkeypatch):

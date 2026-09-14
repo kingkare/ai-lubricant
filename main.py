@@ -6501,6 +6501,10 @@ if __name__ == "__main__":
     import socket
     import uvicorn
 
+    # 监听端口可由 SERVER_PORT 覆盖（默认 8001）。托管平台（如创空间）要求进程
+    # 自己绑固定端口（7860），容器形态在环境变量里设 SERVER_PORT=7860。
+    listen_port = int(os.getenv("SERVER_PORT", "8001"))
+
     # Windows resolves localhost to ::1 first. Binding only 0.0.0.0 makes
     # sequential clients wait for the failed IPv6 connection before retrying
     # 127.0.0.1 (about two seconds on this host). Uvicorn's plain host="::"
@@ -6511,11 +6515,11 @@ if __name__ == "__main__":
         # Same flag uvicorn.Config.bind_socket sets on the sockets it creates.
         listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listen_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        listen_socket.bind(("::", 8001))
+        listen_socket.bind(("::", listen_port))
         listen_socket.listen(2048)
     except OSError:
         if "listen_socket" in locals():
             listen_socket.close()
-        uvicorn.run(app, host="0.0.0.0", port=8001)
+        uvicorn.run(app, host="0.0.0.0", port=listen_port)
     else:
         uvicorn.Server(uvicorn.Config(app)).run(sockets=[listen_socket])

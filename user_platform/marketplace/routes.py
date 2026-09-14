@@ -922,7 +922,9 @@ async def _run_channel_import_job(job_id: str, providers: list[str], overwrite: 
 
     try:
         channel_import_jobs.set_phase(job_id, "importing")
-        existing = {row["item_id"] for row in await store.list_summaries("channels")}
+        # list_summaries 返回的是 manifest 抽出的 summary 行，id 键是 "id"（不是 DB 列名
+        # item_id）——按 item_id 取会 KeyError。
+        existing = {str(row.get("id") or "") for row in await store.list_summaries("channels")}
         for name in providers:
             channel_import_jobs.set_item(job_id, name, "importing")
             try:

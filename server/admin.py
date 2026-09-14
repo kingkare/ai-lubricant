@@ -5428,9 +5428,6 @@ async def create_custom_provider(data: dict, token: str = Header(None, alias="Au
             if name in existing_names:
                 name = _auto_generate_name(remark or name, existing_names)
 
-        if not data.get("accounts"):
-            raise HTTPException(status_code=400, detail="自定义渠道必须至少添加一个账号")
-
         cfg = _custom_provider_config_from_payload(data)
 
     cfg["remark"] = cfg.get("remark") or remark or name

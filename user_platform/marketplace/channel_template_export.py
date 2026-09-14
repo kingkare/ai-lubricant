@@ -163,9 +163,12 @@ def build_manifest(name: str, cfg: dict, policy: dict) -> dict:
         channel["retry_count"] = max(0, min(10, int(channel["retry_count"])))
     # 代码渠道（builtin_type='code'）：spec 源码是渠道本体，必须随模板往返，
     # 否则导入端只能拿到一个没有 spec 的空壳。其它内置类型不带 code 键，
-    # 避免普通渠道模板里塞一个空串字段。builtin_type 一律带出，导入端据此还原
-    # 「新建渠道」时的类型（决定 Provider 类与认证方式）。
-    builtin_type = str(cfg.get("builtin_type") or cfg.get("type") or "")
+    # 避免普通渠道模板里塞一个空串字段。
+    #
+    # 只认真正的 builtin_type（'code'/'cloudflare'…），**不能**回落到 type：
+    # 自定义渠道的 type 是 'custom'，回落后导入端会把 'custom' 当内置类型去建渠道，
+    # 后端直接报「未知的内置渠道类型: custom」。自定义渠道本就没有 builtin_type。
+    builtin_type = str(cfg.get("builtin_type") or "")
     if builtin_type:
         channel["builtin_type"] = builtin_type
     if builtin_type == "code":

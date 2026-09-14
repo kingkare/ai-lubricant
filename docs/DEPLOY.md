@@ -155,6 +155,27 @@ supervisord -c <生成的 conf 路径> -n
 - Linux supervisord/单脚本在 musl/Alpine 上无法运行官方 glibc 二进制，用 glibc 发行版。
 - PG 主版本固定 16（与 compose 一致），不自动跨版本升级。
 
+### 形态 G：托管平台单容器（创空间类）
+
+面向「推送 git 仓库触发构建、跑 Dockerfile、单容器、无 compose、无持久卷、应用须自己绑固定端口」的托管平台（如创空间）。用 [Dockerfile.codespace](Dockerfile.codespace) + [deploy/codespace/entrypoint.sh](deploy/codespace/entrypoint.sh)：一个容器内用 supervisord 拉起 PG + Redis + node-server + main + tunnel-server，**对外只监听 7860**（平台约定端口，`SERVER_PORT` 驱动 main）。
+
+构建参数（平台侧配置）：
+
+```bash
+docker build -f Dockerfile.codespace \
+  --build-arg AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL=you@example.com \
+  --build-arg AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD='<强密码>' \
+  -t ai-lubricant-codespace .
+```
+
+要点：
+
+- **端口**：数据服务绑 `SERVER_PORT`（默认 8001，容器内设 7860）；控制面/穿透绑容器内网 `127.0.0.1:8003`/`8004`，经穿透对外，不需宿主映射。节点拨号地址用 `AGENT_COMPOSE_NODE_SERVER_PUBLIC_URL`（穿透后的公网地址）；节点 hello 里的网关 origin 用 `AI_LUBRICANT_GATEWAY_PUBLIC_URL`（创空间公网域名）显式覆盖。
+- **自举幂等**：入口脚本先跑 `python -m native_deps.cli supervisord-conf`（initdb/写 `.env`/生成密钥，全部幂等）再 `exec supervisord -n`。容器 restart 保留文件 → 初始化跳过、PG 数据存活；重建清空 → 重新建库并重种管理员。
+- **管理员**：`AI_LUBRICANT_BOOTSTRAP_ADMIN_*` 由构建参数注入，应用启动时 `seed_bootstrap_admin` 播种（幂等：邮箱已存在则不重置密码）。注意 ARG 值会写进镜像层，私有仓可接受；更严则改用平台环境变量注入并删掉 Dockerfile 里对应的 ARG→ENV 三行。
+- **中间件来源**：PG 16 走 PGDG apt 源、Redis 走 Debian apt（`native_deps.binaries.ensure_dep` 先 `which` 命中系统二进制，跳过 `native_deps` 的下载路径——其 Linux PG 二进制 URL 上游已 404、Redis 默认是源码 tarball）。构建期跑一次 `provision` 完成 initdb + 写 `.env`，容器启动不再下载。若坚持用自备二进制，设 `NATIVE_*_DOWNLOAD_URL` + `SHA256`。
+- **内存**：单容器内 PG + Redis + 3 个 Python 进程共用内存；PG `shared_buffers=128MB`、Redis `noeviction`+`save ""` 已设，ClickHouse 默认关。内存 <2G 需实测。
+
 ## 前端产物
 
 数据服务启动时查找 `user-frontend/dist/index.html` 作为用户门户与管理端共用 SPA（挂 `/admin-static`，API 前缀走后端、其余回退 index.html）。没有构建产物时根路径只返回前端构建提示，API 仍可正常运行。
