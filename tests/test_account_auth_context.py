@@ -426,10 +426,102 @@ def test_replay_first_stage_returns_pending(monkeypatch):
 
 
 def test_replay_without_params_raises_400(monkeypatch):
+    """非 JSON 且解析不出参数 → 400（现在由「无会话认领」分支给出，不是入口拦截）。"""
     monkeypatch.setattr(admin, "_require_admin", _allow_admin)
     with pytest.raises(HTTPException) as exc:
         asyncio.run(admin.replay_provider_account_auth("demo", {"callback_url": "http://x/y"}, "Bearer t"))
     assert exc.value.status_code == 400
+
+
+def test_replay_empty_payload_raises_400(monkeypatch):
+    """空粘贴（含只有空白）→ 入口就 400，不给渠道钩子空跑。"""
+    monkeypatch.setattr(admin, "_require_admin", _allow_admin)
+    for raw in ("", "   ", None):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(admin.replay_provider_account_auth(
+                "demo", {"callback_url": raw}, "Bearer t"))
+        assert exc.value.status_code == 400
+        assert "粘贴" in str(exc.value.detail)
+
+
+def test_replay_json_payload_bypasses_query_parse(monkeypatch):
+    """JSON 载荷（控制台复制的凭证块）跳过 query 解析，原文整条透传给钩子。
+
+    凭证 JSON 里的 base64 '=' 会被 parse_qs 切碎成垃圾键，所以 params 必须为空、
+    原始文本必须原样到达钩子——这是 AutoClaw 海外区补投的关键契约。
+    """
+    received: dict = {}
+
+    class Provider:
+        async def handle_loopback_callback(self, params, poll_params, callback_url=""):
+            received["params"] = params
+            received["url"] = callback_url
+            return {"status": "authorized", "account_data": {"user_name": "neo"}}
+
+    record = {"provider": "demo", "status": "pending", "task_type": "device_code",
+              "poll_params": {"login": "credential"}, "account": {}}
+    _install_loopback(monkeypatch, [("s1", record)], provider=Provider(), provider_cls=Provider)
+    _stub_finalize_deps(monkeypatch)
+
+    async def set_state(_s, _d):
+        pass
+
+    async def read_config(_n):
+        return {}
+
+    async def log_op(*_a, **_k):
+        pass
+
+    monkeypatch.setattr(admin, "_set_account_auth_state", set_state)
+    monkeypatch.setattr(admin, "_read_provider_config", read_config)
+    monkeypatch.setattr(admin, "_log_operation", log_op)
+    monkeypatch.setattr(admin, "_require_admin", _allow_admin)
+
+    payload = '{"accessToken":"Bearer at=x=y","refreshToken":"rt==","deviceId":"dev-1"}'
+    result = asyncio.run(admin.replay_provider_account_auth(
+        "demo", {"callback_url": payload}, "Bearer t"))
+
+    assert result["ok"] is True and result["status"] == "completed"
+    assert received["params"] == {}          # 没被 parse_qs 切碎
+    assert received["url"] == payload        # 原文原样透传
+
+
+def test_replay_bare_token_reaches_hook_with_empty_params(monkeypatch):
+    """裸 token 没有 query 参数，也必须到达钩子——入口拦掉只会给一个与实情无关的报错。"""
+    received: dict = {}
+
+    class Provider:
+        async def handle_loopback_callback(self, params, poll_params, callback_url=""):
+            received["params"] = params
+            received["url"] = callback_url
+            return {"status": "authorized", "account_data": {"user_name": "neo"}}
+
+    record = {"provider": "demo", "status": "pending", "task_type": "device_code",
+              "poll_params": {"login": "credential"}, "account": {}}
+    _install_loopback(monkeypatch, [("s1", record)], provider=Provider(), provider_cls=Provider)
+    _stub_finalize_deps(monkeypatch)
+
+    async def set_state(_s, _d):
+        pass
+
+    async def read_config(_n):
+        return {}
+
+    async def log_op(*_a, **_k):
+        pass
+
+    monkeypatch.setattr(admin, "_set_account_auth_state", set_state)
+    monkeypatch.setattr(admin, "_read_provider_config", read_config)
+    monkeypatch.setattr(admin, "_log_operation", log_op)
+    monkeypatch.setattr(admin, "_require_admin", _allow_admin)
+
+    token = "eyJhbGciOiJIUzI1NiJ9" + "y" * 40
+    result = asyncio.run(admin.replay_provider_account_auth(
+        "demo", {"callback_url": token}, "Bearer t"))
+
+    assert result["ok"] is True and result["status"] == "completed"
+    assert received["params"] == {}
+    assert received["url"] == token
 
 
 def test_replay_unclaimed_raises_400(monkeypatch):

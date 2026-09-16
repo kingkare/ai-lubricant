@@ -59,6 +59,13 @@ dist/
 .codegraph/
 .opencode/
 
+# 下载的第三方 AI 技能（HuggingFace skills add 拉取，随机器不同，不入库）
+.agents/
+skills-lock.json
+
+# 渠道目录调试 dump（本地排障用，不入库）
+.cat_debug.json
+
 # 本地脚本工具（个人临时脚本，不入库）；publish_github.sh 是标准发布工具，例外入库；
 # probe_apple_gsa.sh 是 Apple ID 登录出口的诊断脚本（多机部署用），例外入库
 # native_launch.sh 是无 Docker 原生启动入口（见 native_deps/），例外入库

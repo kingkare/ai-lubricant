@@ -31,7 +31,7 @@ from limits.manager import (
     routing_redis_state,
 )
 from limits.backend import RedisLimitBackend
-from model_metadata import FALLBACK_DEFAULT_MODEL_METADATA, apply_model_metadata, get_model_metadata, has_explicit_metadata, _mutable
+from model_metadata import apply_model_metadata, get_model_metadata, _mutable
 from providers.base import BaseProvider
 from providers.custom import CustomProvider
 from usage_utils import estimate_request_part_tokens
@@ -1964,6 +1964,11 @@ class ModelClientPool:
     # Daily reliability factor（Redis 日级成功/失败计数，跨重启）
     RELIABILITY_MIN_SAMPLES = 5           # 当天样本不足此值返回中性 1.0，不压新账号
     RELIABILITY_FLOOR = 0.2               # 可靠性下限，避免单候选被完全饿死
+    # 账号初始化并发护栏：启动窗口内主池 min_size 预连 + Tortoise 池已占住大量
+    # PG 连接，全渠道 init_all 无界并发会在同一窗口叠加上游 HTTP 与失败通知的
+    # outbox 写库，把共享 PG 的 max_connections 顶满（TooManyConnections）。
+    # 渠道内部账号本就串行（init_all 逐账号 await），跨渠道限 6 只拉平启动波形。
+    POOL_INIT_CONCURRENCY = 6
     # Exploration：带权随机中给次优候选留极小概率，避免一味死磕最快那一条
     EXPLORE_EPSILON = 0.05
     SPEED_NO_DATA_BASELINE = 0.7
@@ -2205,9 +2210,19 @@ class ModelClientPool:
 
     @classmethod
     async def _initialize_builtin_pools(cls, pools: list[ProviderPool]):
+        # 启动窗口的 PG 连接最紧张（两池 min_size 预连 + 迁移建表），全渠道并发
+        # init_all / restore_cooldowns 叠上去就是 TooManyConnections 的主力之一。
+        # gate 在方法内新建：asyncio.Semaphore 绑首个使用它的 loop，模块级实例在
+        # 测试的多次 asyncio.run() 间会串 loop 报 "attached to a different loop"。
+        gate = asyncio.Semaphore(cls.POOL_INIT_CONCURRENCY)
+
+        async def _gated(coro):
+            async with gate:
+                return await coro
+
         try:
             restore_results = await asyncio.gather(
-                *(pool.restore_cooldowns() for pool in cls._provider_pools.values()),
+                *(_gated(pool.restore_cooldowns()) for pool in cls._provider_pools.values()),
                 return_exceptions=True,
             )
             for pool, result in zip(cls._provider_pools.values(), restore_results):
@@ -2215,7 +2230,7 @@ class ModelClientPool:
                     logger.error(f"恢复账号冷却失败 provider={getattr(pool, 'provider_name', '?')}: {result}")
 
             init_results = await asyncio.gather(
-                *(pool.init_all() for pool in pools),
+                *(_gated(pool.init_all()) for pool in pools),
                 return_exceptions=True,
             )
             for pool, result in zip(pools, init_results):
@@ -2246,8 +2261,16 @@ class ModelClientPool:
         ]
 
         if custom_pools:
+            # custom 渠道 init_all 与 builtin 共用同一并发护栏理由（启动窗口 PG 紧张）；
+            # 此 gather 在 builtin 后台任务 spawn 之前完成，两者不重叠，独立 gate 即可。
+            gate = asyncio.Semaphore(cls.POOL_INIT_CONCURRENCY)
+
+            async def _gated(coro):
+                async with gate:
+                    return await coro
+
             await asyncio.gather(*(
-                pool.init_all(use_invitation_interval=False)
+                _gated(pool.init_all(use_invitation_interval=False))
                 for pool in custom_pools
             ))
 
@@ -2960,17 +2983,19 @@ class ModelClientPool:
                     logger.warning(f"关闭 provider session 失败 provider={getattr(provider, 'PROVIDER_NAME', '?')}: {e}")
 
     @classmethod
-    def _metadata_for_model(cls, model_id: str, by_id: dict, groups_by_id: dict, default: dict) -> tuple[dict, bool]:
-        metadata = {**FALLBACK_DEFAULT_MODEL_METADATA, **(default or {})}
+    def _metadata_for_model(cls, model_id: str, by_id: dict, groups_by_id: dict) -> tuple[dict, bool]:
+        """返回 (metadata, is_explicit_missing)。
+
+        只返回显式配置的元数据；未配置时返回 ``({}, True)``。
+        """
         record = by_id.get(model_id) or groups_by_id.get(model_id)
         if not record:
-            return metadata, True
-        metadata.update({k: v for k, v in record.items() if k != "model_id"})
-        return metadata, False
+            return {}, True
+        return {k: v for k, v in record.items() if k != "model_id"}, False
 
     @classmethod
-    def _apply_metadata_from_indices(cls, item: dict, by_id: dict, groups_by_id: dict, default: dict) -> bool:
-        metadata, is_default_only = cls._metadata_for_model(item.get("id"), by_id, groups_by_id, default)
+    def _apply_metadata_from_indices(cls, item: dict, by_id: dict, groups_by_id: dict) -> bool:
+        metadata, is_default_only = cls._metadata_for_model(item.get("id"), by_id, groups_by_id)
         for key, value in metadata.items():
             if item.get(key) is None:
                 item[key] = value
@@ -3012,11 +3037,11 @@ class ModelClientPool:
         return groups_by_id
 
     @classmethod
-    def _apply_group_member_min_tokens_from_indices(cls, item: dict, members: list[str], by_id: dict, groups_by_id: dict, default: dict) -> None:
+    def _apply_group_member_min_tokens_from_indices(cls, item: dict, members: list[str], by_id: dict, groups_by_id: dict) -> None:
         for field in ("max_tokens", "max_context_tokens"):
             values = []
             for member in members:
-                metadata, _ = cls._metadata_for_model(member, by_id, groups_by_id, default)
+                metadata, _ = cls._metadata_for_model(member, by_id, groups_by_id)
                 try:
                     value = int(metadata.get(field) or 0)
                 except (TypeError, ValueError):
@@ -3050,21 +3075,19 @@ class ModelClientPool:
         # 会随 item 一路带进 _models，最终 pydantic 序列化时抛
         # "Unable to serialize unknown type: <class 'mappingproxy'>"。
         # 用 _mutable 递归还原为可变 dict/list，从源头杜绝。
-        default = _mutable(snapshot.default)
         by_id = {model_id: _mutable(item) for model_id, item in snapshot.metadata.items()}
         groups_by_id = {model_id: _mutable(item) for model_id, item in snapshot.group_metadata.items()}
 
         emitted_ids = set()
         for model_id in cls.all_model_ids():
-            if model_id not in by_id:
-                continue
             item = {
                 "id": model_id,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "ai-lubricant",
             }
-            cls._apply_metadata_from_indices(item, by_id, groups_by_id, default)
+            # 有元数据则打上能力字段；没有就只留基础字段，不合成默认值。
+            cls._apply_metadata_from_indices(item, by_id, groups_by_id)
             model_list.append(item)
             emitted_ids.add(model_id)
 
@@ -3074,7 +3097,7 @@ class ModelClientPool:
         for display_id, group in group_index.items():
             if display_id in custom_emitted:
                 continue
-            members = [m for m in group.get("models", []) if isinstance(m, str) and m and m in by_id and cls.has_model_route(m)]
+            members = [m for m in group.get("models", []) if isinstance(m, str) and m and cls.has_model_route(m)]
             if not members:
                 continue
             custom_emitted.add(display_id)
@@ -3094,11 +3117,11 @@ class ModelClientPool:
             if remark:
                 item["remark"] = remark
                 item["name"] = remark
-            cls._apply_metadata_from_indices(item, by_id, groups_by_id, default)
+            cls._apply_metadata_from_indices(item, by_id, groups_by_id)
             # 仅当未显式指定「模型元数据」来源时，才按成员逐字段取最小值；
             # 显式指定时直接采用该模型的原值，不做最小值折算。
             if not str(group.get("metadata_model") or "").strip():
-                cls._apply_group_member_min_tokens_from_indices(item, members, by_id, groups_by_id, default)
+                    cls._apply_group_member_min_tokens_from_indices(item, members, by_id, groups_by_id)
             model_list.append(item)
         return model_list
 
@@ -3739,7 +3762,17 @@ class ModelClientPool:
             max_age_hours = clear_config.get("max_age_hours", 2)
             clean_task.append(pool.clean_message(max_age_hours))
         if clean_task:
-            await asyncio.gather(*clean_task)
+            # 清理默认 2:00 整点跑，恰与小时聚合（_hourly_stats_loop 全表聚合）同窗。
+            # clear_conversations 虽是 Redis/上游 HTTP 而非 PG，但各渠道清理会触发
+            # 失败路径的通知写库（outbox），全渠道无界并发时在同一整点叠加。
+            # 渠道内账号本就串行+间隔（invitation_interval），跨渠道限 2 不改变总量。
+            gate = asyncio.Semaphore(2)
+
+            async def _gated(coro):
+                async with gate:
+                    return await coro
+
+            await asyncio.gather(*(_gated(t) for t in clean_task))
 
     @classmethod
     def _is_model_tpm_cooling(cls, model_id: str, now: float | None = None) -> bool:
@@ -4973,10 +5006,8 @@ class ModelClientPool:
             )
             candidates = []
             for member_model in group_models:
-                has_metadata = await _timed_routing_call(
-                    "candidate_metadata_ms", _catalog_call(has_explicit_metadata, member_model, snapshot=snapshot)
-                )
-                if has_metadata and cls.has_model_route(member_model):
+                # 候选只看是否有渠道路由；元数据是可选的增强信息，不再是入选前提。
+                if cls.has_model_route(member_model):
                     candidates.append(member_model)
             return candidates
         return [model_id]
@@ -6149,10 +6180,8 @@ class ModelClientPool:
         if not await _catalog_call(config.Config.is_model_group, model_id, snapshot=snapshot):
             return []
         group_models = await _catalog_call(config.Config.get_model_group_models, model_id, snapshot=snapshot)
-        return [
-            m for m in group_models
-            if await _catalog_call(has_explicit_metadata, m, snapshot=snapshot) and cls.has_model_route(m)
-        ]
+        # 可用成员只看是否有渠道路由；未配置元数据的成员同样可用。
+        return [m for m in group_models if cls.has_model_route(m)]
 
     @classmethod
     def get_model_providers(cls, model_id: str) -> list[str]:
@@ -6171,7 +6200,12 @@ class ModelClientPool:
 
     @classmethod
     def get_model_info(cls, model_id: str) -> dict | None:
-        """Return current catalog-backed model metadata without DB or lazy cache I/O."""
+        """Return current catalog-backed model metadata without DB or lazy cache I/O.
+
+        只返回显式元数据；未配置时回落到运行时模型表（``_models_by_id``）的条目。
+        默认元数据机制已废弃——这里不再合成 max_tokens/max_context_tokens/modalities
+        等默认值，调用方据「字段缺失」跳过相应限制。
+        """
         snapshot = model_catalog.current_snapshot()
         record = snapshot.metadata.get(model_id) or snapshot.group_metadata.get(model_id)
         if record is not None:
@@ -6180,11 +6214,7 @@ class ModelClientPool:
             # 同源；否则调用方拿到 tuple/MappingProxyType 后 isinstance(..., list) 误判，曾导致
             # _model_output_modalities 把 ('image',) 当非法值回退成 ['text']，图片/视频模型一律被
             # 误判为不支持生成。
-            return _mutable({
-                **FALLBACK_DEFAULT_MODEL_METADATA,
-                **dict(snapshot.default),
-                **{key: value for key, value in record.items() if key != "model_id"},
-            })
+            return _mutable({key: value for key, value in record.items() if key != "model_id"})
         return cls._models_by_id.get(model_id)
 
     @classmethod

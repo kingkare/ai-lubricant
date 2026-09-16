@@ -32,6 +32,11 @@ _MAX_REPO_PAGE_SIZE = 100
 _REPO_CACHE_TTL = 7 * 24 * 3600
 # Bounded prefetch timeout so CRUD never waits on a slow upstream Git API.
 _PREFETCH_TIMEOUT = 60
+# Profile (username) lookup runs inline on add/update so the response already
+# carries the label. It is one lightweight call, but a user is waiting on it, so
+# the budget is tight: past this we return without a label rather than keep the
+# save button spinning.
+_PROFILE_TIMEOUT = 5
 
 
 def _normalize_repo_page_size(size: int) -> int:
@@ -384,8 +389,49 @@ class GitService:
             remark=req.get("remark") or None,
             oauth_refresh_token=req.get("oauth_refresh_token") or None,
         )
+        await self._fill_identity_username(identity)
         self._prefetch_repositories(identity)
         return _identity_dict(identity)
+
+    async def _fill_identity_username(self, identity: GitIdentity) -> None:
+        """Resolve the account name from the host and store it as ``username``.
+
+        The console no longer asks the user for a username — it is a label, not
+        a credential (the token authenticates on its own; see
+        ``node_server.git_proxy._auth_header``). Asking the host keeps the field
+        truthful and makes the repo picker show ``octocat`` instead of a base
+        URL.
+
+        Best-effort by design: an unsupported host, an unreachable API or a
+        token without profile scope leaves the field as the caller supplied it.
+        A bad credential is reported by the repo prefetch, not here — this must
+        never be the reason an add or update fails. An explicit value from the
+        caller wins — this only fills a gap.
+
+        Bounded by :data:`_PROFILE_TIMEOUT`: this runs inline on an interactive
+        add/update request, so a slow host must degrade to "no label" rather
+        than stall the response for the client's full HTTP timeout.
+        """
+        if (identity.username or "").strip():
+            return
+        try:
+            profile = await asyncio.wait_for(
+                git_clients.fetch_profile(
+                    (identity.platform or "").lower(),
+                    git_clients.RepositoryOptions(
+                        token=identity.access_token or "",
+                        base_url=identity.base_url or "",
+                        is_oauth=bool(identity.oauth_refresh_token),
+                    ),
+                ),
+                timeout=_PROFILE_TIMEOUT,
+            )
+        except Exception:  # noqa: BLE001 — a label lookup must never fail the add
+            return
+        if profile.is_empty:
+            return
+        identity.username = profile.username
+        await identity.save(update_fields=["username", "updated_at"])
 
     async def update_identity(
         self, user_id: str, identity_id: str, req: dict, *, role: str | None = None
@@ -394,7 +440,7 @@ class GitService:
         if identity is None:
             return False
         changed: list[str] = []
-        for field in ("base_url", "username", "email", "organization_id", "remark"):
+        for field in ("base_url", "organization_id", "remark"):
             if field in req:
                 setattr(identity, field, req[field])
                 changed.append(field)
@@ -403,6 +449,19 @@ class GitService:
         if req.get("access_token"):
             identity.access_token = req["access_token"]
             changed.append("access_token")
+            # A new token may belong to a different account, so the derived label
+            # is now suspect. Drop it and let the lookup below refill it — but
+            # only when the caller did not supply a username of their own.
+            if not (req.get("username") or "").strip():
+                identity.username = None
+                changed.append("username")
+        if req.get("username"):
+            identity.username = req["username"]
+            if "username" not in changed:
+                changed.append("username")
+        if req.get("email"):
+            identity.email = req["email"]
+            changed.append("email")
         if req.get("oauth_refresh_token"):
             identity.oauth_refresh_token = req["oauth_refresh_token"]
             changed.append("oauth_refresh_token")
@@ -413,6 +472,9 @@ class GitService:
         # Credentials/base_url/org may have changed → drop stale cached repos and
         # re-warm the cache in the background (matches upstream's Update).
         _repo_cache.invalidate(str(identity.user_id), str(identity.id))
+        # The label is derived from the token, so a credential swap refreshes it.
+        if req.get("access_token") and not (req.get("username") or "").strip():
+            await self._fill_identity_username(identity)
         self._prefetch_repositories(identity)
         return True
 

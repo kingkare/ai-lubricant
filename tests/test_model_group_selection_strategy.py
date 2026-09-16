@@ -206,7 +206,6 @@ class _StubAccountClient:
 def _setup_two_members_two_accounts(monkeypatch, strategy):
     _patch_group(monkeypatch, strategy)
     import rate_limiter
-    monkeypatch.setattr(rate_limiter, "has_explicit_metadata", lambda model: _async_return(True))
     monkeypatch.setattr(rate_limiter, "get_model_metadata", lambda model: _async_return(({}, False)))
     _install_routes(monkeypatch, {
         "m1": [{"provider": "p1", "upstream_model_id": "m1"}],
@@ -230,7 +229,6 @@ async def _async_true():
 def test_media_operation_filters_chat_only_provider(monkeypatch):
     _patch_group(monkeypatch, "sequential")
     import rate_limiter
-    monkeypatch.setattr(rate_limiter, "has_explicit_metadata", lambda model: _async_return(True))
     monkeypatch.setattr(rate_limiter, "get_model_metadata", lambda model: _async_return(({"output_modalities": ["image"], "capabilities": {"image_generation": True}}, True)))
     _install_routes(monkeypatch, {
         "m1": [{"provider": "p1", "upstream_model_id": "m1"}],
@@ -307,7 +305,6 @@ def test_random_member_strategy_picks_different_start_member_across_calls(monkey
     """渠道随机：两个模型各有不同 provider，shuffle provider 后应轮流选到不同模型。"""
     _patch_group(monkeypatch, "random_member")
     import rate_limiter
-    monkeypatch.setattr(rate_limiter, "has_explicit_metadata", lambda model: _async_return(True))
     monkeypatch.setattr(rate_limiter, "get_model_metadata", lambda model: _async_return(({}, False)))
     _install_routes(monkeypatch, {
         "m1": [{"provider": "p1", "upstream_model_id": "m1"}],
@@ -407,7 +404,6 @@ def _setup_group_provider_routes(monkeypatch, strategy, providers):
     monkeypatch.setattr(config.Config, "get_api_key_provider_filter", classmethod(lambda cls, api_key: _async_return((set(), set()))))
     monkeypatch.setattr(config.Config, "get_providers", classmethod(lambda cls: _async_return({})))
     import rate_limiter
-    monkeypatch.setattr(rate_limiter, "has_explicit_metadata", lambda model: _async_return(True))
     monkeypatch.setattr(rate_limiter, "get_model_metadata", lambda model: _async_return(({}, False)))
     _install_routes(monkeypatch, {
         member: [{"provider": provider, "upstream_model_id": member}]

@@ -15,7 +15,7 @@ def test_global_model_metadata_supplies_max_tokens_and_tools(monkeypatch):
         },
     }
 
-    async def fake_metadata(model):
+    async def fake_metadata(model, *, snapshot=None):
         return {
             "max_tokens": 123,
             "parameters": {"tools": [default_tool], "temperature": 0.2},
@@ -32,7 +32,7 @@ def test_global_model_metadata_supplies_max_tokens_and_tools(monkeypatch):
 
 
 def test_global_defaults_do_not_override_present_values(monkeypatch):
-    async def fake_metadata(model):
+    async def fake_metadata(model, *, snapshot=None):
         return {"max_tokens": 500, "parameters": {"max_tokens": 999, "top_p": 0.5}}, False
 
     monkeypatch.setattr(main.model_metadata, "get_model_metadata", fake_metadata)

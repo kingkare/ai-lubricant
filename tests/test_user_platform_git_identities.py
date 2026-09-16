@@ -59,6 +59,24 @@ def test_normalize_base_variants():
     assert git_clients._normalize_base("x.com/", "d") == ("https", "x.com")
 
 
+def test_github_api_base_maps_public_web_host():
+    """github.com serves no /api/v3 — it must map to api.github.com.
+
+    The console pre-fills ``https://github.com`` as the identity base_url; the
+    previous shape returned ``https://github.com/api/v3/...`` and 404'd every
+    GitHub identity created via the dialog (repo list silently empty).
+    """
+    base = git_clients._github_api_base
+    assert base("") == "https://api.github.com"
+    assert base("https://github.com") == "https://api.github.com"
+    assert base("https://www.github.com") == "https://api.github.com"
+    assert base("https://api.github.com") == "https://api.github.com"
+    assert base("https://github.com/owner/repo") == "https://api.github.com"
+    # Enterprise installs keep the /api/v3 suffix on their own host.
+    assert base("https://ghe.corp.com") == "https://ghe.corp.com/api/v3"
+    assert base("http://ghe.corp.com/") == "http://ghe.corp.com/api/v3"
+
+
 def test_unsupported_platform_returns_empty(anyio_backend=None):
     import asyncio
 
@@ -468,6 +486,198 @@ async def test_update_invalidates_repo_cache(tortoise_db, monkeypatch):
     # Cache was invalidated on update → upstream hit again (plus a prefetch may
     # have run, so assert it grew rather than an exact count).
     assert calls["n"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_add_identity_fills_username_from_host(tortoise_db, monkeypatch):
+    """The console no longer asks for a username, so the service derives it from
+    the host and the repo picker can label the identity with the account name."""
+    from user_platform import git_clients as gc, git_service
+
+    async def fake_profile(platform, opts):
+        assert platform == "github"
+        assert opts.token == "ghp_new"
+        return gc.GitProfile(username="octocat")
+
+    monkeypatch.setattr(gc, "fetch_profile", fake_profile)
+
+    result = await git_service.git_service.add_identity(
+        str(uuid.uuid4()), {"platform": "github", "access_token": "ghp_new"}
+    )
+    assert result["username"] == "octocat"
+
+
+@pytest.mark.asyncio
+async def test_add_identity_profile_failure_does_not_fail_the_add(tortoise_db, monkeypatch):
+    """A label lookup is best-effort: an unreachable host or a token without
+    profile scope must not turn a working credential into a failed add."""
+    from user_platform import git_clients as gc, git_service
+
+    async def boom(platform, opts):
+        raise gc.GitClientError("GET https://api.github.com/user returned HTTP 403")
+
+    monkeypatch.setattr(gc, "fetch_profile", boom)
+
+    result = await git_service.git_service.add_identity(
+        str(uuid.uuid4()), {"platform": "github", "access_token": "ghp_tok"}
+    )
+    assert result["username"] is None
+    assert result["has_access_token"] is True
+
+
+@pytest.mark.asyncio
+async def test_add_identity_explicit_username_wins(tortoise_db, monkeypatch):
+    """An explicit username is never overwritten by the host lookup."""
+    from user_platform import git_clients as gc, git_service
+
+    async def fake_profile(platform, opts):
+        return gc.GitProfile(username="octocat")
+
+    monkeypatch.setattr(gc, "fetch_profile", fake_profile)
+
+    result = await git_service.git_service.add_identity(
+        str(uuid.uuid4()),
+        {"platform": "github", "access_token": "ghp_tok", "username": "mine"},
+    )
+    assert result["username"] == "mine"
+
+
+@pytest.mark.asyncio
+async def test_add_identity_unsupported_host_leaves_username_empty(tortoise_db, monkeypatch):
+    """codeup/cnb/atomgit have no verified profile endpoint, so ``fetch_profile``
+    returns an empty profile and the identity keeps no label (the console falls
+    back to base_url). The "no network call" half of that lives in
+    ``fetch_profile`` and is covered by its own test above."""
+    from user_platform import git_clients as gc, git_service
+
+    async def empty_profile(platform, opts):
+        return gc.GitProfile()
+
+    monkeypatch.setattr(gc, "fetch_profile", empty_profile)
+
+    result = await git_service.git_service.add_identity(
+        str(uuid.uuid4()), {"platform": "cnb", "access_token": "tok"}
+    )
+    assert result["username"] is None
+
+
+@pytest.mark.asyncio
+async def test_update_identity_token_swap_refreshes_username(tortoise_db, monkeypatch):
+    """A new token may belong to a different account, so the derived label is
+    dropped and re-resolved; a caller-supplied username still wins."""
+    from user_platform import git_clients as gc, git_service
+    from user_platform.models_git import GitIdentity
+
+    identity = await _make_identity(username="old-account")
+
+    async def fake_profile(platform, opts):
+        assert opts.token == "ghp_swapped"
+        return gc.GitProfile(username="new-account")
+
+    monkeypatch.setattr(gc, "fetch_profile", fake_profile)
+
+    await git_service.git_service.update_identity(
+        str(identity.user_id), str(identity.id), {"access_token": "ghp_swapped"}
+    )
+    refreshed = await GitIdentity.get(id=identity.id)
+    assert refreshed.username == "new-account"
+
+
+@pytest.mark.asyncio
+async def test_update_identity_without_token_keeps_username(tortoise_db, monkeypatch):
+    """Editing a remark must not re-resolve (or clear) the stored label."""
+    from user_platform import git_clients as gc, git_service
+    from user_platform.models_git import GitIdentity
+
+    identity = await _make_identity(username="octocat")
+
+    async def unexpected(platform, opts):
+        raise AssertionError("profile lookup should not run without a new token")
+
+    monkeypatch.setattr(gc, "fetch_profile", unexpected)
+
+    await git_service.git_service.update_identity(
+        str(identity.user_id), str(identity.id), {"remark": "x"}
+    )
+    refreshed = await GitIdentity.get(id=identity.id)
+    assert refreshed.username == "octocat"
+
+
+@pytest.mark.asyncio
+async def test_fetch_profile_swallows_upstream_error(monkeypatch):
+    """An upstream failure degrades to an empty profile, never an exception."""
+
+    async def _raise(*_a, **_k):
+        raise git_clients.GitClientError("GET https://api.github.com/user returned HTTP 401")
+
+    monkeypatch.setattr(git_clients, "_get_json", _raise)
+    profile = await git_clients.fetch_profile(
+        "github", git_clients.RepositoryOptions(token="ghp_tok")
+    )
+    assert profile.is_empty
+
+
+@pytest.mark.asyncio
+async def test_fetch_profile_unknown_platform_makes_no_call(monkeypatch):
+    calls: list = []
+
+    async def counting(*a, **k):
+        calls.append(a)
+        return [], {}
+
+    monkeypatch.setattr(git_clients, "_get_json", counting)
+    profile = await git_clients.fetch_profile(
+        "cnb", git_clients.RepositoryOptions(token="tok")
+    )
+    assert profile.is_empty
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_profile_requires_a_token(monkeypatch):
+    """No token ⇒ nothing to look up; do not send an unauthenticated request."""
+    calls: list = []
+
+    async def counting(*a, **k):
+        calls.append(a)
+        return [], {}
+
+    monkeypatch.setattr(git_clients, "_get_json", counting)
+    profile = await git_clients.fetch_profile("github", git_clients.RepositoryOptions(token=""))
+    assert profile.is_empty
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_github_profile_reads_login(patch_get):
+    mock = patch_get([({"login": "octocat", "email": None}, {})])
+    profile = await git_clients.fetch_profile(
+        "github", git_clients.RepositoryOptions(token="ghp_tok")
+    )
+    assert profile.username == "octocat"
+    assert "api.github.com/user" in mock.calls[0]["url"]
+    assert mock.calls[0]["headers"]["Authorization"] == "token ghp_tok"
+
+
+@pytest.mark.asyncio
+async def test_gitlab_profile_reads_username(patch_get):
+    mock = patch_get([({"username": "gl-user"}, {})])
+    profile = await git_clients.fetch_profile(
+        "gitlab", git_clients.RepositoryOptions(token="tok")
+    )
+    assert profile.username == "gl-user"
+    assert "/api/v4/user" in mock.calls[0]["url"]
+
+
+@pytest.mark.asyncio
+async def test_gitee_profile_passes_access_token_as_query(patch_get):
+    """Gitee authenticates by query parameter, not a header."""
+    mock = patch_get([({"login": "gitee-user"}, {})])
+    profile = await git_clients.fetch_profile(
+        "gitee", git_clients.RepositoryOptions(token="tok")
+    )
+    assert profile.username == "gitee-user"
+    assert mock.calls[0]["params"]["access_token"] == "tok"
 
 
 @pytest.mark.asyncio

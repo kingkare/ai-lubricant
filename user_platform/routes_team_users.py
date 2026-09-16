@@ -501,12 +501,27 @@ async def list_groups(
 @router.post("/groups")
 async def create_group(
     body: GroupReq,
+    user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """建分组，并把创建者加为成员。
+
+    加成员是关键：``nodes_service.list_my_nodes`` 按 ``TeamGroupMember`` 判定可见性，
+    不加成员的话用户建完分组也看不到自己在该分组下建的节点（「只能看到自己的」
+    这条要求会落空）。管理员建分组仍走管理端自己的流程，不受影响。
+    """
     try:
-        return await team_users_service.create_group(team_id, body.name)
+        group = await team_users_service.create_group(team_id, body.name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="分组名称不能为空") from exc
+    try:
+        await team_users_service.add_group_member(str(group["id"]), str(user.id))
+    except Exception:
+        # 加成员失败不该让建分组回滚：分组已落库，管理员可后补成员。
+        from loguru import logger
+
+        logger.warning("[groups] add creator as member failed: group={}", group.get("id"), exc_info=True)
+    return group
 
 
 @router.put("/groups/{group_id}")

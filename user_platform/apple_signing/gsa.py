@@ -80,61 +80,15 @@ def _bag_url(key: str) -> str:
         raise GsaError(f"URL bag 缺 {key}（现有: {sorted(urls)}）")
     return str(url)
 
-# 出口路由（二选一，调用方在登录前设置）：
-# 1. _proxies：requests proxies 形态（如 {"http": "http://127.0.0.1:7890"}），
-#    network 模式代理池条目。None = 直连。
-# 2. _transport：可替换 HTTP 发送函数 (method, url, headers, body) ->
-#    (status, headers, body_bytes)，node 模式代理池条目用——服务端把整个请求
-#    塞进 NodeProxyRequest 帧发给指定执行节点出网（节点 IP 可能是 Apple 认可
-#    的住宅/宽带 IP）。同步桥在工作线程内 asyncio.run() 跑帧往返。
 # gsa.apple.com 对数据中心/非 Apple 认可网络 IP 直接回 503（无友好错误码）。
-# 模块级而非参数：登录是同步函数链，逐参透传会把每个私有函数签名都污染一遍。
-_proxies: dict[str, str] | None = None
-_transport: Any | None = None
-
-# transport 异常：统一由 routes 层映射成可读 HTTP 错误。
-class GsaTransportError(GsaError):
-    pass
-
-
-def set_gsa_proxies(proxies: dict[str, str] | None) -> None:
-    """设置/清除 GSA 请求的出口代理。调用方在每次登录前按配置决定。"""
-    global _proxies, _transport
-    _proxies = proxies
-    _transport = None
-
-
-def set_gsa_transport(transport: Any | None) -> None:
-    """设置/清除 GSA 请求的节点隧道传输函数（node 模式代理）。"""
-    global _proxies, _transport
-    _transport = transport
-    _proxies = None
-
-
-def current_proxies() -> dict[str, str] | None:
-    """当前 GSA 出口代理（developer.py 等同族请求复用同一出口口径）。"""
-    return _proxies
-
-
-def current_transport() -> Any | None:
-    """当前节点隧道传输函数（developer.py 签名请求同样复用）。"""
-    return _transport
 
 
 def _http(method: str, url: str, headers: dict[str, str], body: bytes) -> tuple[int, dict[str, str], bytes]:
-    """统一的 HTTP 出口：transport 优先（节点隧道），否则 requests 直连/显式代理。
+    """统一的 HTTP 出口：直连（trust_env=False）。
 
-    直连分支 trust_env=False：不吃 HTTP(S)_PROXY 环境变量——出口代理由
-    routes 层的 proxy_config_id 显式选择（set_gsa_proxies/set_gsa_transport），
-    环境变量代理只会把 GSA 请求绕进 Clash 抖动里（实测 22s/请求）。
+    trust_env=False：不吃 HTTP(S)_PROXY 环境变量——环境变量代理只会把 GSA
+    请求绕进 Clash 抖动里（实测 22s/请求）。
     """
-    if _transport is not None:
-        try:
-            return _transport(method, url, headers, body)
-        except GsaError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — 隧道失败统一成可读错误
-            raise GsaTransportError(f"节点隧道请求失败：{exc}") from exc
     with requests.Session() as session:
         session.trust_env = False
         resp = session.request(
@@ -144,7 +98,6 @@ def _http(method: str, url: str, headers: dict[str, str], body: bytes) -> tuple[
             data=body,
             timeout=_TIMEOUT,
             verify=tls.ca_bundle(),
-            proxies=_proxies,
         )
     return resp.status_code, dict(resp.headers), resp.content
 

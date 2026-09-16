@@ -12,7 +12,7 @@ def test_channel_page_has_one_unified_add_entry():
     source = CHANNELS.read_text(encoding="utf-8")
 
     assert "<ChannelCatalogSelector" in source
-    assert "添加渠道" in source
+    assert "添加供应商" in source
     assert "从模板添加" not in source
     assert "QuickAddModal" not in source
     assert "ChannelTemplatePicker" not in source
@@ -36,7 +36,9 @@ def test_channel_selector_uses_configured_and_default_icons_in_large_dialog():
     assert "channelIconKey" in selector
     assert "item.icon" in selector
     assert "channelType(item)" in selector
-    assert 'return "自定义"' in selector
+    # 「自定义供应商」伪条目已改名为「通用供应商」（selector 按 id=='custom' 判定），
+    # 断言随实现更新。
+    assert 'return "通用"' in selector
     assert 'return "内置"' in selector
     assert 'return "其他"' in selector
     assert "继续填写详情" not in selector

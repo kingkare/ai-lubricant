@@ -326,6 +326,14 @@ async def handle_loopback_callback(p, params, poll_params, callback_url=""):
 `handle_loopback_callback` 一份实现同时服务两条入口。宽松接受完整 URL、`?code=…`、
 裸 `code=…` 三种粘贴形态。
 
+**非 URL 载荷（让用户从控制台复制凭证）。** 有些上游（如 AutoClaw 海外区）没有可编程的
+OAuth 接口，只能让用户在官网登录后在浏览器控制台复制凭证块。这种粘贴不是 URL，管理端
+按 `{`/`[` 开头识别为 JSON 载荷：**跳过 query 解析**（JSON 里的 base64 `=` 会被 `parse_qs`
+切碎成垃圾键），以空 `params` + 原文 `callback_url` 交给钩子自行识别。spec 侧在
+`handle_loopback_callback` 里读 `callback_url` 原文即可（裸 token、JS 对象字面量等非 JSON
+形态也只能从这里拿到）；别忘了同时把 `poll_params` 里的会话标记写成独立值（如
+`login="credential"`），这样「本会话在等什么」一目了然，不必靠粘贴内容猜。
+
 ---
 
 ## 场景 G：回调式 OAuth

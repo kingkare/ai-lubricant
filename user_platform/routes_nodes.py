@@ -25,6 +25,7 @@ from .node_client import NodeServerUnavailable, RPCError
 from .deps import client_meta, get_current_team_id, get_current_user
 from .models import TeamGroup, User
 from .nodes_service import (
+    SUPPORTED_EDITORS,
     NodesServiceError,
     latest_node_version,
     list_node_binaries,
@@ -878,7 +879,7 @@ async def team_approve_node(node_id: str, user: User = Depends(get_current_user)
 async def team_install_node_editor(
     node_id: str, editor: str, user: User = Depends(get_current_user)
 ) -> dict:
-    if editor not in {"claude", "codex", "gemini", "opencode", "cursor"}:
+    if editor not in SUPPORTED_EDITORS:
         raise HTTPException(status_code=400, detail="不支持该编辑器")
     if await nodes_service.user_can_use_node(str(user.id), node_id) is None:
         raise HTTPException(status_code=403, detail="无权管理该节点")
@@ -920,6 +921,34 @@ async def team_install_node_tool(
             detail={"code": "missing_runtime", "missing": "npm", "guide": guide},
         )
     return await _guard(nodes_service.manage_editor(node_id, "ocr", "install"))
+
+
+@team_router.post("/groups/{group_id}/management-nodes")
+async def team_create_management_node(
+    group_id: str,
+    body: CreateExecutionNodeReq,
+    request: Request,
+    user: User = Depends(get_current_user),
+    team_id: str = Depends(get_current_team_id),
+) -> dict:
+    """在分组下创建**管理节点**（用户侧自助）。
+
+    用途：首页「接入自己的编辑器」的「创建隔离环境」路径——用户自己没有机器时，
+    让平台起一个 docker 管理节点当运行位置（管理节点会再拉起执行节点）。
+
+    归属隔离：新节点自动绑到该分组（GroupNode），而 ``list_my_nodes`` 只返回用户
+    所属分组的节点，故「只能看到自己的」自然成立——别人的分组他不是成员。
+    ``_owned_group`` 校验分组属于本 team，避免跨 team 建节点。
+    """
+    return await _guard(
+        nodes_service.create_group_management_node(
+            team_id, group_id,
+            startup_method=body.startup_method or "docker",
+            node_name=body.node_name,
+            proxy_config_id=body.proxy_config_id,
+            server_url=_node_server_url(request),
+        )
+    )
 
 
 @team_router.post("/groups/{group_id}/execution-nodes")
@@ -1036,7 +1065,7 @@ async def team_upgrade_node_editor(
     node_id: str, editor: str, user: User = Depends(get_current_user)
 ) -> dict:
     """用户侧升级执行节点上一个已安装的编辑器 CLI 到最新版本。"""
-    if editor not in {"claude", "codex", "gemini", "opencode", "cursor"}:
+    if editor not in SUPPORTED_EDITORS:
         raise HTTPException(status_code=400, detail="不支持该编辑器")
     await _require_user_node(user, node_id, execution_only=True)
     result = await _guard(nodes_service.manage_editor(node_id, editor, "upgrade"))

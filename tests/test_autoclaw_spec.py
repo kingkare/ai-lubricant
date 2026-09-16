@@ -89,7 +89,7 @@ def test_class_flags(channel_cls):
 def test_account_schema_declares_device_code_loopback(channel_cls):
     schema = channel_cls.account_schema()
     assert schema["provider_name"] == "autoclaw-test"
-    # 短信（cn）/Google（global）授权已接入：device_code + loopback 补投。
+    # 短信（cn）授权已接入：device_code + loopback 补投；global 走手动填凭证。
     assert "device_code" in schema["add_methods"]
     assert schema["auth_start"]["mode"] == "device_code"
     assert schema["auth_start"]["completion"] == "loopback"
@@ -102,6 +102,22 @@ def test_account_fields_cover_runtime_state(channel_cls):
     fields = set(channel_cls.ACCOUNT_FIELDS)
     assert {"refresh_token", "expires_at", "device_id", "region",
             "sandbox_id", "sandbox_endpoint", "sandbox_end_ts", "quota_text"} <= fields
+
+
+def test_region_is_first_field_and_select(channel_cls):
+    """region 必须是首个字段的下拉框：cn/global 决定授权方式与域名，文本框没人看得懂。
+
+    前端按 section 首次出现顺序分组、组内保持后端数组顺序，故 fields[0] 即「供应商字段」
+    区第一行（对齐 codebuddy.py 的 region 写法）。
+    """
+    fields = channel_cls.account_schema()["fields"]
+    assert fields[0]["key"] == "region"
+    region = fields[0]
+    assert region["type"] == "select"
+    assert region["default_value"] == "cn"
+    assert {opt["value"] for opt in region["options"]} == {"cn", "global"}
+    # 每个 option 都要有中文标签（前端直接渲染 label，不渲染裸值）
+    assert all(opt.get("label") for opt in region["options"])
 
 
 # ==================== 凭证 JSON 解析 ====================
@@ -134,6 +150,77 @@ def test_credential_json_parses_into_fields(channel_cls):
     assert p.sandbox_id == "sb-1"
     # expiresAt 有值就保留，不覆盖成 28 天
     assert int(p.expires_at) > int(time.time())
+
+
+# ==================== 写死的 cn / global 凭证 ====================
+
+def test_hardcoded_credential_used_when_account_blank(channel_cls):
+    """账号页 password 留空 → 按 region 套用写死凭证（cn/global 各一份）。"""
+    mod = _module()
+    saved = dict(mod.HARDCODED_CREDENTIALS)
+    mod.HARDCODED_CREDENTIALS = {
+        "cn": {"accessToken": "Bearer hard-cn", "refreshToken": "rt-cn",
+               "deviceId": "dev-cn", "region": "cn"},
+        "global": {"accessToken": "Bearer hard-gl", "refreshToken": "rt-gl",
+                   "deviceId": "dev-gl", "userName": "g@example.com", "region": "global"},
+    }
+    try:
+        p = _make_provider(channel_cls, password="")   # 不传 region → 默认 cn
+        assert mod._maybe_parse_credential_json(p) is True
+        assert p.password == "Bearer hard-cn"
+        assert p.refresh_token == "rt-cn"
+        assert p.device_id == "dev-cn"   # device_id 必须写死，refresh 才对得上
+
+        g = _make_provider(channel_cls, password="", region="global")
+        assert mod._maybe_parse_credential_json(g) is True
+        assert g.password == "Bearer hard-gl"
+        assert g.region == "global"
+    finally:
+        mod.HARDCODED_CREDENTIALS = saved
+
+
+def test_hardcoded_credential_unset_is_empty(channel_cls):
+    """常量为空占位（未配置）→ 不认凭证，账号视为未授权。"""
+    mod = _module()
+    saved = dict(mod.HARDCODED_CREDENTIALS)
+    mod.HARDCODED_CREDENTIALS = {"cn": {"accessToken": ""}, "global": {"accessToken": ""}}
+    try:
+        p = _make_provider(channel_cls, password="")
+        assert mod._hardcoded_credential(p) == {}
+        assert mod._maybe_parse_credential_json(p) is False
+    finally:
+        mod.HARDCODED_CREDENTIALS = saved
+
+
+def test_pasted_credential_beats_hardcoded(channel_cls):
+    """账号页粘贴的凭证永远优先，写死常量不覆盖它。"""
+    mod = _module()
+    saved = dict(mod.HARDCODED_CREDENTIALS)
+    mod.HARDCODED_CREDENTIALS = {"cn": {"accessToken": "Bearer hard-cn"}}
+    try:
+        p = _make_provider(channel_cls, password="Bearer typed-token")
+        assert mod._maybe_parse_credential_json(p) is False
+        assert p.password == "Bearer typed-token"
+    finally:
+        mod.HARDCODED_CREDENTIALS = saved
+
+
+def test_check_auth_accepts_hardcoded_credential(channel_cls):
+    """账号页留空但写死凭证已配 → check_auth/health_check/is_init 都认。"""
+    # 类钩子在自己的 exec 命名空间里跑，常量要打到那里才生效
+    ns = channel_cls._spec_hooks["check_auth"].__globals__
+    saved = ns["HARDCODED_CREDENTIALS"]
+    ns["HARDCODED_CREDENTIALS"] = {"cn": {"accessToken": "Bearer hard-cn"}, "global": {}}
+    try:
+        p = _make_provider(channel_cls, password="")
+        assert _run(channel_cls.check_auth(p)) is True
+        assert _run(channel_cls.health_check(p)) is True
+        assert channel_cls.is_init(p) is True
+
+        blank = _make_provider(channel_cls, password="", region="global")
+        assert _run(channel_cls.check_auth(blank)) is False   # global 那份是空的
+    finally:
+        ns["HARDCODED_CREDENTIALS"] = saved
 
 
 def test_credential_json_without_token_is_noop(channel_cls):
@@ -677,7 +764,7 @@ def test_is_init_and_check_auth(channel_cls):
 # ==================== 登录授权（短信 / Google）====================
 
 def test_begin_device_flow_sms_mode(channel_cls):
-    """cn + 手机号：发短信、poll_params 带 login=sms + phone。"""
+    """cn + 手机号：发短信、poll_params 带 login=sms + phone，并给出短信交互提示。"""
     p = _ready_provider(channel_cls)
     p.phone = "13800001234"
     sent = {}
@@ -691,6 +778,13 @@ def test_begin_device_flow_sms_mode(channel_cls):
     assert result["task_type"] == "device_code"
     assert result["poll_params"]["login"] == "sms"
     assert result["poll_params"]["phone"] == "13800001234"
+    # 交互提示：补投框要填的是验证码，不是回调 URL
+    assert "6 位" in result["replay_hint"]
+    assert result["replay_label"]
+    assert result["polling_hint"]
+    # 短信流程没有要打开的网页——返回 auth_url 会把用户误导去点官网首页
+    assert not result.get("auth_url")
+    assert not result.get("verification_uri")
 
 
 def test_begin_device_flow_requires_phone_for_cn(channel_cls):
@@ -702,19 +796,44 @@ def test_begin_device_flow_requires_phone_for_cn(channel_cls):
     assert "手机号" in str(excinfo.value.detail)
 
 
-def test_begin_device_flow_google_mode(channel_cls):
-    """global 无手机号：不发起网络请求，直接给官方登录页 + login=google 会话。"""
+def test_begin_device_flow_global_waits_for_credential_paste(channel_cls):
+    """global：不再报错，改为「网页登录 + 凭证补投」的等待态（有完成路径才返回 auth_url）。
+
+    旧实现直接 400，把用户丢在死胡同里——海外区等于无法授权。现在返回 pending 设备码态，
+    提示文案直接给出控制台命令，用户照着做即可。
+    """
     p = _ready_provider(channel_cls)
     p.phone = ""
     p.region = "global"
 
     async def fail_send(pp, phone):
-        raise AssertionError("google 流程不应发短信")
+        raise AssertionError("global 不应发短信")
 
     _patch_namespace(channel_cls, _sms_send_code=fail_send)
     result = _run(channel_cls.begin_device_flow(p))
-    assert result["poll_params"]["login"] == "google"
+
+    assert result["task_type"] == "device_code"
+    assert result["poll_params"]["login"] == "credential"
+    assert result["poll_params"]["region"] == "global"
+    # 用户要先在官网登录才能拿到 localStorage，现在有完成路径了，返回它不再误导
     assert "autoclaw.z.ai" in result["auth_url"]
+    # 文案必须给出可照抄的动作：控制台命令 + 补投框提示
+    assert "localStorage" in result["message"]
+    assert result["replay_hint"] and result["replay_label"] and result["polling_hint"]
+
+
+def test_begin_device_flow_global_never_sends_sms_even_with_phone(channel_cls):
+    """global 填了手机号也一样走凭证补投：海外短信登录未验证，不能悄悄走没测过的路。"""
+    p = _ready_provider(channel_cls)
+    p.phone = "13800001234"
+    p.region = "global"
+
+    async def fail_send(pp, phone):
+        raise AssertionError("global 不应发短信")
+
+    _patch_namespace(channel_cls, _sms_send_code=fail_send)
+    result = _run(channel_cls.begin_device_flow(p))
+    assert result["poll_params"]["login"] == "credential"
 
 
 def test_sms_login_body_shape(channel_cls):
@@ -776,11 +895,83 @@ def test_google_oauth_exchange_body_shape(channel_cls):
     assert calls["path"] == "/userapi/overseasv1/google-oauth-login"
     body = calls["body"]
     assert body["code"] == "code-x" and body["state"] == "state-x"
-    assert body["navigate_uri"] == "https://autoglm-api.autoglm.ai/userapi/oauth/google/callback"
+    # navigate_uri 跟随 region 的 userapi 域名（测试实例默认 region=cn）
+    assert body["navigate_uri"] == "https://autoglm-acceleration-api.zhipuai.cn/userapi/oauth/google/callback"
     assert body["source_id"] == "web"
     assert body["flow_type"] == "web" and body["client_type"] == "web"
     assert account["password"] == "at-g"
     assert account["region"] == "cn"  # 测试实例默认 region=cn（落库时由会话 region 覆盖）
+
+
+def test_google_oauth_exchange_navigate_uri_follows_region(channel_cls):
+    """region=global 的账号用海外域名换 token——写死域名会让它「登录成功但识别不出来」。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="", region="global")
+    p.device_id = "dev-1"
+    seen = {}
+
+    async def fake_userapi(pp, method, path, **kw):
+        seen["uri"] = kw.get("json_body", {}).get("navigate_uri")
+        return {"access_token": "at-g", "refresh_token": "rt-g"}
+
+    hook = mod._google_oauth_exchange
+    saved = hook.__globals__.get("_userapi_json")
+    hook.__globals__["_userapi_json"] = fake_userapi
+    try:
+        _run(mod._google_oauth_exchange(p, "code-x", "state-x"))
+    finally:
+        hook.__globals__["_userapi_json"] = saved
+
+    assert seen["uri"] == "https://autoglm-api.autoglm.ai/userapi/oauth/google/callback"
+
+
+def test_google_oauth_exchange_retries_other_state_shape(channel_cls):
+    """官方 state 末段为空时会省略尾 '_'：首投失败换另一种形态重试。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="")
+    p.device_id = "dev-1"
+    tried: list[str] = []
+
+    async def fake_userapi(pp, method, path, **kw):
+        tried.append(kw.get("json_body", {}).get("state"))
+        if len(tried) == 1:
+            raise HTTPException(status_code=400, detail="state 不匹配")
+        return {"access_token": "at-g", "refresh_token": "rt-g"}
+
+    hook = mod._google_oauth_exchange
+    saved = hook.__globals__.get("_userapi_json")
+    hook.__globals__["_userapi_json"] = fake_userapi
+    try:
+        account = _run(mod._google_oauth_exchange(p, "code-x", "state-x_"))
+    finally:
+        hook.__globals__["_userapi_json"] = saved
+
+    assert tried == ["state-x_", "state-x"]
+    assert account["password"] == "at-g"
+
+
+def test_google_oauth_exchange_does_not_retry_on_401(channel_cls):
+    """401 = code 已被消费/授权过期，换 state 形态也救不回来，不能重复打上游。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="")
+    p.device_id = "dev-1"
+    tried: list[str] = []
+
+    async def fake_userapi(pp, method, path, **kw):
+        tried.append(kw.get("json_body", {}).get("state"))
+        raise HTTPException(status_code=401, detail="code 已失效")
+
+    hook = mod._google_oauth_exchange
+    saved = hook.__globals__.get("_userapi_json")
+    hook.__globals__["_userapi_json"] = fake_userapi
+    try:
+        with pytest.raises(HTTPException) as excinfo:
+            _run(mod._google_oauth_exchange(p, "code-x", "state-x_"))
+    finally:
+        hook.__globals__["_userapi_json"] = saved
+
+    assert excinfo.value.status_code == 401
+    assert tried == ["state-x_"]  # 只投一次
 
 
 def test_loopback_sms_claims_and_persists_phone(channel_cls):
@@ -800,11 +991,52 @@ def test_loopback_sms_claims_and_persists_phone(channel_cls):
     assert outcome["account_data"]["phone"] == "13800001234"
 
 
-def test_loopback_sms_not_claimed_for_other_sessions(channel_cls):
-    """google 会话不吃裸 code（没有 state），避免误认领别的会话。"""
+def test_loopback_google_claims_code_without_state(channel_cls):
+    """google 会话只粘到 code（没 state）也必须认领——否则海外登录成功却一直 pending。"""
+    p = _ready_provider(channel_cls)
+    seen = {}
+
+    async def fake_exchange(pp, code, state):
+        seen["code"] = code
+        seen["state"] = state
+        return {"password": "at-g", "refresh_token": "rt-g", "user_id": "u-g",
+                "expires_at": "1", "device_id": "dev-1", "region": "global"}
+
+    _patch_namespace(channel_cls, _google_oauth_exchange=fake_exchange)
+    outcome = _run(channel_cls.handle_loopback_callback(
+        p, {"code": "4/0AY-code"}, {"login": "google"}))
+    assert outcome["status"] == "authorized"
+    assert outcome["account_data"]["password"] == "at-g"
+    assert seen == {"code": "4/0AY-code", "state": ""}
+
+
+def test_loopback_sms_session_not_hijacked_by_state_param(channel_cls):
+    """sms 会话误粘带 state 的 URL：按会话流程走短信，不能被打进 google 换 token。"""
+    p = _ready_provider(channel_cls)
+    called: list[str] = []
+
+    async def fake_sms_login(pp, phone, code):
+        called.append("sms")
+        return {"password": "Bearer at-1", "refresh_token": "rt-1", "user_id": "u1",
+                "expires_at": "1", "device_id": "dev-1", "region": "cn"}
+
+    async def fake_exchange(pp, code, state):
+        called.append("google")
+        raise AssertionError("sms 会话不应走 google 换 token")
+
+    _patch_namespace(channel_cls, _sms_login=fake_sms_login,
+                     _google_oauth_exchange=fake_exchange)
+    outcome = _run(channel_cls.handle_loopback_callback(
+        p, {"code": "654321", "state": "leaked"}, {"login": "sms", "phone": "13800001234"}))
+    assert outcome["status"] == "authorized"
+    assert called == ["sms"]
+
+
+def test_loopback_unknown_login_marker_not_claimed(channel_cls):
+    """认不出的会话标记（既非 sms 也非 google）→ 不认领，交下一个候选会话。"""
     p = _ready_provider(channel_cls)
     outcome = _run(channel_cls.handle_loopback_callback(
-        p, {"code": "654321"}, {"login": "google"}))
+        p, {"code": "whatever"}, {"login": "something-else"}))
     assert outcome is None
 
 
@@ -837,3 +1069,117 @@ def test_loopback_error_returns_error_status(channel_cls):
         p, {"code": "x", "state": "y"}, {"login": "google"}))
     assert outcome["status"] == "error"
     assert "过期" in outcome["error"]
+
+
+# ==================== 补投凭证识别（localStorage / JSON / 裸 token）====================
+
+def test_credential_payload_from_localstorage_json():
+    """官网控制台 copy(localStorage.getItem('autoclaw.web')) → 严格 JSON，直接认。"""
+    mod = _module()
+    doc = mod._credential_doc_from_payload(json.dumps({
+        "accessToken": "Bearer at-ls", "refreshToken": "rt-ls",
+        "deviceId": "dev-ls", "userId": "u-ls", "region": "global",
+    }))
+    assert doc["accessToken"] == "Bearer at-ls"
+    assert doc["refreshToken"] == "rt-ls"
+
+
+def test_credential_payload_drills_into_nested_json():
+    """整份 localStorage dump / 带外层 key 的形态：递归下钻找到凭证对象。"""
+    mod = _module()
+    # {"autoclaw.web": {...}} —— 直接嵌对象
+    doc = mod._credential_doc_from_payload(json.dumps({
+        "autoclaw.web": {"accessToken": "Bearer at-n", "refreshToken": "rt-n"},
+        "some.other.key": "noise",
+    }))
+    assert doc["accessToken"] == "Bearer at-n"
+    # {"autoclaw.web": "<JSON 字符串>"} —— localStorage 存的是字符串
+    inner = json.dumps({"accessToken": "Bearer at-s", "deviceId": "dev-s"})
+    doc = mod._credential_doc_from_payload(json.dumps({"autoclaw.web": inner}))
+    assert doc["accessToken"] == "Bearer at-s"
+    assert doc["deviceId"] == "dev-s"
+
+
+def test_credential_payload_from_js_object_literals():
+    """控制台直接复制对象（单引号/无引号键）不是合法 JSON → JS 字面量兜底。"""
+    mod = _module()
+    doc = mod._credential_doc_from_payload(
+        "{accessToken: 'Bearer at-js', refreshToken: \"rt-js\", deviceId: 'dev-js'}")
+    assert doc["accessToken"] == "Bearer at-js"
+    assert doc["refreshToken"] == "rt-js"
+
+
+def test_credential_payload_bare_token():
+    mod = _module()
+    token = "eyJhbGciOiJIUzI1NiJ9" + "x" * 40
+    assert mod._credential_doc_from_payload(token)["accessToken"] == token
+    assert mod._credential_doc_from_payload(f"Bearer {token}")["accessToken"] == f"Bearer {token}"
+
+
+def test_credential_payload_never_mistakes_callback_url_for_token():
+    """回调 URL / 短文本不能被当成裸 token——否则会把垃圾写进 access_token。"""
+    mod = _module()
+    for raw in (
+        "http://127.0.0.1:8001/oauth/callback?code=abc&secret=s1",
+        "https://autoglm-api.autoglm.ai/userapi/oauth/google/callback?state=st&code=4/0AY",
+        "123456",           # 短信验证码
+        "", "   ", None,
+        "not a url",
+    ):
+        assert mod._credential_doc_from_payload(raw) == {}, raw
+
+
+def test_loopback_credential_paste_creates_account(channel_cls):
+    """海外区主路径：粘凭证 JSON（params 为空，原文走 callback_url）→ 自动建号。"""
+    p = _ready_provider(channel_cls)
+    p.region = "global"
+    raw = json.dumps({
+        "accessToken": "Bearer at-gl", "refreshToken": "rt-gl",
+        "deviceId": "dev-gl", "userId": "u-gl", "userName": "g@example.com",
+        "region": "global",
+    })
+    outcome = _run(channel_cls.handle_loopback_callback(
+        p, {}, {"login": "credential", "region": "global"}, raw))
+
+    assert outcome["status"] == "authorized"
+    account = outcome["account_data"]
+    assert account["password"] == "Bearer at-gl"
+    assert account["refresh_token"] == "rt-gl"
+    assert account["device_id"] == "dev-gl"
+    assert account["user_id"] == "u-gl"
+    assert account["region"] == "global"
+
+
+def test_loopback_credential_paste_without_session_marker_still_claimed(channel_cls):
+    """凭证 JSON 的 base64 '=' 会被 query 解析切碎 → params 空也必须能认（靠原文）。"""
+    p = _ready_provider(channel_cls)
+    raw = json.dumps({"accessToken": "Bearer at-x", "refreshToken": "rt-x"})
+    outcome = _run(channel_cls.handle_loopback_callback(p, {}, {}, raw))
+    assert outcome["status"] == "authorized"
+    assert outcome["account_data"]["password"] == "Bearer at-x"
+
+
+def test_loopback_credential_session_rejects_unrecognized_paste(channel_cls):
+    """等凭证的会话粘了别的东西 → 明确报错终止，别让前端一直 pending。"""
+    p = _ready_provider(channel_cls)
+    outcome = _run(channel_cls.handle_loopback_callback(
+        p, {}, {"login": "credential"}, "just some random text"))
+    assert outcome["status"] == "error"
+    assert "凭证" in outcome["error"]
+
+
+def test_loopback_sms_accepts_bare_code(channel_cls):
+    """前端占位符提示「输入 6 位验证码」→ 用户直接敲 123456，必须认。"""
+    p = _ready_provider(channel_cls)
+    seen = {}
+
+    async def fake_sms_login(pp, phone, code):
+        seen["phone"], seen["code"] = phone, code
+        return {"password": "Bearer at-1", "refresh_token": "rt-1", "user_id": "u1",
+                "expires_at": "1", "device_id": "dev-1", "region": "cn"}
+
+    _patch_namespace(channel_cls, _sms_login=fake_sms_login)
+    outcome = _run(channel_cls.handle_loopback_callback(
+        p, {}, {"login": "sms", "phone": "13800001234"}, "654321"))
+    assert outcome["status"] == "authorized"
+    assert seen == {"phone": "13800001234", "code": "654321"}

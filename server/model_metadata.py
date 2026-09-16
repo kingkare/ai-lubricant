@@ -21,19 +21,6 @@ from project_paths import model_metadata_json
 CONFIG_PATH = model_metadata_json()
 _WRITE_LOCK = asyncio.Lock()
 
-FALLBACK_DEFAULT_MODEL_METADATA = {
-    "max_tokens": 4096,
-    "max_context_tokens": 4096,
-    "input_modalities": ["text"],
-    "output_modalities": ["text"],
-    "function_calling": False,
-    "auto_search": False,
-    "auto_thinking": False,
-    "is_thinking": True,
-    "capabilities": {},
-}
-
-
 def _snapshot_field(snapshot: Any, *names: str) -> Mapping:
     for name in names:
         value = getattr(snapshot, name, None)
@@ -84,17 +71,17 @@ async def init_cache() -> None:
 
 
 async def _migrate_from_json() -> None:
-    """把 model_metadata.json 灌进 model_groups（kind=real），仅在无 real 行时调用。"""
+    """把 model_metadata.json 灌进 model_groups（kind=real），仅在无 real 行时调用。
+
+    文件里的 ``default`` 段已废弃，导入时忽略——默认元数据机制不再存在。
+    """
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
             file_cfg = json.load(f)
     except Exception as e:
         logger.warning(f"读取 model_metadata.json 失败: {e}")
         return
-    default = file_cfg.get("default") or {}
     models_obj = file_cfg.get("models") or {}
-    if default:
-        await PostgresClient.set_model_metadata_default(default)
     items = []
     for key, value in models_obj.items():
         if not isinstance(value, dict):
@@ -110,23 +97,23 @@ async def _migrate_from_json() -> None:
 # ==================== 对外接口 ====================
 
 async def get_default_metadata(*, snapshot: Any = None) -> dict:
-    snapshot = snapshot or current_snapshot()
-    default = _snapshot_field(snapshot, "default_metadata", "default")
-    return {**FALLBACK_DEFAULT_MODEL_METADATA, **_mutable(default)}
+    """默认元数据已废弃，恒返回空 dict（保留函数以兼容旧调用方）。"""
+    return {}
 
 
 async def get_model_metadata(
     model_id: str, *, snapshot: Any = None
 ) -> tuple[dict, bool]:
-    """返回 (metadata, is_default_only)。按 model_id 命中；模型组命中合成的特殊记录。"""
-    by_id, groups_by_id, default = await _load_combined_indices(snapshot=snapshot)
-    metadata = {**FALLBACK_DEFAULT_MODEL_METADATA, **default}
+    """返回 (metadata, is_default_only)。
+
+    只返回显式配置的元数据；未配置时返回 ``({}, True)``，不再合成默认元数据。
+    调用方据此区分「有元数据」与「没有元数据」，并对后者跳过一切基于元数据的限制。
+    """
+    by_id, groups_by_id, _ = await _load_combined_indices(snapshot=snapshot)
     record = by_id.get(model_id) or groups_by_id.get(model_id)
     if not record:
-        return metadata, True
-    record_copy = {k: v for k, v in record.items() if k != "model_id"}
-    metadata.update(record_copy)
-    return metadata, False
+        return {}, True
+    return {k: v for k, v in record.items() if k != "model_id"}, False
 
 
 async def has_explicit_metadata(model_id: str, *, snapshot: Any = None) -> bool:
@@ -147,15 +134,12 @@ async def get_explicit_metadata(model_id: str, *, snapshot: Any = None) -> dict 
 async def apply_model_metadata(
     provider: str, model: dict, *, snapshot: Any = None
 ) -> dict:
-    metadata, is_default_model = await get_model_metadata(
+    metadata, _ = await get_model_metadata(
         model["id"], snapshot=snapshot
     )
     for key, value in metadata.items():
         if model.get(key) is None:
             model[key] = value
-
-    if is_default_model and model.get('max_tokens') == 4096:
-        logger.warning(f"模型：{model['id']} 使用默认模型，max_tokens 为 4096，请进行配置")
 
     if "multimodal" not in model and "input_modalities" in model:
         model["multimodal"] = model["input_modalities"]
@@ -164,8 +148,11 @@ async def apply_model_metadata(
 
 
 async def reapply_to_models(models: list[dict], *, snapshot: Any = None) -> int:
-    """把同一 catalog 快照中的元数据重新打到一组 model dict 上（in-place）。"""
-    by_id, _, default = await _load_combined_indices(snapshot=snapshot)
+    """把同一 catalog 快照中的元数据重新打到一组 model dict 上（in-place）。
+
+    只打显式元数据；未配置的模型不补任何默认值。
+    """
+    by_id, _, _ = await _load_combined_indices(snapshot=snapshot)
     touched = 0
     for m in models or []:
         mid = m.get("id")
@@ -177,10 +164,6 @@ async def reapply_to_models(models: list[dict], *, snapshot: Any = None) -> int:
                 if key == "model_id":
                     continue
                 m[key] = value
-        else:
-            for key, value in default.items():
-                if m.get(key) is None:
-                    m[key] = value
         if "multimodal" not in m and "input_modalities" in m:
             m["multimodal"] = m["input_modalities"]
         touched += 1
@@ -195,6 +178,8 @@ async def list_metadata_from_db_async() -> dict:
     快照由 load_model_catalog_source 从 model_groups(kind=real) 构建；管理端列表不再查库。
     每条附行上的渠道标签过滤（provider_whitelist/provider_blacklist）——real 行的路由
     配置存于行顶层列而非 metadata JSONB，这里从快照 groups 并入，供管理端展示/回填。
+
+    ``default`` 恒为空 dict：默认元数据机制已废弃，未配置元数据的模型不再回落到任何默认值。
     """
     snap = current_snapshot()
     by_id = _snapshot_field(snap, "metadata_by_id", "metadata")
@@ -213,8 +198,8 @@ async def list_metadata_from_db_async() -> dict:
             item.setdefault("provider_whitelist", [])
             item.setdefault("provider_blacklist", [])
         models.append(item)
-    default = _snapshot_field(snap, "default_metadata", "default")
-    return {"default": _mutable(default), "models": models}
+    default: dict = {}
+    return {"default": default, "models": models}
 
 
 async def list_metadata_async() -> dict:
@@ -241,9 +226,11 @@ async def delete_metadata_async(model_id: str) -> bool:
 
 
 async def update_default_async(default: dict) -> dict:
-    cleaned = {**FALLBACK_DEFAULT_MODEL_METADATA, **(default or {})}
-    await PostgresClient.set_model_metadata_default(cleaned)
-    return cleaned
+    """默认元数据已废弃：不再落库，静默返回空 dict。
+
+    端点保留（前端仍有入口），但保存不生效——未配置元数据的模型不会继承任何默认值。
+    """
+    return {}
 
 
 async def bulk_import_async(items: list[dict]) -> int:

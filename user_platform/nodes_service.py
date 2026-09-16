@@ -55,6 +55,16 @@ _NODE_BIN_NAME_RE = re.compile(
 # A non-empty ``agent_compose_agent_image`` config overrides it.
 _DEFAULT_NODE_IMAGE = "ai-lubricant-node:local"
 
+# Editor CLIs a node can install/upgrade/report versions for. Single source of
+# truth for the install/upgrade route guards — keep in sync with the Go side's
+# agent.SupportedEditors (nodes/common/agent/editorinfo.go) and the frontend's
+# SUPPORTED_EDITORS (pages/manager/platform/nodes/types.ts). Adding an editor
+# means touching all three; the route guards reject anything not listed here
+# before it ever reaches the node.
+SUPPORTED_EDITORS: frozenset[str] = frozenset(
+    {"claude", "codex", "gemini", "opencode", "cursor", "dsh"}
+)
+
 
 def _default_node_bin_candidates() -> list[Path]:
     """Dev-friendly search paths when no explicit bin dir is configured.
@@ -1501,7 +1511,7 @@ class NodesService:
         return await client.set_node_capacity(node_id, capacity)
 
     async def manage_editor(self, node_id: str, editor: str, action: str) -> dict:
-        """在某个在线节点上安装/升级一个编辑器 CLI（claude/codex/gemini/opencode/cursor）。"""
+        """在某个在线节点上安装/升级一个编辑器 CLI（见 SUPPORTED_EDITORS）。"""
         client = get_local_node_client()
         return await client.manage_editor(node_id, editor, action)
 
@@ -1893,6 +1903,10 @@ class NodesService:
             "group_id": str(link.group_id),
             "node_id": link.node_id,
             "node_name": (live or {}).get("node_name") or link.node_name or link.node_id,
+            # ``name`` is the alias several C-side consumers read (the iOS host
+            # pickers, the scan dialog's host labels). Without it they fall back
+            # to the raw node_id and the UI renders a UUID instead of the name.
+            "name": (live or {}).get("node_name") or link.node_name or link.node_id,
             # Keep the common live-node projection aligned with admin /nodes.
             # ``node_role`` remains as the C-side compatibility alias.
             "role": (live or {}).get("role") or link.node_role,
@@ -2191,6 +2205,71 @@ class NodesService:
             except Exception:
                 logger.warning(
                     "[nodes] failed to save team node bootstrap for {}", new_node_id, exc_info=True
+                )
+        return result
+
+    async def create_group_management_node(
+        self,
+        team_id: str,
+        group_id: str,
+        startup_method: str = "docker",
+        node_name: str | None = None,
+        image: str | None = None,
+        proxy_config_id: str = "",
+        server_url: str = "",
+    ) -> dict:
+        """Create a **management** node bound to the group (user self-service).
+
+        Used by the home "接入自己的编辑器 → 创建隔离环境" path: a user with no
+        machine of their own gets a platform-managed docker node as the run
+        location (the manager then launches execution nodes on itself).
+
+        Visibility isolation falls out of the group binding: ``list_my_nodes``
+        only returns nodes of groups the caller belongs to, and creating a group
+        adds its creator as a member — so a user sees their own nodes and not
+        other users' (whose groups they are not in).
+
+        Mirrors :meth:`create_group_execution_node`, except it does not require
+        the group to already hold a management node (this *is* the manager).
+        """
+        group = await self._owned_group(team_id, group_id)
+        if group is None:
+            raise NodesServiceError("group_not_found")
+
+        result = await self.onboard_node(
+            role="management",
+            startup_method=startup_method,
+            node_name=node_name,
+            labels={"guest_image": image} if image else None,
+            proxy_config_id=proxy_config_id,
+        )
+        new_node_id = result.get("node_id")
+        if new_node_id:
+            # Bind back to the group so the creator (a member) can see and use it.
+            await GroupNode.get_or_create(
+                group_id=group.id,
+                node_id=new_node_id,
+                defaults={
+                    "node_role": "management",
+                    "node_name": (result.get("node") or {}).get("node_name") or new_node_id,
+                },
+            )
+        # Persist the bootstrap record so the public install.sh endpoint works for
+        # manual reinstall (same best-effort contract as the admin onboard route).
+        if new_node_id and result.get("secret"):
+            try:
+                await save_node_bootstrap(
+                    new_node_id,
+                    secret=result["secret"],
+                    server_url=server_url,
+                    role="management",
+                    startup_method=startup_method,
+                    proxy_config_id=proxy_config_id,
+                )
+            except Exception:
+                logger.warning(
+                    "[nodes] failed to save team management node bootstrap for {}",
+                    new_node_id, exc_info=True,
                 )
         return result
 

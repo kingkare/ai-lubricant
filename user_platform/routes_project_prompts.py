@@ -16,7 +16,7 @@ from . import project_prompt_store
 admin_router = APIRouter(prefix="/api/v1/admin/project-prompts", tags=["project-prompts-admin"])
 user_router = APIRouter(prefix="/api/v1/users/project-prompts", tags=["project-prompts-user"])
 
-_ALLOWED_PROVIDERS = {"claude", "codex", "opencode", "cursor"}
+_ALLOWED_PROVIDERS = {"claude", "codex", "opencode", "cursor", "dsh"}
 
 
 async def _require_admin(user: User = Depends(get_current_user)) -> User:

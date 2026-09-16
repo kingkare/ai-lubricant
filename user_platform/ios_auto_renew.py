@@ -144,7 +144,8 @@ async def _notify_failure(
     if retryable:
         return
     owner_user_id = str(resource.get("owner_user_id") or "")
-    device_name = (resource.get("data") or {}).get("name") or ios_info.get("udid") or "设备"
+    # get_resource 返回扁平化 DTO（无 "data" 层）。
+    device_name = resource.get("name") or ios_info.get("udid") or "设备"
     await emit_notification(
         "ios.wda.auto_renew_failed",
         params={
@@ -209,7 +210,9 @@ async def _scan_once(client: NodeClient) -> int:
     )
     dispatched = 0
     for res in resources or []:
-        data = res.get("data") or {}
+        # list_resources 返回扁平化 DTO（无 "data" 层）。此前读 res["data"] 恒为
+        # {}，扫描器永远看不到任何设备 → 自动续签从不派发。
+        data = res
         ios_info = data.get("ios") or {}
         if not isinstance(ios_info, dict):
             continue

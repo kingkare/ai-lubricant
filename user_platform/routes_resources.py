@@ -360,7 +360,7 @@ async def create_reference_from_github_v2(
         }
         association = []
         provider = str(plugin_spec.get("provider") or "claude")
-        editors = [provider] if provider in ("claude", "codex", "opencode", "cursor", "gemini") else []
+        editors = [provider] if provider in ("claude", "codex", "opencode", "cursor", "gemini", "dsh") else []
         name = name_override or str(plugin_spec.get("provider") or full_name.split("/")[-1])
     else:  # mcp
         launch = recognized.get("launch_spec") or {}

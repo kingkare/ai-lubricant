@@ -856,7 +856,12 @@ def _proxy_id(item: dict) -> str:
     mode = str(item.get("mode") or "network").strip().lower()
     # node 模式 url 为空，改以 node_id 入 seed，避免同名不同节点的条目撞 id。
     disc = item.get("node_id", "") if mode == "node" else item.get("url", "")
-    seed = f"{item.get('name', '')}|{mode}|{disc}"
+    # owner_id 入 seed：不同用户用同名同 URL 建代理也不会撞 id（owner_id 是归属，
+    # 不影响已存在条目的哈希——见 _normalize_proxy_item 对 owner_id 的保留）。
+    # 仅当条目带 owner_id 时入 seed；owner-less（管理员/历史建）保持原 seed 口径，
+    # 使既有 proxy_id 与账号里存的 proxy_id 引用字节一致。
+    owner = (item.get("owner_user_id") or "").strip()
+    seed = f"{owner}|{item.get('name', '')}|{mode}|{disc}" if owner else f"{item.get('name', '')}|{mode}|{disc}"
     return "proxy_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
 
 
@@ -896,13 +901,16 @@ def _normalize_proxy_item(item: dict) -> dict:
     else:
         username = (item.get("username") or "").strip()
         password = item.get("password") or ""
+    # 归属：原样保留。owner-less = 管理员/历史建（对所有人可用、非管理员不可见）。
+    owner_user_id = (item.get("owner_user_id") or "").strip() or None
     result = {
-        "id": _proxy_id({**item, "name": name, "url": url, "mode": mode}),
+        "id": _proxy_id({**item, "name": name, "url": url, "mode": mode, "owner_user_id": owner_user_id}),
         "name": name,
         "mode": mode,
         "url": url,
         "username": username,
         "password": password,
+        "owner_user_id": owner_user_id,
     }
     # node_id 仅 node 模式携带，避免污染其余模式的条目结构。
     if mode == "node":
@@ -1323,6 +1331,68 @@ async def _resolve_admin_from_user_session() -> Optional[str]:
     if getattr(authed, "role", None) != "admin":
         return None
     return str(authed.id)
+
+
+async def _resolve_user_or_admin() -> Optional[tuple[str, bool]]:
+    """鉴权（不限 admin）：返回 (user_id, is_admin)，全部失败返回 None。
+
+    与 `_require_admin` 同口径：主路径 C 端 session cookie（role 任意，active 即可），
+    应急兜底 Bearer admin token（视作 admin）。首页快捷操作要「放开鉴权但只操作自己
+    添加的」，用本函数拿调用者身份后做归属过滤/校验。
+    """
+    cookie = _current_user_cookie.get()
+    if cookie:
+        try:
+            from user_platform.config import settings as _compat_settings
+            if _compat_settings.enabled:
+                from user_platform.auth_service import auth_service
+                authed = await auth_service.resolve_session(cookie)
+                if authed is not None and not getattr(authed, "is_blocked", False) and getattr(authed, "status", "active") == "active":
+                    return (str(authed.id), getattr(authed, "role", None) == "admin")
+        except Exception:
+            pass
+    # 应急兜底：Bearer admin token（由调用方从 Header 传入，这里只解析 cookie 失败的回退）
+    return None
+
+
+async def _require_admin_or_user(authorization: Optional[str] = Header(None)) -> tuple[str, bool]:
+    """放开鉴权：任意已登录用户都放行，返回 (user_id, is_admin)。
+
+    - 主路径：C 端 session cookie（role 任意 active）。
+    - 应急兜底：Bearer admin token（/admin/login 换取），视作 admin。
+    401 当两者都没有。
+    """
+    ident = await _resolve_user_or_admin()
+    if ident is not None:
+        return ident
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="需要登录")
+    token = authorization[7:]
+    session = await _get_admin_session(token)
+    if not session or time.time() > session["expires_at"]:
+        await _del_admin_session(token)
+        raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
+    return (token, True)
+
+
+def _provider_visible_to(owner_user_id, user_id: str, is_admin: bool) -> bool:
+    """渠道可见性：管理员全见；非管理员只见自己建的（owner_user_id==自己）。
+
+    owner_user_id 为 None（管理员/历史建）的行对非管理员不可见——满足
+    「管理员添加的能使用但是不能看」（可见性层过滤，选路层不过滤）。
+    """
+    if is_admin:
+        return True
+    owner = str(owner_user_id or "").strip()
+    return owner != "" and owner == str(user_id)
+
+
+def _provider_owned_by(owner_user_id, user_id: str, is_admin: bool) -> bool:
+    """渠道可操作性：管理员全可改；非管理员只能改自己建的（owner_user_id==自己）。"""
+    if is_admin:
+        return True
+    owner = str(owner_user_id or "").strip()
+    return owner != "" and owner == str(user_id)
 
 
 async def _require_admin(authorization: Optional[str] = Header(None)):
@@ -2861,15 +2931,20 @@ async def get_api_keys_usage(token: str = Header(None, alias="Authorization")):
     await _require_admin(token)
     from rate_limiter import RateLimiter
     keys = await PostgresClient.list_api_keys()
-    # 并发取每一个 Key 的运行时限流余量 + 用量明细；原实现串行循环，N 个 key 就
-    # 叠加 N 次 Redis + N 次 DB 往返，key 多时直接超时。
+    # ledger 用量一次性批量拉齐：原实现对每个 key 并发调 api_key_usage_totals，
+    # N 个 key 同时占 N 条 PG 连接（88 个 key = 88 条），共享 PG 的
+    # max_connections 直接连打满 → TooManyConnections 500。批量版两条
+    # GROUP BY 聚合只占 2 条连接，口径与单 key 版一致。
+    ledger = await PostgresClient.api_key_usage_totals_batch(
+        [k["id"] for k in keys],
+        root_ids=[k["id"] for k in keys if k.get("parent_id") is None],
+    )
+    # Redis 限流余量仍按 key 并发读：走 Redis 池（max_connections=500），
+    # 不抢 PG 连接，且原串行循环会叠加 N 次 Redis RTT 拖慢页面。
     async def _usage(k: dict) -> dict:
         usage = await RateLimiter.get_usage(k.get("key", ""))
-        ledger_usage = await PostgresClient.api_key_usage_totals(
-            k["id"], include_children=bool(k.get("parent_id") is None)
-        )
         k["rate_limit"] = json.loads(k["rate_limit"]) if isinstance(k["rate_limit"], str) else (k["rate_limit"] or {})
-        return {**k, "usage": usage, "ledger_usage": ledger_usage}
+        return {**k, "usage": usage, "ledger_usage": ledger.get(k["id"]) or {"requests": 0, "total_tokens": 0}}
     return await asyncio.gather(*[_usage(k) for k in keys])
 
 
@@ -3974,11 +4049,16 @@ async def list_providers(
     lite: bool = False,
     token: str = Header(None, alias="Authorization"),
 ):
-    await _require_admin(token)
+    user_id, is_admin = await _require_admin_or_user(token)
     provider_configs = await config.Config.get_providers()
     # 仅返回已在 Postgres 持久化（即真正“已创建”）的渠道。
     # 不要并入 ModelClientPool 运行时注册的内置渠道模板，否则未创建的渠道也会出现在列表中。
-    names = sorted((provider_configs or {}).keys())
+    # 非管理员：只看自己建的渠道（owner_user_id==自己）；管理员建的对本人不可见
+    # （但选路层不过滤，故管理员建的渠道照样可被调用——「能使用但不能看」）。
+    names = sorted(
+        n for n, cfg in (provider_configs or {}).items()
+        if _provider_visible_to(cfg.get("owner_user_id"), user_id, is_admin)
+    )
     models_map = _build_provider_models_map()
     if lite:
         return [
@@ -3998,8 +4078,10 @@ async def list_providers(
 
 @router.delete("/providers/{name}")
 async def delete_provider(name: str, token: str = Header(None, alias="Authorization")):
-    await _require_admin(token)
+    user_id, is_admin = await _require_admin_or_user(token)
     cfg = await _read_provider_config(name)
+    if not _provider_owned_by(cfg.get("owner_user_id"), user_id, is_admin):
+        raise HTTPException(status_code=403, detail="只能操作自己添加的渠道")
 
     main_cfg = await _read_json_async(CONFIG_FILE)
     old_data = {
@@ -4025,8 +4107,11 @@ async def delete_provider(name: str, token: str = Header(None, alias="Authorizat
 
 @router.get("/providers/{name}/base")
 async def get_provider_base_config(name: str, token: str = Header(None, alias="Authorization")):
-    await _require_admin(token)
+    user_id, is_admin = await _require_admin_or_user(token)
     cfg = await _read_provider_base_config(name)
+    if cfg is not None and not _provider_visible_to(cfg.get("owner_user_id"), user_id, is_admin):
+        # 不可见 = 对非管理员不存在的渠道，按 404 处理避免泄露存在性。
+        raise HTTPException(status_code=404, detail="渠道不存在或无权访问")
     return _provider_base_response(name, cfg)
 
 
@@ -4699,21 +4784,30 @@ async def oauth_loopback_callback(request: Request):
 
 @router.post("/providers/{name}/accounts/auth/replay")
 async def replay_provider_account_auth(name: str, data: dict, token: str = Header(None, alias="Authorization")):
-    """手工补投回调地址：把浏览器地址栏里的整条 URL 粘回来，当作那次本机回调处理。
+    """手工补投：把浏览器地址栏里的整条 URL（或控制台复制的凭证块）粘回来补投那次授权。
 
     跨机部署时上游回调落在用户自己机器的 127.0.0.1 上（那台机器没有本服务，页面打不开），
     但地址栏里的参数是完整的（code / secret / redirect 都在）。管理员复制整条地址粘进
     管理端，服务端按与 ``GET /oauth/callback`` 完全相同的「认领 → 换码 / 回填」逻辑补投。
     只处理本渠道的会话；与 ticket 轮询双通道幂等（_finalize_authorized_auth 有 completed 护栏）。
+
+    除 URL 外还接受**非 URL 载荷**（渠道让用户从浏览器控制台复制凭证块时用）：``{``/``[``
+    开头的粘贴跳过 query 解析（JSON 里的 base64 ``=`` 会被 parse_qs 切碎），以空 ``params``
+    + 原文 ``callback_url`` 交给渠道钩子自行识别。解析不出参数的粘贴同样交给钩子——裸
+    token 这类载荷本来就没有 query，由知道「本会话在等什么」的渠道判定比在这里拦更准
+    （拦掉只会让用户拿到一个与实情无关的报错）。
     """
     admin_token = await _require_admin(token)
     raw = data.get("callback_url") if isinstance(data, dict) else None
-    params = _parse_callback_url_params(raw)
-    if not params:
-        raise HTTPException(status_code=400, detail="回调地址里没有可识别的参数，请粘贴浏览器地址栏的完整 URL")
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text:
+        raise HTTPException(status_code=400, detail="请粘贴回调地址或渠道提示的凭证内容")
+    # JSON 载荷别喂给 parse_qs（base64 '=' 会被切成垃圾键）；其余照常解析，解析不出就
+    # 空 params 透传，由渠道钩子按自己的会话类型判定认领与否。
+    params = {} if text[:1] in ("{", "[") else _parse_callback_url_params(text)
     # 整条 URL 也透传给渠道钩子：需要 fragment（#token=…）或非常规参数的 spec 自己解析。
     result = await _process_loopback_params(
-        params, only_provider=name, callback_url=raw if isinstance(raw, str) else "")
+        params, only_provider=name, callback_url=text)
     kind = result["kind"]
     logger.info(f"[admin] auth/replay provider={name} kind={kind} keys={sorted(params)}")
     if kind == "authorized":
@@ -5381,13 +5475,28 @@ async def detect_custom_provider_input(data: dict, token: str = Header(None, ali
     return await _detect_quick_custom_provider(data.get("raw", ""))
 
 
-@router.post("/custom-providers")
-async def create_custom_provider(data: dict, token: str = Header(None, alias="Authorization")):
-    await _require_admin(token)
+async def _create_provider_from_config(
+    data: dict,
+    *,
+    token: str,
+    is_admin: bool = True,
+    user_id: str | None = None,
+    existing_names: set[str] | None = None,
+    log_action: str = "create_provider",
+) -> dict:
+    """从原始建渠道 payload 建一个渠道，返回 ``{"ok": True, "name": name}``。
 
+    覆盖「内置模板 / 自定义」两条分支 → 名称生成 → 配置归一化 → base_url 校验 →
+    整份写渠道 → 模型批量写 → 限流策略种子 → 运行时加载 → 审计 → 通知。
+
+    ``create_custom_provider`` 与外部渠道批量导入共用此实现，避免两条创建路径漂移。
+    ``existing_names`` 传可变集合时：既省掉每个渠道一次 ``get_providers()`` 往返，
+    也保证**批内**名称唯一——否则一批同名渠道会并发穿过 ``_auto_generate_name``。
+    """
     builtin_type = (data.get("builtin_type") or "").strip()
-    existing_configs = await config.Config.get_providers()
-    existing_names = set(existing_configs.keys()) | set(ModelClientPool.get_provider_names())
+    if existing_names is None:
+        existing_configs = await config.Config.get_providers()
+        existing_names = set(existing_configs.keys()) | set(ModelClientPool.get_provider_names())
     remark = (data.get("remark") or "").strip()
 
     if builtin_type:
@@ -5432,6 +5541,8 @@ async def create_custom_provider(data: dict, token: str = Header(None, alias="Au
 
     cfg["remark"] = cfg.get("remark") or remark or name
     _validate_provider_requires_base_url(name, cfg)
+    # 归属：管理员建 = NULL（对所有人可用、对非管理员不可见）；非管理员建 = 本人 user_id。
+    cfg["owner_user_id"] = None if is_admin else user_id
     initial_models = data.get("models")
     await _write_provider_config(name, cfg)
     if isinstance(initial_models, list):
@@ -5447,7 +5558,7 @@ async def create_custom_provider(data: dict, token: str = Header(None, alias="Au
     })
     clear_policy_cache(name)
     await _load_provider_runtime(name, cfg)
-    await _log_operation(token, "create_provider", "provider", name, None, cfg)
+    await _log_operation(token, log_action, "provider", name, None, cfg)
     from user_platform.notify_core import emit_notification_background
     emit_notification_background(
         "channel.created",
@@ -5456,7 +5567,16 @@ async def create_custom_provider(data: dict, token: str = Header(None, alias="Au
         severity="info",
         dedupe_key=f"channel.created:{name}",
     )
+    existing_names.add(name)
     return {"ok": True, "name": name}
+
+
+@router.post("/custom-providers")
+async def create_custom_provider(data: dict, token: str = Header(None, alias="Authorization")):
+    user_id, is_admin = await _require_admin_or_user(token)
+    return await _create_provider_from_config(
+        data, token=token, is_admin=is_admin, user_id=user_id,
+    )
 
 
 @router.post("/custom-providers/upstream-models")
@@ -7858,32 +7978,69 @@ async def cancel_oauth_device_flow(name: str, token: str = Header(None, alias="A
 
 @router.get("/config/proxies")
 async def get_proxies(token: str = Header(None, alias="Authorization")):
-    await _require_admin(token)
-    return _normalize_proxies(_read_json(CONFIG_FILE).get("proxies", []))
+    user_id, is_admin = await _require_admin_or_user(token)
+    # 全量读（_read_proxies 不过滤，运行时选路靠它）；非管理员按归属过滤，
+    # 管理员建的条目对非管理员不可见（url/密码不外泄）。
+    proxies = _normalize_proxies(_read_json(CONFIG_FILE).get("proxies", []))
+    if not is_admin:
+        proxies = [p for p in proxies if str(p.get("owner_user_id") or "") == user_id]
+    return proxies
 
 
 @router.put("/config/proxies")
 async def update_proxies(data: list[dict], token: str = Header(None, alias="Authorization")):
-    """全量更新代理池 [{name, url}]"""
-    await _require_admin(token)
+    """更新代理池。
+
+    管理员：全量替换（既有口径）。
+    非管理员：只替换自己的那一段——保留他人与管理员建的条目，本人的条目用提交列表替换。
+    提交列表里不允许出现 id 已属他人/管理员的条目（403）。非管理员条目统一打上自己的归属。
+    """
+    user_id, is_admin = await _require_admin_or_user(token)
     cfg = _read_json(CONFIG_FILE)
-    old_proxies = cfg.get("proxies", [])
-    proxies = _normalize_proxies(data)
-    cfg["proxies"] = proxies
+    old_proxies = cfg.get("proxies", []) or []
+    # old_proxies 原样（已带 owner_user_id），不经过 _normalize_proxies 二次清洗以免丢归属。
+    incoming = _normalize_proxies(data)
+
+    if is_admin:
+        merged = incoming
+    else:
+        # 非管理员：把 incoming 全部标记为自己的归属；并校验没碰他人的 id。
+        others_by_id = {}
+        for p in old_proxies:
+            if not isinstance(p, dict):
+                continue
+            pid = (p.get("id") or "").strip()
+            owner = str(p.get("owner_user_id") or "").strip()
+            if pid and owner != user_id:
+                others_by_id[pid] = p
+        for p in incoming:
+            pid = (p.get("id") or "").strip()
+            if pid and pid in others_by_id:
+                raise HTTPException(status_code=403, detail=f"代理 {pid} 不属于你，不能修改")
+            p["owner_user_id"] = user_id
+        # 保留所有 owner != 自己 的条目（含管理员建的 owner-less 行 + 他人建的行），
+        # 再接上本人的新列表——只替换自己那一段，不动他人/管理员建的。
+        preserved = [
+            p for p in old_proxies
+            if isinstance(p, dict) and str(p.get("owner_user_id") or "").strip() != user_id
+        ]
+        merged = preserved + incoming
+
+    cfg["proxies"] = merged
     # 异步等待持久化 + 配置缓存刷新完成，再原地刷新运行态代理并广播跨实例事件。
     await _write_json_async(CONFIG_FILE, cfg)
-    update_result = _hot_update_proxy_pool(proxies)
+    update_result = _hot_update_proxy_pool(merged)
     # 同步本实例共享 ProxyManager 的配置缓存（含剪掉已删除条目 + 关闭残留实例），
     # 否则改代理 url/密码/模式在本实例要等 Redis 自收 EVENT_PROXY 或 60s 对账才生效；
     # Redis 不可用时会最长滞后 60s。其它实例仍由 _publish_proxy_event 兜底。
     try:
         from proxy_utils import sync_proxy_manager_configs
-        await sync_proxy_manager_configs(proxies)
+        await sync_proxy_manager_configs(merged)
     except Exception as exc:
         logger.warning(f"[admin] ProxyManager 代理配置同步失败: {exc}")
     await _publish_proxy_event()
-    await _log_operation(token, "update_proxies", "proxy", "proxies", _scrub_relay_secret(old_proxies), _scrub_relay_secret(proxies))
-    return {"ok": True, "count": len(proxies), "hot_reloaded": update_result["changed"]}
+    await _log_operation(token, "update_proxies", "proxy", "proxies", _scrub_relay_secret(old_proxies), _scrub_relay_secret(merged))
+    return {"ok": True, "count": len(merged), "hot_reloaded": update_result["changed"]}
 
 
 # ==================== 全局配置聚合（各 Tab 独立读写） ====================
@@ -7908,13 +8065,15 @@ async def update_global_run_mode_config(data: dict, token: str = Header(None, al
 
 @router.get("/global-config/proxy-pool")
 async def get_global_proxy_pool_config(token: str = Header(None, alias="Authorization")):
-    await _require_admin(token)
-    return {"proxies": _normalize_proxies(_read_json(CONFIG_FILE).get("proxies", []))}
+    user_id, is_admin = await _require_admin_or_user(token)
+    proxies = _normalize_proxies(_read_json(CONFIG_FILE).get("proxies", []))
+    if not is_admin:
+        proxies = [p for p in proxies if str(p.get("owner_user_id") or "") == user_id]
+    return {"proxies": proxies}
 
 
 @router.put("/global-config/proxy-pool")
 async def update_global_proxy_pool_config(data: list[dict], token: str = Header(None, alias="Authorization")):
-    await _require_admin(token)
     result = await update_proxies(data, token=token)
     return {"ok": result.get("ok", True), "count": result.get("count", 0)}
 
@@ -8035,7 +8194,6 @@ async def get_global_models_config(token: str = Header(None, alias="Authorizatio
     await _require_admin(token)
     tokenizer = _read_json(CONFIG_FILE).get("tokenizer") or {}
     thinking = await get_thinking_global_config(token=token)
-    metadata = await _mm.list_metadata_from_db_async()
     detection = tokenizer.get("context_detection_enabled")
     # tokenizer 规则已由后端内置模型族映射维护，不可编辑。仍回传内置策略摘要供前端只读展示。
     tokenizer_policy = [
@@ -8056,7 +8214,8 @@ async def get_global_models_config(token: str = Header(None, alias="Authorizatio
         "context_detection_enabled": detection if isinstance(detection, bool) else config.DEFAULT_CONTEXT_TOKEN_DETECTION_ENABLED,
         "thinking": thinking,
         "owned_by_options": (await get_owned_by_list(token=token)).get("owned_by", []),
-        "default_metadata": metadata.get("default"),
+        # 默认元数据已废弃，恒回传 null；前端入口保留但保存不再生效。
+        "default_metadata": None,
     }
 
 
@@ -8101,8 +8260,7 @@ async def update_global_models_config(data: dict, token: str = Header(None, alia
         await _log_operation(token, "update_tokenizer_vocab_check", "main_config", "tokenizer_vocab_check", None, section)
     if isinstance(data.get("thinking"), dict):
         await update_thinking_global_config(data["thinking"], token=token)
-    if isinstance(data.get("default_metadata"), dict):
-        await update_model_metadata_default(data["default_metadata"], token=token)
+    # default_metadata 已废弃：旧前端可能仍随整包 PUT 携带，直接忽略不写库。
     return {"ok": True}
 
 
@@ -8675,7 +8833,9 @@ def _model_market_payload(metadata_payload: dict) -> dict:
             "routes": model_routes,
             "providers": providers,
             "has_metadata": bool(metadata),
-            "available": bool(metadata),
+            # available = 是否可调用（有渠道路由即可）。元数据是可选增强，缺失只作为
+            # reason 提示，不再视为不可用。
+            "available": True,
             "metadata": metadata,
             "reason": None if metadata else "missing_metadata",
         })
@@ -8701,15 +8861,12 @@ async def list_model_metadata(token: str = Header(None, alias="Authorization")):
 
 @router.put("/model-metadata/default")
 async def update_model_metadata_default(data: dict, token: str = Header(None, alias="Authorization")):
+    """默认元数据已废弃：端点保留（前端仍有入口）但不再落库，静默返回空。
+
+    未配置元数据的模型不再继承任何默认值，保存该表单不产生任何效果。
+    """
     await _require_admin(token)
-    cleaned = _clean_metadata_payload(data)
-    # 渠道过滤只属于具体 real 模型；默认元数据不参与选路。
-    cleaned.pop("provider_whitelist", None)
-    cleaned.pop("provider_blacklist", None)
-    new_default = await _mm.update_default_async(cleaned)
-    await _after_metadata_write("__default__")
-    await _log_operation(token, "update_model_metadata_default", "model_metadata", "default", None, new_default)
-    return {"ok": True, "default": new_default}
+    return {"ok": True, "default": {}}
 
 
 # ==================== Header 模板库（系统配置） ====================

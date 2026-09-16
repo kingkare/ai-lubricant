@@ -36,6 +36,86 @@ def test_catalog_always_merges_custom_system_and_remote(monkeypatch):
     assert by_id["demo"]["preset"]["remark"] == "new"
 
 
+def _catalog_with_remote(monkeypatch, remote_items, builtin=None):
+    channel_catalog.configure_builtin_loader(lambda: list(builtin or []))
+
+    async def headers():
+        return []
+
+    monkeypatch.setattr(channel_catalog, "_snapshot", {
+        "remote_items": remote_items, "updated_at": "now", "stale": False,
+    })
+    monkeypatch.setattr(channel_catalog.PostgresClient, "get_header_templates", headers)
+    return asyncio.run(channel_catalog.get_catalog())
+
+
+def test_remote_builtin_type_custom_does_not_hijack_generic_entry(monkeypatch):
+    """存量脏模板：自定义供应商的 builtin_type 被回落成 'custom'。
+
+    它必须按自己的 id 单列，不能命中「通用供应商」槽位——否则加供应商弹窗里
+    通用供应商那张卡会被换成该模板（name/base_url 全被顶掉）。
+    """
+    result = _catalog_with_remote(monkeypatch, [{
+        "id": "local.aliyun-plan", "name": "aliyun", "description": "aliyun",
+        "tags": [], "builtin_type": "custom",
+        "preset": {"remark": "aliyun", "base_url": "https://coding.example.com/apps/anthropic"},
+    }])
+    by_id = {item["id"]: item for item in result["items"]}
+
+    assert by_id["custom"]["name"] == "通用供应商"
+    assert by_id["custom"]["builtin_type"] == ""
+    assert (by_id["custom"]["preset"] or {}).get("base_url") == ""
+    # 模板自己仍在目录里，只是单列成一张卡。
+    assert by_id["local.aliyun-plan"]["name"] == "aliyun"
+
+
+def test_remote_builtin_type_code_does_not_hijack_custom_entry(monkeypatch):
+    """代码模板（builtin_type='code'）不得覆盖「自定义供应商」的空白起点。
+
+    合并会把 _code_entry() 的 EchoChannel 示例源码换成发布者的代码，之后点
+    「自定义供应商」建出来的是别人的渠道而非空白模板。按 id 单列即可，
+    前端仍按 builtin_type='code' 走自定义供应商分支。
+    """
+    result = _catalog_with_remote(monkeypatch, [{
+        "id": "local.my-code", "name": "我的代码渠道", "description": "",
+        "tags": [], "builtin_type": "code",
+        "preset": {"remark": "我的代码渠道", "builtin_type": "code", "code": "class Mine: pass"},
+    }])
+    by_id = {item["id"]: item for item in result["items"]}
+
+    assert by_id["code"]["name"] == "自定义供应商"
+    assert "class EchoChannel" in by_id["code"]["preset"]["code"]
+    assert by_id["local.my-code"]["preset"]["code"] == "class Mine: pass"
+
+
+def test_remote_builtin_type_still_merges_into_real_builtin_entry(monkeypatch):
+    """真内置类型的合并行为不变：模板更新那张卡的展示与预设，不多出一张重复卡。"""
+    result = _catalog_with_remote(monkeypatch, [{
+        "id": "local.cf", "name": "CF 模板", "description": "new",
+        "tags": ["推荐"], "builtin_type": "cloudflare", "preset": {"timeout": 300},
+    }], builtin=[{
+        "id": "cloudflare", "name": "Cloudflare Workers AI", "description": "old",
+        "tags": [], "builtin_type": "cloudflare", "preset": {"timeout": 120},
+    }])
+    by_id = {item["id"]: item for item in result["items"]}
+
+    assert "local.cf" not in by_id
+    assert by_id["cloudflare"]["name"] == "CF 模板"
+    assert by_id["cloudflare"]["description"] == "new"
+    assert by_id["cloudflare"]["preset"]["timeout"] == 300
+
+
+def test_remote_template_id_colliding_with_system_entry_is_skipped(monkeypatch):
+    """兜底：没有 builtin_type 但 id 直接叫 'custom' 的模板跳过，不占系统槽位。"""
+    result = _catalog_with_remote(monkeypatch, [{
+        "id": "custom", "name": "冒名顶替", "description": "", "tags": [],
+        "builtin_type": "", "preset": {"base_url": "https://evil.example.com"},
+    }])
+    by_id = {item["id"]: item for item in result["items"]}
+
+    assert by_id["custom"]["name"] == "通用供应商"
+
+
 def test_catalog_resolves_header_name_to_local_id(monkeypatch):
     channel_catalog.configure_builtin_loader(lambda: [])
     monkeypatch.setattr(channel_catalog, "_snapshot", {

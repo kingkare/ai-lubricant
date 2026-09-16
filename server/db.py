@@ -133,6 +133,12 @@ class PostgresClient:
             """)
             await conn.execute("ALTER TABLE provider_configs ADD COLUMN IF NOT EXISTS billing_mode TEXT NOT NULL DEFAULT 'token'")
             await conn.execute("ALTER TABLE provider_configs ADD COLUMN IF NOT EXISTS error_rate_threshold REAL NOT NULL DEFAULT 0.3")
+            # owner_user_id：渠道归属。NULL = 管理员/历史建（对所有人可见且可用，参与选路）；
+            # 非 NULL = 该用户自建（仅本人可见可改，仍参与选路供本人任务调用）。
+            # 「管理员添加的能使用但是不能看」：非管理员列表过滤掉 owner_user_id != 自己 的行，
+            # 但 get_providers() 选路快照不过滤，故管理员建的渠道照样可被调用。
+            await conn.execute("ALTER TABLE provider_configs ADD COLUMN IF NOT EXISTS owner_user_id TEXT")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_provider_configs_owner ON provider_configs(owner_user_id)")
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS provider_accounts (
                     id BIGSERIAL PRIMARY KEY,
@@ -3205,7 +3211,7 @@ class PostgresClient:
         async with cls.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT enabled, rate_limit, config, billing_mode, error_rate_threshold, updated_at
+                SELECT enabled, rate_limit, config, billing_mode, error_rate_threshold, updated_at, owner_user_id
                 FROM provider_configs WHERE name=$1
                 """,
                 name,
@@ -3225,6 +3231,7 @@ class PostgresClient:
             "billing_mode": row["billing_mode"] or "token",
             "error_rate_threshold": float(row["error_rate_threshold"] or 0.3),
             "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+            "owner_user_id": row["owner_user_id"],
         })
         return cls._merge_provider(base, accounts)
 
@@ -3234,7 +3241,7 @@ class PostgresClient:
         async with cls.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT enabled, rate_limit, config, billing_mode, error_rate_threshold, updated_at
+                SELECT enabled, rate_limit, config, billing_mode, error_rate_threshold, updated_at, owner_user_id
                 FROM provider_configs WHERE name=$1
                 """,
                 name,
@@ -3253,6 +3260,7 @@ class PostgresClient:
             "billing_mode": row["billing_mode"] or "token",
             "error_rate_threshold": float(row["error_rate_threshold"] or 0.3),
             "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+            "owner_user_id": row["owner_user_id"],
         })
         return base
 
@@ -3271,13 +3279,16 @@ class PostgresClient:
         async with cls.pool.acquire() as conn:
             base = cls._provider_base(data)
             config = {k: v for k, v in base.items() if k not in (
-                "enabled", "rate_limit", "model_aliases", "model_whitelist", "custom_models", "billing_mode", "error_rate_threshold"
+                "enabled", "rate_limit", "model_aliases", "model_whitelist", "custom_models", "billing_mode", "error_rate_threshold", "owner_user_id"
             )}
+            # owner_user_id 只在 INSERT 时写入（新建归属），ON CONFLICT 不改归属，
+            # 避免编辑他人渠道时把归属改到自己。data 里没带则视为管理员建（NULL）。
+            owner_user_id = data.get("owner_user_id")
             async with conn.transaction():
                 await conn.execute(
                     """
-                    INSERT INTO provider_configs(name, enabled, rate_limit, config, billing_mode, error_rate_threshold, updated_at)
-                    VALUES($1, $2, $3::jsonb, $4::jsonb, $5, $6, now())
+                    INSERT INTO provider_configs(name, enabled, rate_limit, config, billing_mode, error_rate_threshold, owner_user_id, updated_at)
+                    VALUES($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7, now())
                     ON CONFLICT(name) DO UPDATE SET
                         enabled=EXCLUDED.enabled,
                         rate_limit=EXCLUDED.rate_limit,
@@ -3292,6 +3303,7 @@ class PostgresClient:
                     cls._dumps(config),
                     str(base.get("billing_mode", "token")),
                     float(base.get("error_rate_threshold", 0.3)),
+                    owner_user_id,
                 )
                 if drop_accounts:
                     await conn.execute("DELETE FROM provider_accounts WHERE provider_name=$1", name)
@@ -3342,13 +3354,15 @@ class PostgresClient:
     async def _set_provider_config_conn(cls, conn, name: str, data: dict, delete_legacy: bool = False):
         base = cls._provider_base(data)
         config = {k: v for k, v in base.items() if k not in (
-            "enabled", "rate_limit", "model_aliases", "model_whitelist", "custom_models", "billing_mode", "error_rate_threshold"
+            "enabled", "rate_limit", "model_aliases", "model_whitelist", "custom_models", "billing_mode", "error_rate_threshold", "owner_user_id"
         )}
+        # owner_user_id 只在 INSERT 时写入（新建归属），ON CONFLICT 不改归属。
+        owner_user_id = data.get("owner_user_id")
         async with conn.transaction():
             await conn.execute(
                 """
-                INSERT INTO provider_configs(name, enabled, rate_limit, config, billing_mode, error_rate_threshold, updated_at)
-                VALUES($1, $2, $3::jsonb, $4::jsonb, $5, $6, now())
+                INSERT INTO provider_configs(name, enabled, rate_limit, config, billing_mode, error_rate_threshold, owner_user_id, updated_at)
+                VALUES($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7, now())
                 ON CONFLICT(name) DO UPDATE SET
                     enabled=EXCLUDED.enabled,
                     rate_limit=EXCLUDED.rate_limit,
@@ -3363,6 +3377,7 @@ class PostgresClient:
                 cls._dumps(config),
                 str(base.get("billing_mode", "token")),
                 float(base.get("error_rate_threshold", 0.3)),
+                owner_user_id,
             )
             await conn.execute("DELETE FROM provider_accounts WHERE provider_name=$1", name)
             for acc in data.get("accounts", []) or []:
@@ -3436,7 +3451,7 @@ class PostgresClient:
 
             rows = await conn.fetch(
                 """
-                SELECT name, enabled, rate_limit, config, updated_at
+                SELECT name, enabled, rate_limit, config, updated_at, owner_user_id
                 FROM provider_configs
                 ORDER BY name
                 """
@@ -3467,6 +3482,7 @@ class PostgresClient:
                     "enabled": row["enabled"],
                     "rate_limit": json.loads(row["rate_limit"]) if isinstance(row["rate_limit"], str) else dict(row["rate_limit"]),
                     "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                    "owner_user_id": row["owner_user_id"],
                 })
                 providers[row["name"]] = cls._merge_provider(base, accounts_by_provider.get(row["name"], []))
         return providers
@@ -5328,6 +5344,57 @@ class PostgresClient:
             "requests": int(row["requests"] or 0),
             "total_tokens": int(row["total_tokens"] or 0),
         }
+
+    @classmethod
+    async def api_key_usage_totals_batch(
+        cls, api_key_ids: list[int], *, root_ids: list[int] | None = None
+    ) -> dict[int, dict]:
+        """批量统计多个 key 的成功请求数与 token 总量（/config/api-keys/usage 专用）。
+
+        单 key 版每次调用 acquire 一条连接，N 个 key 的并发 gather 会同时占住
+        N 条连接（88 个 key 就是 88 条），在共享 PG 的 max_connections 预算内
+        直接打出 TooManyConnections。这里把 N 次点查合成两条 GROUP BY 聚合，
+        只占 2 条连接：
+
+        1) 自身用量：api_key_id = ANY($1) GROUP BY api_key_id，走
+           idx_request_logs_api_key_id；
+        2) 子 key 汇总：api_key_parent_id = ANY($2) GROUP BY api_key_parent_id，
+           走 idx_request_logs_api_key_parent_id，仅对 root_ids 里的父 key 叠加。
+
+        口径与单 key 版一致：第二段用 ``api_key_id IS DISTINCT FROM
+        api_key_parent_id`` 排除自引用行，避免同一行被算两次。请求的 id 没有
+        任何日志时也给全 0 条目，调用方免于逐个兜底。
+        """
+        out: dict[int, dict] = {i: {"requests": 0, "total_tokens": 0} for i in api_key_ids}
+        if not cls.pool or not api_key_ids:
+            return out
+        roots = list(root_ids or [])
+        async with cls.pool.acquire() as conn:
+            own_rows = await conn.fetch(
+                """SELECT api_key_id, count(*) AS requests, coalesce(sum(total_tokens), 0) AS total_tokens
+                FROM request_logs
+                WHERE api_key_id = ANY($1::int[]) AND success = true
+                GROUP BY api_key_id""",
+                api_key_ids,
+            )
+            for r in own_rows:
+                out[int(r["api_key_id"])]["requests"] += int(r["requests"] or 0)
+                out[int(r["api_key_id"])]["total_tokens"] += int(r["total_tokens"] or 0)
+            if roots:
+                parent_rows = await conn.fetch(
+                    """SELECT api_key_parent_id, count(*) AS requests, coalesce(sum(total_tokens), 0) AS total_tokens
+                    FROM request_logs
+                    WHERE api_key_parent_id = ANY($1::int[]) AND success = true
+                      AND api_key_id IS DISTINCT FROM api_key_parent_id
+                    GROUP BY api_key_parent_id""",
+                    roots,
+                )
+                for r in parent_rows:
+                    root_id = int(r["api_key_parent_id"])
+                    if root_id in out:
+                        out[root_id]["requests"] += int(r["requests"] or 0)
+                        out[root_id]["total_tokens"] += int(r["total_tokens"] or 0)
+        return out
 
     @classmethod
     async def recent_logs(cls, limit: int = 50) -> list[dict]:
@@ -8159,7 +8226,7 @@ class PostgresClient:
 
         model_groups 现在是唯一真相源：custom 行（kind='custom'）是路由组，real 行
         （kind='real'）承载真实模型元数据（metadata 列）。二者同表，由 kind 区分。
-        default 元数据仍存 app_config（全局默认，不属于任何具体模型）。
+        默认元数据机制已废弃；历史 app_config 中的 model_metadata_default 不再读取。
         """
         if not cls.pool:
             return {"groups": {}, "metadata": [], "default": {}}
@@ -8171,10 +8238,6 @@ class PostgresClient:
                 group_rows = await conn.fetch(
                     "SELECT name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata, schemes, active_scheme, created_at "
                     "FROM model_groups ORDER BY created_at ASC, name"
-                )
-                default_row = await conn.fetchrow(
-                    "SELECT data FROM app_config WHERE key=$1",
-                    cls.MODEL_METADATA_DEFAULT_KEY,
                 )
 
         groups: dict[str, dict] = {}
@@ -8191,11 +8254,11 @@ class PostgresClient:
                 record = dict(parsed.get("metadata") or {})
                 record["model_id"] = name
                 metadata.append(record)
-        default = cls._loads_json(default_row["data"], {}) if default_row else {}
+        # default 恒为空：默认元数据已废弃，未配置元数据的模型不回落到任何默认值。
         return {
             "groups": groups,
             "metadata": metadata,
-            "default": default if isinstance(default, dict) else {},
+            "default": {},
         }
 
     @classmethod
@@ -8488,6 +8551,16 @@ class PostgresClient:
                 "model_id": model_id or upstream_id,
                 "extra_config": extra_config,
                 "enabled": True if enabled is None else bool(enabled),
+            }
+        if isinstance(item, str):
+            # 裸字符串是「上下游同名」的模型 id。必须单独判，否则会落进下面的序列分支：
+            # 字符串本身是序列，"gpt-4o" 会被拆成 ("g", "p") —— 静默写坏模型名。
+            model_id = item.strip()
+            return {
+                "upstream_model_id": model_id,
+                "model_id": model_id,
+                "extra_config": {},
+                "enabled": True,
             }
         upstream_id = str(item[0] if len(item) > 0 else "").strip()
         model_id = str(item[1] if len(item) > 1 else upstream_id).strip() or upstream_id

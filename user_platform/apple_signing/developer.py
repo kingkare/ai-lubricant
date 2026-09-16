@@ -22,7 +22,7 @@ from typing import Any
 
 import requests
 
-from . import anisette, gsa, tls
+from . import anisette, tls
 from .errors import DeveloperServicesError
 
 _BASE = "https://developerservices2.apple.com/services/QH65B2/"
@@ -72,37 +72,18 @@ def _request(
     if params:
         body.update(params)
 
-    # GSA 引擎的统一出口：transport（节点隧道）优先，否则 requests + proxies。
-    # 与 gsa 同口径——登录用的出口在物化签名请求时也复用，Apple 对 IP 一致。
-    transport = gsa.current_transport()
-    if transport is not None:
-        try:
-            status, _hdrs, content = transport(
-                "POST",
-                f"{_BASE}{endpoint}?clientId={_CLIENT_ID}",
-                _headers(session, anisette.get_headers()),
-                plistlib.dumps(body),
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise DeveloperServicesError(f"节点隧道签名请求失败：{exc}") from exc
-        if status >= 400:
-            raise DeveloperServicesError(f"developer services HTTP {status}")
-        result = plistlib.loads(content)
-    else:
-        # trust_env=False：不吃环境变量代理——developer services 的出口与 GSA
-        # 同口径（显式 proxy_config_id / 节点隧道），环境变量代理只会添乱。
-        with requests.Session() as direct:
-            direct.trust_env = False
-            resp = direct.post(
-                f"{_BASE}{endpoint}?clientId={_CLIENT_ID}",
-                headers=_headers(session, anisette.get_headers()),
-                data=plistlib.dumps(body),
-                timeout=_TIMEOUT,
-                verify=tls.ca_bundle(),
-                proxies=gsa.current_proxies(),
-            )
-        resp.raise_for_status()
-        result = plistlib.loads(resp.content)
+    # trust_env=False：不吃环境变量代理——环境变量代理只会添乱。
+    with requests.Session() as direct:
+        direct.trust_env = False
+        resp = direct.post(
+            f"{_BASE}{endpoint}?clientId={_CLIENT_ID}",
+            headers=_headers(session, anisette.get_headers()),
+            data=plistlib.dumps(body),
+            timeout=_TIMEOUT,
+            verify=tls.ca_bundle(),
+        )
+    resp.raise_for_status()
+    result = plistlib.loads(resp.content)
 
     result_code = result.get("resultCode")
     if result_code not in (0, None, "0"):

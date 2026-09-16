@@ -10,6 +10,7 @@ Release 直链，宿主节点经自身出口代理下载后重签安装（见 ro
 from __future__ import annotations
 
 import base64
+import json
 import plistlib
 import re
 from datetime import datetime, timezone
@@ -20,6 +21,49 @@ from db import PostgresClient
 # mobileprovision 是一个 CMS/PKCS#7 签名的 plist：plist XML 原文嵌在二进制里，
 # 正则截出来用 plistlib（标准库）解析即可，无需新增依赖。
 _MOBILEPROVISION_PLIST_RE = re.compile(rb"<\?xml[\s\S]*?</plist>")
+
+
+def _encode_secret(secret_data: dict[str, Any] | None) -> str | None:
+    """把 secret_data 编码成 jsonb 参数。
+
+    ``secret_data`` 是 JSONB 列，而本进程的 asyncpg 池**没有**注册 jsonb
+    codec：asyncpg 只接受 str，直接传 dict 会在 bind 阶段抛
+    ``TypeError: expected str, got dict``（Apple ID 登录 500 的根因）。写入统一
+    走这里，与 builtin_tool_store 的 ``json.dumps(..., ensure_ascii=False)`` 同口径。
+    """
+    if secret_data is None:
+        return None
+    return json.dumps(secret_data, ensure_ascii=False)
+
+
+def _decode_secret(value: Any) -> dict[str, Any]:
+    """把读回的 jsonb 值还原成 dict。
+
+    同一个 codec 缺失意味着 asyncpg 把 jsonb 读成 **字符串**；而所有消费方
+    （routes_ios 的富化/物化、自动续签）都按 dict 取键（``secret.get("team_id")``），
+    不还原就会 AttributeError。None / 已是 dict 时按原样/空 dict 处理。
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _row_with_secret(row: Any) -> dict | None:
+    """dict(row) + 把 secret_data 列还原成 dict（存在该列时才动）。"""
+    if row is None:
+        return None
+    out = dict(row)
+    if "secret_data" in out:
+        out["secret_data"] = _decode_secret(out["secret_data"])
+    return out
 
 
 def parse_mobileprovision_metadata(base64_blob: str) -> dict[str, str] | None:
@@ -78,7 +122,7 @@ async def create_signing_profile(
             owner_user_id,
             name,
             kind,
-            secret_data,
+            _encode_secret(secret_data),
         )
         return dict(row)
 
@@ -123,7 +167,7 @@ async def get_signing_profile_secret(profile_id: int, owner_user_id: str) -> dic
             profile_id,
             owner_user_id,
         )
-        return dict(row) if row else None
+        return _row_with_secret(row)
 
 
 async def list_signing_profiles(owner_user_id: str, *, include_secret: bool = False) -> list[dict]:
@@ -147,7 +191,7 @@ async def list_signing_profiles(owner_user_id: str, *, include_secret: bool = Fa
             """,
             owner_user_id,
         )
-        return [dict(r) for r in rows]
+        return [_row_with_secret(r) for r in rows]
 
 
 async def update_signing_profile(
@@ -183,9 +227,9 @@ async def update_signing_profile(
                 profile_id,
                 owner_user_id,
                 name,
-                secret_data,
+                _encode_secret(secret_data),
             )
-        return dict(row) if row else None
+        return _row_with_secret(row)
 
 
 async def update_signing_profile_secret(profile_id: int, secret_data: dict[str, Any]) -> bool:
@@ -199,7 +243,7 @@ async def update_signing_profile_secret(profile_id: int, secret_data: dict[str, 
         result = await conn.execute(
             "UPDATE ios_signing_profiles SET secret_data = $2 WHERE id = $1",
             profile_id,
-            secret_data,
+            _encode_secret(secret_data),
         )
         return result.split()[-1] != "0"
 

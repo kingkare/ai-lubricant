@@ -973,6 +973,9 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 app.include_router(admin_router)
+# 外部供应商框架导入（New API 等）：预览/提交路由。挂 admin 门禁，必须在 SPA catch-all 之前。
+from channel_importer_api import router as channel_importer_router
+app.include_router(channel_importer_router)
 # 桌面上游型 OAuth 的本机回调（127.0.0.1:{port}/oauth/callback）。必须在 SPA catch-all
 # 之前注册；/oauth 也进 _API_PREFIXES，未命中路由时返回 404 而不是回退 SPA 页面。
 app.include_router(admin_loopback_router)
@@ -1451,16 +1454,14 @@ async def _validate_chat_request(body: dict, api_key: str | None = None):
     # 访问控制按请求名（组主名/别名/真实模型名）匹配 API Key 的模型白/黑名单。
     if not await config.Config.api_key_allows_model(api_key, model):
         raise HTTPException(status_code=403, detail=f"API Key 无权使用模型 '{model}'")
+    # 元数据是可选增强：有则用于能力识别与 token/context 限制，无则不做任何限制。
+    # 可用性只看是否有渠道路由，不再要求显式元数据。
     if await _catalog_call(config.Config.is_model_group, model, snapshot=catalog_snapshot):
-        if not await _catalog_call(model_metadata.has_explicit_metadata, model, snapshot=catalog_snapshot):
-            raise HTTPException(status_code=400, detail=f"模型组 '{model}' 未配置元数据，不可使用")
         if not await ModelClientPool.get_model_group_available_members(model, snapshot=catalog_snapshot):
-            raise HTTPException(status_code=429, detail=f"模型组 '{model}' 没有已配置元数据的可用成员")
+            raise HTTPException(status_code=429, detail=f"模型组 '{model}' 没有可用渠道成员")
     else:
         if not ModelClientPool.get_model_routes(model):
             raise HTTPException(status_code=404, detail=f"模型 '{model}' 不存在")
-        if not await _catalog_call(model_metadata.has_explicit_metadata, model, snapshot=catalog_snapshot):
-            raise HTTPException(status_code=400, detail=f"模型 '{model}' 未配置元数据，不可使用")
 
     requested_max_tokens = _request_max_tokens(body)
     model_info = await _get_model_info(model)
@@ -3109,6 +3110,67 @@ async def _prime_stream_before_response(stream_iter):
         return chunk
 
 
+def _chunk_is_done_only(chunk) -> bool:
+    """chunk 是否是一个只承载 [DONE] 标记的 SSE 字符串。
+
+    含 usage 的 chunk、含 choices/delta 的内容 chunk、dict 形态的内部块
+    都不算——这些要么顺序本就对，要么内部消费不外泄。
+    """
+    if not isinstance(chunk, str) or "[DONE]" not in chunk:
+        return False
+    seen = False
+    for p in iter_sse_payloads(chunk):
+        seen = True
+        if p != "[DONE]":
+            return False
+    return seen
+
+
+async def _normalize_usage_before_done(stream_iter):
+    """SSE usage 顺序归一：把上游发在 ``[DONE]`` *之后* 的 usage chunk 提到 *之前*。
+
+    部分 OpenAI 兼容上游在流末尾先发 ``data: [DONE]`` 再补一个 usage chunk
+    （不合规范）。规范客户端（OpenAI SDK、dsh 等）读到 [DONE] 即结束，
+    永远看不到 usage，导致客户端侧用量统计全丢。
+
+    这里在转发层修正顺序：暂存 [DONE] 这一条 chunk，peek 下一个——
+
+    - 是纯 usage chunk（_extract_usage_payload 能解出 usage 且无 choices/delta
+      内容）→ 先发 usage 再发 [DONE]
+    - 其它任何 chunk（含内部 dict 块、内容 chunk、又一个 [DONE]）→ 先发
+      [DONE] 再透传该 chunk
+
+    只暂存 [DONE] 一条，不缓冲整条流。上游若在 [DONE] 后挂起不开，由既有
+    SSE 读超时兜底，与未归一时客户端等待连接关闭的行为等价。
+    """
+    buffered_done: str | None = None
+    async for chunk in stream_iter:
+        if buffered_done is None:
+            if isinstance(chunk, str) and _chunk_is_done_only(chunk):
+                buffered_done = chunk
+                continue
+            yield chunk
+            continue
+        # 暂存了 [DONE]，看这个 chunk
+        if isinstance(chunk, str) and not _chunk_is_done_only(chunk):
+            # 纯 usage chunk 判定：解析出 usage 且无 choices / delta 内容
+            usage = _usage_from_stream_chunk(chunk)
+            if usage:
+                # 提前发 usage；[DONE] 继续暂存，好让后续连排的 usage 也能提前
+                yield chunk
+                continue
+        # 其它任何情况：先 flush [DONE]，再透传当前 chunk
+        yield buffered_done
+        buffered_done = None
+        if isinstance(chunk, str) and _chunk_is_done_only(chunk):
+            buffered_done = chunk
+        else:
+            yield chunk
+    # 流自然结束，flush 暂存的 [DONE]
+    if buffered_done is not None:
+        yield buffered_done
+
+
 def _duration_ms(start: float) -> int:
     return max(1, int(round((time.time() - start) * 1000)))
 
@@ -3845,15 +3907,11 @@ async def _validate_responses_request(body: dict, api_key: str | None = None):
         if not await config.Config.api_key_allows_model(api_key, model):
             await _raise_responses_route_error(model, api_key, api_key_name, "api_key_not_allowed_for_model")
         if await _catalog_call(config.Config.is_model_group, model, snapshot=catalog_snapshot):
-            if not await _catalog_call(model_metadata.has_explicit_metadata, model, snapshot=catalog_snapshot):
-                raise HTTPException(status_code=400, detail=f"模型组 '{model}' 未配置元数据，不可使用")
             if not await ModelClientPool.get_model_group_available_members(model, snapshot=catalog_snapshot):
-                raise HTTPException(status_code=429, detail=f"模型组 '{model}' 没有已配置元数据的可用成员")
+                raise HTTPException(status_code=429, detail=f"模型组 '{model}' 没有可用渠道成员")
         else:
             if not ModelClientPool.get_model_routes(model):
                 await _raise_responses_route_error(model, api_key, api_key_name, "model_not_found")
-            if not await _catalog_call(model_metadata.has_explicit_metadata, model, snapshot=catalog_snapshot):
-                raise HTTPException(status_code=400, detail=f"模型 '{model}' 未配置元数据，不可使用")
     openai_messages, kwargs = responses_to_openai_messages(body)
     if body.get("reasoning") is not None:
         kwargs["_thinking_explicit"] = True
@@ -4151,6 +4209,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             await _release_api_key_limit(request)
             raise
         primed_stream = _prepend_stream_chunk(first_chunk, stream_gen)
+        primed_stream = _normalize_usage_before_done(primed_stream)
 
         async def logging_stream():
             last_route_info = {}

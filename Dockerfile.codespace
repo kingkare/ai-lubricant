@@ -7,11 +7,15 @@
 #   * 无持久卷：容器内部路径持久（restart 保留），重建即清空，由入口脚本幂等自举。
 #   * 进程自己绑 7860（平台约定端口），由 supervisord 托管 5 个 program。
 #
-# 用法（创空间推送 git 仓库时在平台侧配置构建参数）：
-#   docker build -f Dockerfile.codespace \
-#     --build-arg AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL=you@example.com \
-#     --build-arg AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD=<强密码> \
-#     -t ai-lubricant-codespace .
+# 用法（创空间按 deploy_schema.json 配置，sdk_type=docker、port=7860）：
+#   平台构建时用本文件；管理员账号等运行时变量走平台的 environment_variables 注入：
+#     AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL / _PASSWORD（详见文件末尾说明）
+#   本地验证：
+#     docker build -f Dockerfile.codespace -t ai-lubricant-codespace .
+#     docker run --rm -p 7860:7860 \
+#       -e AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL=you@example.com \
+#       -e AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD='<强密码>' \
+#       ai-lubricant-codespace
 #
 # Docker Hub 基础镜像前缀，供国内部署走加速器（空 = 直连 Docker Hub）。
 ARG DOCKER_REGISTRY_PREFIX=
@@ -79,15 +83,13 @@ RUN mkdir -p "${NATIVE_DEPS_ROOT}" && chown -R app:app "${NATIVE_DEPS_ROOT}" \
     && su app -c 'cd /app && python -m native_deps.cli provision' \
     && chown -R app:app "${NATIVE_DEPS_ROOT}" /app
 
-# ---- 管理员账号（构建参数注入）----
-# 注意：ARG 值会写进镜像层；创空间私有仓可接受。若需更严，改用平台侧环境变量注入
-# 并删除下面三行（应用读 AI_LUBRICANT_BOOTSTRAP_ADMIN_* 即可）。
-ARG AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL=""
-ARG AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD=""
-ARG AI_LUBRICANT_BOOTSTRAP_ADMIN_NAME="admin"
-ENV AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL=${AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL} \
-    AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD=${AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD} \
-    AI_LUBRICANT_BOOTSTRAP_ADMIN_NAME=${AI_LUBRICANT_BOOTSTRAP_ADMIN_NAME}
+# ---- 管理员账号 ----
+# 不在镜像里烘焙凭据：由平台在**运行时**注入环境变量（创空间的
+# deploy_schema.json → environment_variables）：
+#   AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL / _PASSWORD / _NAME
+# 应用启动时 user_platform.seed_bootstrap_admin 读它们播种（幂等）。
+# 这里刻意不写 ENV 默认值——空的 ENV 会固化进镜像层，且与运行时注入的
+# 同名变量语义重叠，徒增困惑。
 
 # 入口脚本可执行（deploy/ 未被 .dockerignore 排除；script/ 被排除，不能引用它）。
 RUN chmod +x /app/deploy/codespace/entrypoint.sh

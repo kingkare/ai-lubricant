@@ -243,7 +243,19 @@ async def list_devices_resource(user: User = Depends(get_current_user)) -> dict:
         live = live_by_id.get(str(resource.get("device_id") or "")) or {}
         info = live.get("device_info") or resource.get("device_info") or {}
         resource["device_info"] = info
-        resource["platform"] = str(info.get("platform") or ("ios" if info.get("node_id") else "android"))
+        # platform 三级推导：节点上报的 device_info.platform 最权威；其次看
+        # resource.data.ios 块（iOS 认领时补写的身份，见 _adopt_claimed_ios_resource）；
+        # 最后按有无 node_id 兜底。
+        #
+        # 此前只看 device_info.node_id —— 而 iOS 认领走的是通用配对端点，建出来的行
+        # 既无 platform 也无 node_id，于是 iPhone 被判成 android，掉进 Android 列表，
+        # 前端按 platform==="ios" 过滤时找不到它（「找不到该设备的资源 id」）。
+        ios_block = resource.get("ios") if isinstance(resource.get("ios"), dict) else {}
+        resource["platform"] = str(
+            info.get("platform")
+            or ("ios" if ios_block.get("node_id") or ios_block.get("udid") else "")
+            or ("ios" if info.get("node_id") else "android")
+        )
         resource["online"] = bool(live)
         resource["capabilities"] = live.get("capabilities") or []
         # 在线设备的「最后在线」用内存里心跳刷新的 last_seen（epoch 秒，每帧都 touch），
@@ -275,14 +287,23 @@ async def create_device_pairing_resource(body: MintPairingCodeReq, user: User = 
     return {"code": code, "ttl": ttl}
 
 
-# ── iOS device management (role ios_host) ───────────────────────────────────────
+# ── iOS device management (capability ios_mgmt) ─────────────────────────────────
+# Hosts are selected by the *capability*, not the role: iOS device management
+# needs go-ios + usbmuxd on the host, so any node advertising ios_mgmt can serve
+# it — an execution node on a Mac/Windows box with an iPhone attached, as well
+# as the dedicated node-ios binary (role=ios_host).
+def _is_ios_host(node: dict) -> bool:
+    """True when a list_my_nodes row advertises iOS device management."""
+    return ((node.get("capabilities") or {}).get("ios_mgmt") == "true")
+
+
 @router.get("/resources/ios-hosts")
 async def list_ios_hosts(user: User = Depends(get_current_user)) -> dict:
     """List available iOS host nodes the user can access."""
     from .nodes_service import nodes_service
 
     my_nodes = (await nodes_service.list_my_nodes(user.id)).get("nodes") or []
-    hosts = [n for n in my_nodes if n.get("role") == "ios_host"]
+    hosts = [n for n in my_nodes if _is_ios_host(n)]
     return {"ios_hosts": hosts}
 
 
@@ -301,7 +322,7 @@ async def scan_all_ios_devices(user: User = Depends(get_current_user)) -> dict:
     from .nodes_service import nodes_service
 
     my_nodes = (await nodes_service.list_my_nodes(user.id)).get("nodes") or []
-    hosts = [n for n in my_nodes if n.get("role") == "ios_host"]
+    hosts = [n for n in my_nodes if _is_ios_host(n)]
     client = get_node_client()
 
     async def _one(host: dict) -> dict:
@@ -338,7 +359,7 @@ async def list_all_ios_devices(user: User = Depends(get_current_user)) -> dict:
     from .nodes_service import nodes_service
 
     my_nodes = (await nodes_service.list_my_nodes(user.id)).get("nodes") or []
-    hosts = [n for n in my_nodes if n.get("role") == "ios_host"]
+    hosts = [n for n in my_nodes if _is_ios_host(n)]
 
     async def _one(host: dict) -> dict:
         node_id = str(host.get("node_id") or "")
@@ -421,7 +442,17 @@ async def claim_ios_device(
     body: dict,
     user: User = Depends(get_current_user),
 ) -> dict:
-    """Claim an iOS device: mint a pairing code, dispatch claim frame, wait for ack."""
+    """Claim an iOS device: mint a pairing code, dispatch claim frame, wait for ack.
+
+    iOS 认领复用 Android 的配对端点（``POST /mcp/device-control/pair``）：节点拿到
+    配对码后自己兑换，服务端在那一刻只建出一条**通用 device 资源行**——它不知道
+    这是 iPhone，所以既没有 ``platform`` 也没有 ``ios`` 块。后果是前端按
+    ``platform === "ios"`` 过滤时它掉进 Android 列表，``data.ios`` 缺失又让 WDA
+    派发（routes_ios.start_wda_job 要求 node_id/udid）必然 400。
+
+    这里在 ack 之后把 iOS 身份补写回去，并把 ``resource_id`` 返回给调用方——前端
+    claimOne 期待的就是它，此前返回体里没有，导致「接入并初始化」拿到 undefined。
+    """
     from .nodes_service import nodes_service
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
     import mcp_builtin.device_control.store as dc_store
@@ -441,8 +472,11 @@ async def claim_ios_device(
         owner_user_id=None, resource_type="device"
     )
     for res in existing:
-        info = (res.get("data") or {}).get("device_info") or {}
-        ios_info = (res.get("data") or {}).get("ios") or {}
+        # list_resources 返回 _resource_value 扁平化后的 DTO（无 "data" 层）。
+        # 此前读 res["data"] 恒为 {}，冲突检查形同虚设——同一台 iPhone 能被
+        # 重复认领。
+        info = res.get("device_info") or {}
+        ios_info = res.get("ios") or {}
         if ios_info.get("udid") == udid:
             raise HTTPException(status_code=409, detail=f"UDID {udid} 已被认领")
 
@@ -469,7 +503,72 @@ async def claim_ios_device(
             raise HTTPException(status_code=504, detail=exc.message) from exc
         raise HTTPException(status_code=500, detail=exc.message) from exc
 
-    return result
+    # 把刚配对的资源行认成 iOS。节点在 ack 之前已经 reportLocked 上报了新清单
+    # （manager.Claim 末尾），所以这里读 inventory 能拿到它刚写入的 device_id
+    # ——就是配对端点签发的那个，和资源行的 device_id 同源。
+    resource_id = await _adopt_claimed_ios_resource(
+        node_id=node_id, udid=udid, owner_user_id=str(user.id), label=label
+    )
+    return {**result, "resource_id": resource_id}
+
+
+async def _adopt_claimed_ios_resource(
+    *, node_id: str, udid: str, owner_user_id: str, label: str
+) -> int | None:
+    """把节点刚认领的 iPhone 对应的资源行标记成 iOS，返回 resource_id。
+
+    节点的 device_id（配对端点签发）与资源行的 device_id 同源，用它把两边接上。
+    补写 ``ios`` 块（udid/node_id）与 ``platform``：
+
+    - ``platform`` 让 /resources/devices 把它归到 iOS 桶（否则落 android）；
+    - ``ios.node_id`` / ``ios.udid`` 是 WDA 派发的硬前置
+      （routes_ios.start_wda_job 缺一即 400「设备缺少 iOS 节点绑定信息」）；
+    - ``wda_state`` 初值 missing，让设备卡片显示「待初始化」而不是「离线」。
+
+    best-effort：认领本身已成功（凭据已下发到节点），补写失败不该让整个操作报错，
+    只记日志——用户重新扫描时 inventory 里已有 claimed 标记。
+    """
+    from server import builtin_tool_store
+    from loguru import logger
+
+    try:
+        inv = await get_node_client().get_ios_devices(node_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[ios-claim] read inventory for adopt failed: {}", exc)
+        return None
+
+    target = next(
+        (d for d in (inv.get("devices") or []) if str(d.get("udid") or "") == udid),
+        None,
+    )
+    if target is None or not target.get("device_id"):
+        logger.warning("[ios-claim] no inventory entry for udid {} on {}", udid, node_id)
+        return None
+
+    device_id = str(target["device_id"])
+    rows = await builtin_tool_store.list_resources(
+        owner_user_id=owner_user_id, resource_type="device"
+    )
+    row = next((r for r in rows if str(r.get("device_id") or "") == device_id), None)
+    if row is None:
+        logger.warning("[ios-claim] no resource row for device_id {}", device_id)
+        return None
+
+    # list_resources 已把 data JSONB 展平到顶层（_resource_value），所以 ios 块
+    # 直接读 row["ios"]，不是 row["data"]["ios"]。
+    ios_payload = dict(row.get("ios") or {})
+    ios_payload.update({
+        "udid": udid,
+        "node_id": node_id,
+        # missing = 已认领但还没初始化 WDA。设备卡片据此显示「待初始化」，
+        # 与「离线」（present=false / 节点断连）区分开。
+        "wda_state": ios_payload.get("wda_state") or "missing",
+    })
+    await builtin_tool_store.update_resource(
+        int(row["id"]),
+        {"ios": ios_payload, "platform": "ios", "name": label or row.get("name") or udid},
+    )
+    return int(row["id"])
 
 
 @router.post("/resources/{resource_id}/runner-control")
@@ -487,7 +586,8 @@ async def ios_runner_control(resource_id: int, body: dict, user: User = Depends(
         raise HTTPException(status_code=400, detail="action 必须是 start|stop|restart")
 
     resource = await _owned_resource(resource_id, user, resource_type="device")
-    data = resource.get("data") or {}
+    # _owned_resource → get_resource 返回扁平化 DTO（无 "data" 层）。
+    data = resource
     ios_info = data.get("ios") or {}
     node_id = ios_info.get("node_id") or ""
     udid = ios_info.get("udid") or ""
@@ -519,7 +619,8 @@ async def release_ios_device(resource_id: int, user: User = Depends(get_current_
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
 
     resource = await _owned_resource(resource_id, user, resource_type="device")
-    data = resource.get("data") or {}
+    # _owned_resource → get_resource 返回扁平化 DTO（无 "data" 层）。
+    data = resource
     ios_info = data.get("ios") or {}
     device_id = data.get("device_id") or ""
     udid = ios_info.get("udid") or ""

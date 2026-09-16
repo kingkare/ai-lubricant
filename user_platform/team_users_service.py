@@ -489,6 +489,18 @@ class TeamUsersService:
         )
         return await self._domain_group(group)
 
+    async def add_group_member(self, group_id: str, user_id: str) -> None:
+        """把单个用户加进分组（幂等）。
+
+        建分组时把创建者加进来用：``list_my_nodes`` 按 TeamGroupMember 判定节点
+        可见性，不加成员则创建者看不到自己刚建的节点。
+        """
+        gid = _maybe_uuid(group_id)
+        uid = _maybe_uuid(user_id)
+        if gid is None or uid is None:
+            return
+        await TeamGroupMember.get_or_create(group_id=gid, user_id=uid)
+
     async def _owned_group(self, team_id: str, group_id: str) -> TeamGroup | None:
         gid = _maybe_uuid(group_id)
         if gid is None:

@@ -29,6 +29,10 @@ _lock = asyncio.Lock()
 _snapshot: dict[str, Any] = {"remote_items": [], "updated_at": "", "stale": True}
 _builtin_loader: Callable[[], list[dict[str, Any]]] | None = None
 
+# 「通用渠道」/「自定义渠道」两个系统伪条目的 id。它们只是加渠道弹窗里的展示槽位，
+# 不是内置类型——市场模板的 builtin_type 撞上它们时不得合并（合并会把槽位整个顶掉）。
+_RESERVED_ENTRY_IDS = frozenset({"custom", "code"})
+
 
 def configure_builtin_loader(loader: Callable[[], list[dict[str, Any]]]) -> None:
     global _builtin_loader
@@ -89,7 +93,7 @@ def _preset_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
 def _generic_entry() -> dict[str, Any]:
     return {
         "id": "custom",
-        "name": "通用渠道",
+        "name": "通用供应商",
         "description": "配置任意 OpenAI、Anthropic、Responses 或 Gemini 兼容服务",
         "category": "通用",
         "tags": ["兼容接口"],
@@ -158,8 +162,8 @@ def _code_entry() -> dict[str, Any]:
     )
     return {
         "id": "code",
-        "name": "自定义渠道",
-        "description": "贴一个 spec 类（普通类 + @staticmethod 钩子）即造一个完整渠道，支持自定义登录/请求/解析/授权。仅授权管理员，可执行任意代码。",
+        "name": "自定义供应商",
+        "description": "贴一个 spec 类（普通类 + @staticmethod 钩子）即造一个完整供应商，支持自定义登录/请求/解析/授权。仅授权管理员，可执行任意代码。",
         "category": "通用",
         "tags": ["自定义", "代码"],
         "builtin_type": "code",
@@ -263,8 +267,19 @@ async def get_catalog() -> dict[str, Any]:
         merged[str(item.get("id") or item.get("builtin_type"))] = item
     for item in remote:
         builtin_type = str(item.get("builtin_type") or "")
+        # builtin_type 是「合并键」：模板声明了与某个内置条目相同的类型时，用它去更新那张
+        # 卡的展示与预设，而不是多出一张重复卡。但 'custom'/'code' 是伪类型——自定义渠道
+        # 的旧模板曾把 type 回落成 'custom' 写进 builtin_type（导出侧已修，存量数据还在），
+        # 拿它当键会命中系统伪条目，把「通用渠道」/「自定义渠道」整条覆盖掉。故一律降级
+        # 成按模板自己的 id 单列。
+        if builtin_type in _RESERVED_ENTRY_IDS:
+            builtin_type = ""
         key = builtin_type or str(item.get("id") or "")
         if not key:
+            continue
+        # 兜底：模板 id 本身就撞系统槽位（id='custom'/'code'）时跳过，不占槽位。
+        if not builtin_type and key in _RESERVED_ENTRY_IDS:
+            logger.warning("[channel-catalog] skip remote template {} colliding with a system entry", key)
             continue
         if builtin_type and key in merged:
             base = merged[key]

@@ -66,9 +66,6 @@ class AppleIdLoginReq(BaseModel):
     password: str
     # 原地更新已有配置（重新登录）：id 不变，设备绑定的 signing_profile_id 链不断。
     profile_id: int | None = None
-    # 出口代理池条目 id（network 模式）：gsa.apple.com 对数据中心 IP 直接 503，
-    # 服务端所在网络被拒时经代理出境登录。空 = 直连。
-    proxy_config_id: str = ""
     # 远程 anisette 服务器 URL（如 ani.sidestore.io）。本地 anisette 库生成虚拟
     # 设备指纹，Apple 会 503 拒收；远程服务器用真实 provisioning 数据生成头。
     # 空 = 用本地 anisette 库。
@@ -84,8 +81,6 @@ class AppleIdVerify2faReq(BaseModel):
     # SMS 2FA：选中的受信电话号码 id（前端从 login 返回的 phone_numbers 里选）。
     # trusted-device 路径忽略此字段。
     phone_id: int | None = None
-    # 与 login 同口径：2FA 完成那步请求也经同一代理出网。
-    proxy_config_id: str = ""
     # 与 login 同口径：远程 anisette 服务器（2FA 完成那步也用它取真实指纹）。
     anisette_server: str = ""
 
@@ -94,12 +89,11 @@ class AppleIdSmsReq(BaseModel):
     """触发短信 2FA 发送（method=="sms" 时前端选号后调用）。
 
     与 verify-2fa 分离：选号 + 发码是一个语义阶段，验码是另一个。
-    login_token / email / phone_id 定位 pending；proxy/anisette 同口径。
+    login_token / email / phone_id 定位 pending；anisette 同口径。
     """
     login_token: str
     email: str
     phone_id: int
-    proxy_config_id: str = ""
     anisette_server: str = ""
 
 
@@ -137,102 +131,6 @@ def _load_apple_engine() -> Any:
             status_code=503, detail=f"Apple ID 签名引擎不可用（依赖未安装）：{exc}"
         ) from exc
     return SimpleNamespace(gsa=apple_gsa, developer=apple_developer, provision=apple_provision)
-
-
-async def _apple_gsa_egress(proxy_config_id: str) -> None:
-    """按签名配置的代理池条目设置 GSA 引擎出口。
-
-    三种路径：
-    * node 模式：node_id 指向一台执行节点，GSA 请求经 NodeProxyRequest 帧发给该
-      节点出网（节点 IP 可能是 Apple 认可的住宅/宽带 IP）。同步桥在工作线程内
-      asyncio.run() 跑帧往返。
-    * network 模式：requests proxies 形态（http://...），直接给 requests 用。
-    * 空/直连：什么都不设置，引擎走默认直连。
-
-    url_prefix 模式对 GSA API 请求无意义（它是下载前缀改写），400 拒绝。
-    gsa.apple.com 对数据中心 IP 直接 503——服务端所在网络被拒时必须经代理出境。
-    """
-    wanted = (proxy_config_id or "").strip()
-    if not wanted:
-        return
-    # node 模式拿不到 node_id，得绕过 resolve_proxy（它对 node 模式直接 raise）。
-    from config import CONFIG_STORE
-
-    try:
-        main = await CONFIG_STORE.read_main_async()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"读取代理池失败：{exc}") from exc
-    proxies = main.get("proxies") if isinstance(main, dict) else []
-    entry = None
-    if isinstance(proxies, list):
-        for p in proxies:
-            if isinstance(p, dict) and (p.get("id") or "") == wanted:
-                entry = p
-                break
-    if entry is None:
-        raise HTTPException(status_code=400, detail=f"代理配置 {wanted} 不存在")
-    mode = str(entry.get("mode") or "network").strip().lower()
-
-    if mode == "node":
-        node_id = str(entry.get("node_id") or "").strip()
-        if not node_id:
-            raise HTTPException(status_code=400, detail="节点隧道代理未配置目标节点")
-        engine = _load_apple_engine()
-        engine.gsa.set_gsa_transport(_node_tunnel_transport(node_id))
-        return
-
-    if mode == "network":
-        from proxy_utils import canonical_proxy, proxy_effective_url
-
-        url = proxy_effective_url(entry)
-        if not url:
-            raise HTTPException(status_code=400, detail="网络代理未配置地址")
-        engine = _load_apple_engine()
-        engine.gsa.set_gsa_proxies({"http": url, "https": url})
-        return
-
-    if mode == "direct":
-        # 显式直连：清掉同一进程上一次登录可能留下的 node/network 出口。
-        engine = _load_apple_engine()
-        engine.gsa.set_gsa_proxies(None)
-        return
-
-    raise HTTPException(
-        status_code=400,
-        detail="Apple ID 登录仅支持直连、网络代理或节点隧道代理（direct/network/node 模式）",
-    )
-
-
-def _node_tunnel_transport(node_id: str):
-    """构造同步 transport：GSA 引擎线程内调，经节点隧道发请求取完整响应。
-
-    工作线程（asyncio.to_thread）无 running loop，asyncio.run() 安全。
-    RemoteNodeConnectManager 每次请求新建 aiohttp session，无跨 loop 亲和问题。
-    """
-    from providers.proxy_manager import get_proxy_manager
-
-    manager = getattr(get_proxy_manager(), "_node_manager", None)
-    if manager is None:
-        raise RuntimeError("节点代理未就绪（node manager 未注入）")
-
-    def transport(method: str, url: str, headers: dict, body: bytes) -> tuple[int, dict, bytes]:
-        import asyncio
-
-        async def _do() -> tuple[int, dict, bytes]:
-            resp = await manager.request(
-                node_id, method=method, url=url, headers=headers, body=body
-            )
-            chunks: list[bytes] = []
-            try:
-                async for chunk in resp.iter_chunks():
-                    chunks.append(chunk)
-            finally:
-                await resp.close()
-            return resp.status, dict(resp.headers), b"".join(chunks)
-
-        return asyncio.run(_do())
-
-    return transport
 
 
 async def _resolve_market_wda_asset() -> dict:
@@ -635,10 +533,7 @@ async def apple_id_login(body: AppleIdLoginReq, user: User = Depends(get_current
         if str(existing.get("kind") or "") != "apple_id":
             raise HTTPException(status_code=400, detail="该配置不是 Apple ID 类型")
 
-    # 出口路由：必须在 begin_login 前设置——登录/2FA/物化全链路用同一出口。
-    await _apple_gsa_egress(body.proxy_config_id)
     # 远程 anisette 服务器（真实设备指纹，避开本地虚拟指纹被 Apple 503）。
-    engine.gsa.set_gsa_transport(None)  # 防御：清掉上次的 transport
     try:
         from .apple_signing import anisette as _anisette_mod
         _anisette_mod.set_remote_server(body.anisette_server or "")
@@ -700,8 +595,6 @@ async def apple_id_verify_2fa(body: AppleIdVerify2faReq, user: User = Depends(ge
     if method == "sms" and not body.phone_id:
         raise HTTPException(status_code=400, detail="SMS 2FA 需要选择受信电话号码（phone_id）")
 
-    # 与 login 同口径出口代理；2FA 完成那步请求同样要经同一代理出网。
-    await _apple_gsa_egress(body.proxy_config_id)
     # 远程 anisette 服务器（与 login 同口径）。
     try:
         from .apple_signing import anisette as _anisette_mod
@@ -759,7 +652,6 @@ async def apple_id_send_sms(body: AppleIdSmsReq, user: User = Depends(get_curren
     if entry.get("method") != "sms":
         raise HTTPException(status_code=400, detail="当前登录不要求 SMS 2FA")
 
-    await _apple_gsa_egress(body.proxy_config_id)
     try:
         from .apple_signing import anisette as _anisette_mod
         _anisette_mod.set_remote_server(body.anisette_server or "")
@@ -904,7 +796,11 @@ async def prepare_wda(resource_id: int, body: WdaJobRequest, user: User = Depend
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
 
     device = await _owned_device(resource_id, user)
-    data = device.get("data") or {}
+    # get_resource 返回的是 _resource_value **扁平化**后的 DTO：data JSONB 的键
+    # 直接铺在顶层，没有 "data" 这一层。此前读 device["data"] 恒为 {}，导致
+    # ios_info/node_id/udid/device_id 全 None → 每个 WDA 端点都 400
+    # 「设备缺少 iOS 节点绑定信息」。
+    data = device
     ios_info = data.get("ios") or {}
     node_id = ios_info.get("node_id")
     udid = ios_info.get("udid")
@@ -993,7 +889,11 @@ async def renew_wda(resource_id: int, body: WdaJobRequest, user: User = Depends(
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
 
     device = await _owned_device(resource_id, user)
-    data = device.get("data") or {}
+    # get_resource 返回的是 _resource_value **扁平化**后的 DTO：data JSONB 的键
+    # 直接铺在顶层，没有 "data" 这一层。此前读 device["data"] 恒为 {}，导致
+    # ios_info/node_id/udid/device_id 全 None → 每个 WDA 端点都 400
+    # 「设备缺少 iOS 节点绑定信息」。
+    data = device
     ios_info = data.get("ios") or {}
     node_id = ios_info.get("node_id")
     udid = ios_info.get("udid")
@@ -1064,7 +964,11 @@ async def reinstall_wda(resource_id: int, body: WdaJobRequest, user: User = Depe
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
 
     device = await _owned_device(resource_id, user)
-    data = device.get("data") or {}
+    # get_resource 返回的是 _resource_value **扁平化**后的 DTO：data JSONB 的键
+    # 直接铺在顶层，没有 "data" 这一层。此前读 device["data"] 恒为 {}，导致
+    # ios_info/node_id/udid/device_id 全 None → 每个 WDA 端点都 400
+    # 「设备缺少 iOS 节点绑定信息」。
+    data = device
     ios_info = data.get("ios") or {}
     node_id = ios_info.get("node_id")
     udid = ios_info.get("udid")
@@ -1127,7 +1031,11 @@ async def get_wda_job_status(resource_id: int, job_id: str, user: User = Depends
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
 
     device = await _owned_device(resource_id, user)
-    data = device.get("data") or {}
+    # get_resource 返回的是 _resource_value **扁平化**后的 DTO：data JSONB 的键
+    # 直接铺在顶层，没有 "data" 这一层。此前读 device["data"] 恒为 {}，导致
+    # ios_info/node_id/udid/device_id 全 None → 每个 WDA 端点都 400
+    # 「设备缺少 iOS 节点绑定信息」。
+    data = device
     ios_info = data.get("ios") or {}
     node_id = ios_info.get("node_id")
 
@@ -1154,7 +1062,11 @@ async def cancel_wda_job(resource_id: int, job_id: str, user: User = Depends(get
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
 
     device = await _owned_device(resource_id, user)
-    data = device.get("data") or {}
+    # get_resource 返回的是 _resource_value **扁平化**后的 DTO：data JSONB 的键
+    # 直接铺在顶层，没有 "data" 这一层。此前读 device["data"] 恒为 {}，导致
+    # ios_info/node_id/udid/device_id 全 None → 每个 WDA 端点都 400
+    # 「设备缺少 iOS 节点绑定信息」。
+    data = device
     ios_info = data.get("ios") or {}
     node_id = ios_info.get("node_id")
 

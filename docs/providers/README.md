@@ -12,6 +12,7 @@
 
 - [Custom 渠道](./custom.md)
 - [代码渠道（Code Channel）](./code-channel.md) — 贴一个 spec 类（普通类 + `@staticmethod` 钩子）即造一个完整渠道
+- [外部渠道导入（New API 等）](./external-channel-import.md) — 把其它 LLM 网关的渠道列表整体导进来，直接创建为本地渠道
 
 > CLI 逆向渠道（copilot/codebuddy/atomcode/eaichat/qoder）已下架为「代码渠道」形态：
 > 产品只发框架能力，spec 源码由使用者自行粘贴进管理端「源码」Tab 与分发。

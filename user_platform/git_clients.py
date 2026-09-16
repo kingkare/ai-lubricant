@@ -73,6 +73,11 @@ _SUPPORTED_PLATFORMS = {
 
 # Default hosts, used when an identity carries no ``base_url``.
 _GITHUB_API_HOST = "api.github.com"
+# GitHub's REST API lives on a different host than its web UI; the console
+# pre-fills the web host (https://github.com) as the identity's base_url, so
+# those hosts must map onto the API host instead of being mistaken for a
+# GitHub Enterprise install (whose /api/v3 prefix github.com does not serve).
+_GITHUB_WEB_HOSTS = frozenset({"github.com", "www.github.com"})
 _GITLAB_DEFAULT_HOST = "gitlab.com"
 _GITEA_DEFAULT_HOST = "gitea.com"
 _GITEE_DEFAULT_HOST = "gitee.com"
@@ -117,6 +122,27 @@ class RepositoryPage:
 
     repositories: list[AuthRepository]
     page_info: dict | None = None
+
+
+@dataclass
+class GitProfile:
+    """The account a credential belongs to, as the Git host reports it.
+
+    Filled by :func:`fetch_profile` so the console can label an identity with
+    the account name instead of its base URL. Best-effort: a host that does not
+    expose the field yields ``""``.
+
+    Only the username is carried. GitHub will not reliably disclose an email
+    here (see :func:`_github_fetch_profile`), and nothing consumes the identity
+    email anyway, so asking for it would cost every user a token reissue for no
+    gain.
+    """
+
+    username: str = ""
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.username
 
 
 @dataclass
@@ -570,12 +596,19 @@ def _github_headers(token: str) -> dict[str, str]:
 
 
 def _github_api_base(base_url: str) -> str:
-    """``https://api.github.com`` by default; an Enterprise host uses ``/api/v3``."""
+    """``https://api.github.com`` by default; an Enterprise host uses ``/api/v3``.
+
+    The public web hosts (``github.com`` / ``www.github.com``) are mapped onto
+    ``api.github.com`` — github.com does not serve ``/api/v3``, so treating the
+    web host as an Enterprise install 404'd every GitHub identity created via
+    the console (which pre-fills ``https://github.com``).
+    """
     if not (base_url or "").strip():
         return f"https://{_GITHUB_API_HOST}"
     scheme, host = _normalize_base(base_url, _GITHUB_API_HOST)
-    if host == _GITHUB_API_HOST:
-        return f"{scheme}://{host}"
+    hostname = host.split("/", 1)[0].lower()
+    if hostname in _GITHUB_WEB_HOSTS or hostname == _GITHUB_API_HOST:
+        return f"https://{_GITHUB_API_HOST}"
     return f"{scheme}://{host}/api/v3"
 
 
@@ -908,6 +941,51 @@ async def _atomgit_fetch_repositories(opts: RepositoryOptions) -> RepositoryPage
     base = _atomgit_api_base(opts.base_url)
     items = await _fetch_all_pages(f"{base}/user/repos", headers=_atomgit_headers(opts.token))
     return RepositoryPage(repositories=[_atomgit_repo_from(item) for item in items])
+
+
+# ---- Account profile ------------------------------------------------------
+# Best-effort label lookup for an identity: who does this token belong to?
+# Each function returns whatever the host is willing to disclose; a missing
+# field is "" rather than an error.
+#
+# GitHub is the one host that will not reliably return an email from ``/user``
+# — it only appears when the account has made its email public, and reading the
+# private one requires a second call to ``/user/emails`` under the
+# ``user:email`` scope, which the console's documented token permissions
+# (``repo``) do not include. We deliberately do not make that call, and do not
+# carry an email at all: nothing consumes it, so demanding a new scope would
+# force every existing user to reissue their token for no gain.
+async def _github_fetch_profile(opts: RepositoryOptions) -> GitProfile:
+    base = _github_api_base(opts.base_url)
+    body, _ = await _get_json(f"{base}/user", headers=_github_headers(opts.token))
+    item = body if isinstance(body, dict) else {}
+    return GitProfile(username=_first_non_empty(item.get("login")))
+
+
+async def _gitlab_fetch_profile(opts: RepositoryOptions) -> GitProfile:
+    base = _gitlab_api_base(opts.base_url)
+    body, _ = await _get_json(f"{base}/user", headers=_gitlab_headers(opts.token, opts.is_oauth))
+    item = body if isinstance(body, dict) else {}
+    return GitProfile(username=_first_non_empty(item.get("username")))
+
+
+async def _gitea_fetch_profile(opts: RepositoryOptions) -> GitProfile:
+    base = _gitea_api_base(opts.base_url)
+    body, _ = await _get_json(f"{base}/user", headers=_gitea_headers(opts.token))
+    item = body if isinstance(body, dict) else {}
+    return GitProfile(username=_first_non_empty(item.get("login"), item.get("username")))
+
+
+async def _gitee_fetch_profile(opts: RepositoryOptions) -> GitProfile:
+    base = _gitee_api_base(opts.base_url)
+    # Gitee carries the credential as an ``access_token`` query parameter.
+    body, _ = await _get_json(
+        f"{base}/user",
+        headers={"Accept": "application/json"},
+        params={"access_token": opts.token},
+    )
+    item = body if isinstance(body, dict) else {}
+    return GitProfile(username=_first_non_empty(item.get("login"), item.get("name")))
 
 
 # ---- Branches -------------------------------------------------------------
@@ -1958,6 +2036,15 @@ _REPO_CREATORS = {
     "gitea": _gitea_create_repository,
     "gitee": _gitee_create_repository,
 }
+# Hosts with a "who is this token" endpoint we know how to read. The remaining
+# three (codeup / cnb / atomgit) have no verified equivalent, so their identities
+# simply keep whatever the user typed — the label falls back to base_url.
+_PROFILE_FETCHERS = {
+    "github": _github_fetch_profile,
+    "gitlab": _gitlab_fetch_profile,
+    "gitea": _gitea_fetch_profile,
+    "gitee": _gitee_fetch_profile,
+}
 _HOOK_LISTERS = {
     "github": _github_list_webhooks,
     "gitlab": _gitlab_list_webhooks,
@@ -2130,6 +2217,26 @@ async def create_repository(platform: str, opts: CreateRepoOptions) -> CreatedRe
     if not (opts.token or "").strip():
         raise GitClientError("access token is required")
     return await creator(opts)
+
+
+async def fetch_profile(platform: str, opts: RepositoryOptions) -> GitProfile:
+    """Return the account an identity's credential belongs to.
+
+    Best-effort: an unsupported host, a missing token, or any upstream error
+    yields an empty :class:`GitProfile` instead of raising — callers use this to
+    label an identity and must never fail an add/update over it. The token is
+    used only to authorize the call and is never logged.
+    """
+    platform = (platform or "").lower()
+    fetcher = _PROFILE_FETCHERS.get(platform)
+    if fetcher is None or not (opts.token or "").strip():
+        return GitProfile()
+    try:
+        return await fetcher(opts)
+    except GitClientError:
+        # Never surfaced: the caller labels an identity with this and an empty
+        # profile simply falls back to base_url.
+        return GitProfile()
 
 
 async def list_webhooks(

@@ -46,6 +46,7 @@ _CLI_TO_PROVIDER = {
     "gemini": "gemini",
     "opencode": "opencode",
     "cursor": "cursor",
+    "dsh": "dsh",
 }
 _DEFAULT_PROVIDER = "claude"
 
