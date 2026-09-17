@@ -21,6 +21,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # 复制应用代码
 COPY . .
 
+# 版本号烧进镜像：compose 用 TAG 传（--build-arg APP_VERSION=$TAG），
+# /api/v1/server/config 的 current_version 与升级卡片的「当前运行版本」都读它。
+# 不烧的话恒为 dev——升级完成后无法回答「现在跑的是哪版」。
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 # 暴露端口：8001 数据服务 / 8003 节点控制面 / 8004 Tunnel Runtime
 # （同一镜像承载三个入口，由 docker-compose 按服务分配 command）
 EXPOSE 8001 8003 8004
