@@ -64,11 +64,19 @@ def advertised_http_port() -> int:
 
 def build_response() -> bytes:
     """构造质询响应 JSON（一次构造，进程内复用也无所谓，保持简单每次现造）。"""
+    # 版本与 /api/v1/server/version 同源（VERSION 文件），避免局域网发现报一个
+    # 版本、网页显示另一个。lan_discovery 是独立模块，延迟 import 避免循环依赖。
+    try:
+        from server_release_catalog import current_version
+
+        version = current_version()
+    except Exception:  # noqa: BLE001 - 独立进程/早期启动时回落 dev
+        version = "dev"
     return json.dumps(
         {
             "app": "ai-lubricant",
             "name": (os.environ.get("LAN_DISCOVERY_SERVER_NAME") or "Ai Lubricant").strip() or "Ai Lubricant",
-            "version": os.getenv("APP_VERSION", "dev").strip() or "dev",
+            "version": version,
             "http_port": advertised_http_port(),
         },
         separators=(",", ":"),

@@ -57,6 +57,10 @@ _SOURCES: dict[str, dict] = {
     },
 }
 
+# Kinds that run a *different* kind's binary. chmlfrp is an frp-hosting panel:
+# its tunnels run the stock frpc client, so it downloads frpc.
+_BINARY_ALIAS: dict[str, str] = {"chmlfrp": "frpc"}
+
 
 class BinaryError(Exception):
     """The client binary could not be resolved, downloaded, or unpacked."""
@@ -108,6 +112,12 @@ def cache_dir() -> Path:
     return Path.home() / ".cache" / "mc-tunnel-bins"
 
 
+def _binary_kind(kind: str) -> str:
+    """The kind whose binary actually runs — chmlfrp → frpc, others identity."""
+    kind = (kind or "").strip()
+    return _BINARY_ALIAS.get(kind, kind)
+
+
 def resolve_source(kind: str, config: dict | None = None) -> tuple[str, str | None, str | None]:
     """Return ``(url, archive_kind, member)`` for this platform.
 
@@ -115,7 +125,7 @@ def resolve_source(kind: str, config: dict | None = None) -> tuple[str, str | No
     ``{exe}``/``{ext}`` placeholders are still substituted) so an operator can
     serve a private mirror.
     """
-    source = _SOURCES.get((kind or "").strip())
+    source = _SOURCES.get(_binary_kind(kind))
     if source is None:
         raise BinaryError(f"unsupported tunnel client kind {kind!r}")
     os_token, arch, exe = _platform_tokens()
@@ -147,17 +157,18 @@ async def ensure_binary(kind: str, config: dict | None = None) -> Path:
     operator can pre-install the client and skip the download entirely.
     """
     kind = (kind or "").strip()
-    if kind not in _SOURCES:
+    binary_kind = _binary_kind(kind)
+    if binary_kind not in _SOURCES:
         raise BinaryError(f"unsupported tunnel client kind {kind!r}")
 
-    target = cache_dir() / binary_name(kind)
+    target = cache_dir() / binary_name(binary_kind)
     if target.exists() and os.access(target, os.X_OK):
-        logger.debug("[tunnel] {} binary already cached: {}", kind, target)
+        # Cache hit: silent. This runs on every reconcile tick, so logging it
+        # here just floods the log with "already cached" for no signal.
         return target
 
-    on_path = shutil.which(kind)
+    on_path = shutil.which(binary_kind)
     if on_path:
-        logger.debug("[tunnel] {} binary found on PATH: {}", kind, on_path)
         return Path(on_path)
 
     url, archive, member = resolve_source(kind, config)
@@ -202,7 +213,7 @@ async def ensure_binary(kind: str, config: dict | None = None) -> Path:
                     )
                 logger.debug("[tunnel] {} checksum verified", kind)
             extracted = await asyncio.to_thread(
-                _unpack, asset, tmp_dir, archive, member, kind
+                _unpack, asset, tmp_dir, archive, member, binary_kind
             )
             _make_executable(extracted)
             # os.replace is atomic within a filesystem; the temp dir may be on a

@@ -47,9 +47,11 @@ def test_protocol_limits_match_spec():
     assert protocol.SERVER_GRACE_MS == 5000
 
 
-def test_command_vocabulary_is_the_16_spec_commands():
-    """spec §8 的命令表。工具定义从这里派生，所以少一个就等于少一个 MCP 工具。"""
-    assert len(protocol.COMMANDS) == 16
+def test_command_vocabulary_is_the_16_spec_commands_plus_two_extensions():
+    """spec §8 的命令表 + 2 条无特权扩展（get_foreground_app/open_url）。
+    工具定义从这里派生，所以少一个就等于少一个 MCP 工具；与两端设备实现
+    （Android Capabilities.ALL / iOS caps.All）同步——加命令一次改五处。"""
+    assert len(protocol.COMMANDS) == 18
     assert "get_screen_state" in protocol.COMMANDS
     assert "tap" in protocol.COMMANDS
     assert "list_apps" in protocol.COMMANDS
@@ -57,11 +59,17 @@ def test_command_vocabulary_is_the_16_spec_commands():
     # 单独做能力门禁（spec §8）。
     assert {"press_back", "press_home", "press_recents"} <= set(protocol.COMMANDS)
     assert "press_back" not in protocol.PRESS_KEYS
+    # 无特权扩展：读前台 App（不占串行锁）+ 打开 URL（占锁，属变更类）。
+    assert "get_foreground_app" in protocol.COMMANDS
+    assert "open_url" in protocol.COMMANDS
 
 
-def test_read_only_commands_are_the_two_concurrency_safe_ones():
-    """spec §5：除这两个以外的命令都会改 UI 状态，设备必须串行执行。"""
-    assert protocol.READ_ONLY_COMMANDS == frozenset({"get_screen_state", "list_apps"})
+def test_read_only_commands_are_the_concurrency_safe_ones():
+    """spec §5：除这几个以外的命令都会改 UI 状态，设备必须串行执行。
+    get_foreground_app 只读一个 volatile 字段，与两个 v0 只读命令同等安全。"""
+    assert protocol.READ_ONLY_COMMANDS == frozenset(
+        {"get_screen_state", "list_apps", "get_foreground_app"}
+    )
 
 
 def test_clamp_call_timeout_applies_default_and_cap():

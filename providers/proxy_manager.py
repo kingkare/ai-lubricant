@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import time
 from contextvars import ContextVar
 from typing import Any, AsyncIterator, Callable, Optional
@@ -78,6 +79,8 @@ def describe_and_record(config: dict | None, target_host: str | None) -> None:
         info["url_prefix"] = cfg.get("url_prefix") or ""
     elif mode == "node":
         info["node_id"] = cfg.get("node_id") or ""
+    elif mode == "browser":
+        info["client_id"] = cfg.get("client_id") or ""
     _last_outbound_proxy.set(info)
 
 
@@ -112,6 +115,13 @@ class OutboundResponse:
         # dict(resp.headers) 会把同名多条 Set-Cookie 塌成一条 → 从 headers 重解析会丢
         # cookie（eaichat 取 2 个 cookie、qwen 遍历全部 cookie 都会因此坏）。故优先透传。
         self._cookies = cookies
+        # 读泵状态（惰性启动，见 _run_pump / readany）：调用方可以对「取下一块」做
+        # 单块超时（asyncio.wait_for），超时取消的只是对缓冲的等待，底层生成器不受扰。
+        self._pump_task: Optional[asyncio.Task] = None
+        self._pump_buf: "collections.deque[bytes]" = collections.deque()
+        self._pump_done = False                # 底层生成器已耗尽（正常 EOF）
+        self._pump_error: Optional[BaseException] = None
+        self._pump_event: Optional[asyncio.Event] = None
 
     @property
     def content(self):
@@ -149,18 +159,109 @@ class OutboundResponse:
                     pass
         return jar
 
-    async def iter_any(self) -> AsyncIterator[bytes]:
-        """流式迭代响应体（SSE 场景用）。与 read/text/json 互斥：流式场景不要再 read。"""
-        async for chunk in self._body_iter:
-            yield chunk
+    def iter_any(self) -> "_BodyIterator":
+        """流式迭代响应体（SSE 场景用）。与 read/text/json 互斥：流式场景不要再 read。
+
+        返回的是**非生成器**迭代器：调用方拿 `wait_for(it.__anext__(), N)` 当计时器、
+        超时取消一次，只会取消这一次等待，迭代器与底层读泵都不受影响，下次 __anext__
+        继续给块。（原生 aiohttp 的 iter_any 是异步生成器，被取消即终结——这点我们
+        刻意做得比原生更稳，因为 facade 底下还套着 node 生成器，一取消整条死。）
+        """
+        return _BodyIterator(self)
+
+    async def readany(self) -> bytes:
+        """对齐 aiohttp StreamReader.readany：单次读一块就返回，EOF 返回 b""。
+
+        供 ``asyncio.wait_for(resp.content.readany(), timeout=...)`` 这种「单次读
+        等 N 秒、超了继续等」的用法（autoclaw relay 事件流按内容静默判收尾）——
+        iter_any 没法对单块做 wait_for，语义覆盖不了。
+
+        **取消安全**：内部用常驻读泵把块收进队列，等待的是队列而不是底层生成器的
+        ``__anext__()``。故 ``wait_for`` 超时取消的只是这一次「等队列」，底层流不受
+        影响，后续调用仍能拿到新块。这一点是必须的：直接 await 生成器的 ``__anext__()``
+        时，取消会把 CancelledError 注入生成器帧并**终结**它（finally 跑完、生成器关闭），
+        之后每次读取都直接 StopAsyncIteration → 恒返回 b"" → 调用方误判成「上游 EOF」。
+        生产事故即此：autoclaw relay 的 planning 阶段静默 >sock_read(10s)，wait_for 一
+        取消就把事件流打死，日志表现为「最后一字节后恰好 10.0s 报事件流 EOF」。
+
+        aiohttp 模式下 ``_AiohttpOutboundResponse.content`` 透传原生 StreamReader
+        （其 readany 本身可取消安全）；node 隧道与纯内存响应靠本实现。
+        与 read()/text()/json() 互斥。
+        """
+        if self._body_cache is not None:
+            # read()/text()/json() 已把流读到底，之后没有新块可给
+            return b""
+        try:
+            return await self._pump_next()
+        except StopAsyncIteration:
+            return b""
+
+    async def _pump_next(self) -> bytes:
+        """从读泵缓冲取下一块；底层耗尽抛 StopAsyncIteration。
+
+        等待期间被取消（wait_for 超时）不改变读泵与生成器状态，可安全重入。
+        """
+        self._ensure_pump()
+        while True:
+            if self._pump_buf:
+                return self._pump_buf.popleft()
+            if self._pump_error is not None:
+                err = self._pump_error
+                self._pump_error = None
+                raise err
+            if self._pump_done:
+                raise StopAsyncIteration
+            event = self._pump_event
+            event.clear()
+            # 读完缓冲再等之前重新确认一次，避免读泵刚好在 clear 前完成导致空等。
+            if self._pump_buf or self._pump_done or self._pump_error is not None:
+                continue
+            await event.wait()
+
+    def _ensure_pump(self) -> None:
+        """惰性启动读泵（每个响应一个，贯穿其生命周期）。"""
+        if self._pump_task is None:
+            self._pump_event = asyncio.Event()
+            self._pump_task = asyncio.ensure_future(self._run_pump())
+
+    async def _run_pump(self) -> None:
+        """后台读泵：连续从底层生成器取块入队，绝不因调用方取消而中断。"""
+        try:
+            async for chunk in self._body_iter:
+                if chunk:
+                    self._pump_buf.append(chunk)
+                    self._pump_event.set()
+        except asyncio.CancelledError:
+            # 仅在响应被显式关闭/GC 时发生；把状态收尾成 EOF，不向上冒泡。
+            self._pump_done = True
+            self._pump_event.set()
+            raise
+        except Exception as exc:  # noqa: BLE001 - 原样交给等待方
+            self._pump_error = exc
+            self._pump_event.set()
+        else:
+            self._pump_done = True
+            self._pump_event.set()
+
+    async def _close_pump(self) -> None:
+        """关闭读泵（响应关闭时调用），并释放底层生成器。"""
+        task = self._pump_task
+        self._pump_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
     async def read(self) -> bytes:
         """一次性读取完整响应体（非流式场景用）。可重复调用（结果缓存）。"""
         if self._body_cache is None:
             chunks = []
-            async for chunk in self._body_iter:
+            async for chunk in self.iter_any():
                 chunks.append(chunk)
             self._body_cache = b"".join(chunks)
+            await self._close_pump()
         return self._body_cache
 
     async def text(self, encoding: Optional[str] = None) -> str:
@@ -180,9 +281,38 @@ class OutboundResponse:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self._close_pump()
         if self._closer:
             await self._closer()
         return False
+
+
+class _BodyIterator:
+    """``iter_any()`` 的返回物：可被调用方安全取消的非生成器异步迭代器。
+
+    生成器版（原生 aiohttp 也是）被取消一次就终结；这个类每次 __anext__ 都只是
+    「向读泵要下一块」，取消的仅是当次等待，对象本身可以反复重入。
+    """
+
+    def __init__(self, owner: "OutboundResponse"):
+        self._owner = owner
+        self._served_cache = False
+
+    def __aiter__(self) -> "_BodyIterator":
+        return self
+
+    async def __anext__(self) -> bytes:
+        owner = self._owner
+        if owner._body_cache is not None:
+            # read()/text()/json() 已把流读到底：缓存一次性给出，之后 EOF
+            if self._served_cache or not owner._body_cache:
+                raise StopAsyncIteration
+            self._served_cache = True
+            return owner._body_cache
+        chunk = await owner._pump_next()
+        if not chunk:
+            raise StopAsyncIteration
+        return chunk
 
 
 class RequestInstance:
@@ -196,10 +326,12 @@ class RequestInstance:
 
     def __init__(self, proxy_config: dict, target_host: str,
                  node_manager: Optional["NodeConnectManager"] = None,
+                 browser_manager=None,
                  on_done: Optional[callable] = None):
         self._proxy_config = proxy_config
         self._target_host = target_host
         self._node_manager = node_manager
+        self._browser_manager = browser_manager
         self._session: Optional[aiohttp.ClientSession] = None
         self._in_flight: int = 0          # 当前进行中的请求数
         self._closing: bool = False       # 是否已标记关闭（已从池移除）
@@ -249,6 +381,10 @@ class RequestInstance:
         try:
             if self.mode == "node":
                 resp = await self._request_via_node(
+                    url=url, method=method, headers=headers, timeout=timeout, ssl=ssl, **kwargs,
+                )
+            elif self.mode == "browser":
+                resp = await self._request_via_browser(
                     url=url, method=method, headers=headers, timeout=timeout, ssl=ssl, **kwargs,
                 )
             else:
@@ -364,6 +500,67 @@ class RequestInstance:
 
         return _NodeOutboundResponse(proxy_resp)
 
+    async def _request_via_browser(self, *, url: str, method: str,
+                                   headers: Optional[dict], timeout: Optional[aiohttp.ClientTimeout],
+                                   ssl: bool, **kwargs) -> OutboundResponse:
+        """browser 模式：把请求描述经浏览器代理通道 WS 下发给扩展，扩展 fetch 后
+        流式回传。出口 = 该浏览器的网络（其 IP / TLS 指纹 / 当前 chrome.proxy 配置），
+        纯 I/O 中继（含 TLS 终止），不处理业务（见 docs/browser-proxy-design.md Phase 3）。"""
+        if self._browser_manager is None:
+            raise RuntimeError("browser mode requires BrowserConnectManager")
+
+        body = kwargs.get("data") or kwargs.get("json") or b""
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        elif isinstance(body, dict):
+            import json
+            body = json.dumps(body).encode("utf-8")
+
+        # browser 模式 ssl 参数无用（TLS 由浏览器端终止）；忽略以对齐 node 语义。
+        try:
+            proxy_resp = await self._browser_manager.request(
+                self._proxy_config["client_id"],
+                method=method,
+                url=url,
+                headers=headers,
+                body=body,
+                timeout=timeout.total if timeout and timeout.total else None,
+            )
+        except Exception:
+            raise
+
+        return _BrowserOutboundResponse(proxy_resp)
+
+
+class _BrowserOutboundResponse(OutboundResponse):
+    """包装 BrowserProxyResponse 为 OutboundResponse。响应流关闭时收尾 exchange。"""
+
+    def __init__(self, proxy_resp: "Any"):
+        self._proxy_resp = proxy_resp
+        self._closed = False
+        super().__init__(
+            status=proxy_resp.status,
+            headers=dict(proxy_resp.headers) if proxy_resp.headers else {},
+            body_iter=self._iter_chunks(),
+            closer=self._close,
+        )
+
+    async def _iter_chunks(self):
+        try:
+            async for chunk in self._proxy_resp.iter_chunks():
+                yield chunk
+        finally:
+            await self._close()
+
+    async def _close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._proxy_resp.close()
+        except Exception as exc:
+            logger.debug(f"[ProxyManager] close browser proxy tunnel failed: {exc}")
+
 
 class _NodeOutboundResponse(OutboundResponse):
     """包装 NodeProxyResponse 为 OutboundResponse。响应流关闭时关 tunnel。"""
@@ -412,6 +609,17 @@ class _AiohttpOutboundResponse(OutboundResponse):
             cookies=resp.cookies,
         )
 
+    @property
+    def content(self):
+        """直接交出原生 aiohttp StreamReader。
+
+        忠实替身原则：底层就是 aiohttp 时不该降级——StreamReader 自带 readany /
+        readline / readexactly 等全部原生 API，spec 里 `resp.content.readany()`
+        （autoclaw relay 事件流）才不用逐个补。纯内存/node 模式才回落基类的
+        self（提供 iter_any + readany 子集）。
+        """
+        return self._resp.content
+
     async def _iter_bytes(self):
         try:
             async for chunk in self._resp.content.iter_any():
@@ -449,6 +657,8 @@ class ProxyManager:
         self._proxy_configs: dict[str, dict] = {}
         # node 模式管理器（可选）
         self._node_manager = node_manager
+        # browser 模式管理器（可选）：浏览器当代理节点，进程内直连 CDP 代理通道。
+        self._browser_manager = None
         self._lock = asyncio.Lock()
 
     def update_proxy_config(self, proxy_config: dict):
@@ -513,6 +723,7 @@ class ProxyManager:
                 await instance.mark_closing()
             instance = RequestInstance(
                 current_config, target_host, self._node_manager,
+                browser_manager=self._browser_manager,
                 on_done=self.cleanup,
             )
             self._instances[key] = instance
@@ -704,3 +915,11 @@ def get_proxy_manager() -> ProxyManager:
 def set_node_manager(node_manager) -> None:
     """运行时注入 NodeConnectManager（节点服务启动后调用）。"""
     get_proxy_manager()._node_manager = node_manager
+
+
+def set_browser_manager(browser_manager) -> None:
+    """运行时注入 BrowserConnectManager（CDP 代理通道就绪后调用）。
+
+    进程内单例：CDP driver 与 ProxyManager 同处主进程，browser 模式直接经代理
+    通道 WS 转发（无 node 那种跨进程 hop）。"""
+    get_proxy_manager()._browser_manager = browser_manager

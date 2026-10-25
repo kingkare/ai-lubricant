@@ -19,8 +19,23 @@ def test_send_message_request_accepts_execution_modes():
     assert goal.goal_config.objective == "improve docs"
     assert goal.goal_config.budget_seconds == 600
 
+    # supervisor = 监督模式：无需 goal_config（普通发消息即可，用户口径）。
+    supervisor = agent_api.SendMessageRequest(content="decompose and delegate", mode="supervisor")
+    assert supervisor.mode == "supervisor"
+    assert supervisor.goal_config is None
+
     with pytest.raises(Exception):
         agent_api.SendMessageRequest(content="x", mode="invalid")
+
+
+def test_supervisor_hint_shared_and_inlines_redline():
+    """红线常量两处注入点共用（api + cdp import 同一份），含红线关键句与 SOP 路径。"""
+    from agent.cdp_chat_service import _SUPERVISOR_HINT as cdp_hint
+
+    assert agent_api._SUPERVISOR_HINT is cdp_hint  # 同一份常量，防两处文案漂移
+    assert "spawn_subagent" in agent_api._SUPERVISOR_HINT
+    assert "supervisor_sop.md" in agent_api._SUPERVISOR_HINT
+    assert "read-only" in agent_api._SUPERVISOR_HINT
 
 
 def test_attachment_default_uses_real_agent_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

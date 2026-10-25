@@ -214,3 +214,91 @@ async def test_node_shell_exec_auto_allow_keys_skip_approval_and_flag_audit(monk
     approval_registry.resolve(emitted[0]["confirmation_id"], "deny")
     with pytest.raises(ApprovalDenied):
         await prepare_task
+
+
+@pytest.mark.asyncio
+async def test_node_shell_auto_approve_runs_dangerous_chain_without_card(monkeypatch):
+    """auto 模式：多段链/危险结构一律直接执行，不弹审批卡。
+
+    这是「全部审批通过」的核心断言——连 ``ls; rm x`` 这种在普通模式下必弹卡的
+    组合都不弹（审计仍记 auto_allowed=True）。
+    """
+    bag = ToolBag()
+    audited: list[dict] = []
+    emitted: list[dict] = []
+    calls: list[dict] = []
+
+    async def audit(node_id, caller, conversation_id, command, result, shell_flavor, *, auto_allowed):
+        audited.append({"command": command, "auto_allowed": auto_allowed})
+
+    async def executor(**kwargs):
+        calls.append(kwargs)
+        return {"status": "ok", "exit_code": 0, "output": "done"}
+
+    async def emit(event):
+        emitted.append(event)
+
+    monkeypatch.setattr(node_tools, "_audit", audit)
+    batch = node_tools.register_node_shell_exec(
+        bag,
+        "node-1",
+        "user-1",
+        "conv-1",
+        emit=emit,
+        terminal_id="term-1",
+        cwd="/work",
+        shell_flavor="posix",
+        executor=executor,
+        auto_approve=True,
+    )
+
+    await batch.prepare(
+        [{"function": {"name": "node_shell_exec", "arguments": json.dumps({"command": "ls; rm x"})}}]
+    )
+    result = await bag.tools["node_shell_exec"]({"command": "ls; rm x"})
+
+    assert emitted == []           # 没有 confirmation_required
+    assert result["status"] == "ok"
+    assert calls and calls[0]["command"] == "ls; rm x"
+    assert audited and audited[-1]["auto_allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_node_shell_auto_approve_without_event_sink_still_blocks(monkeypatch):
+    """emit=None（无人值守）时 auto_approve 不生效：照常挂起等裁决，超时 fail closed。
+
+    没有人（也没有事件流）在场时，auto_approve 不能让命令静默执行——这是
+    「无人值守必须有人裁决」底线在本模式下的体现。
+    """
+    from user_platform.node_client.approvals import ApprovalTimeout
+
+    bag = ToolBag()
+    executed: list[dict] = []
+    monkeypatch.setattr(node_tools, "_audit", lambda *a, **k: asyncio.sleep(0))
+
+    async def executor(**kwargs):
+        executed.append(kwargs)
+        return {"status": "ok"}
+
+    batch = node_tools.register_node_shell_exec(
+        bag,
+        "node-1",
+        "user-1",
+        "conv-1",
+        emit=None,
+        terminal_id="term-1",
+        cwd="/work",
+        shell_flavor="posix",
+        executor=executor,
+        auto_approve=True,
+        timeout_seconds=1,
+    )
+
+    with pytest.raises(ApprovalTimeout):
+        await asyncio.wait_for(
+            batch.prepare(
+                [{"function": {"name": "node_shell_exec", "arguments": json.dumps({"command": "rm x"})}}]
+            ),
+            timeout=5,
+        )
+    assert executed == []

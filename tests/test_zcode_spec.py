@@ -83,7 +83,19 @@ def test_account_schema_declares_device_code(channel_cls):
     assert schema["provider_name"] == "zcode-test"
     assert schema["auth_start"]["mode"] == "device_code"
     keys = {f["key"] for f in schema["fields"]}
-    assert {"credential_mode", "password", "plan_name", "quota_text", "last_claim"} == keys
+    assert {"credential_mode", "password", "plan_name", "quota_text", "last_claim", "pending_claim",
+            "captcha_client_id",
+            "last_checkin", "last_checkin_status"} == keys
+    # 站点服务已删：captcha_site_id/captcha_site_token 不再是账号字段，只留 client_id 钉位。
+    assert "captcha_site_id" not in keys and "captcha_site_token" not in keys
+    # 三件套已拆成独立账号动作 + refresh_auth（手动全刷，默认关）。
+    actions = {a["id"]: a for a in schema["account_actions"]}
+    assert set(actions) == {"checkin", "sync_quota", "claim", "refresh_auth"}
+    assert actions["checkin"]["display"]["badge_field"] == "last_checkin"
+    assert actions["sync_quota"]["display"]["value_field"] == "quota_text"
+    assert actions["claim"]["display"]["value_field"] == "last_claim"
+    assert actions["refresh_auth"]["default"]["enabled"] is False, "全刷入口默认不进自动调度"
+    assert "perform_action" in channel_cls._spec_hooks
 
 
 def test_account_fields_covers_device_profile(channel_cls):
@@ -268,14 +280,17 @@ def test_identity_headers_full_shape(channel_cls):
                        device_mid="mid-1", fp_platform="darwin", fp_arch="arm64",
                        fp_os_version="25.5.0", fp_language="zh-CN", fp_timezone="Asia/Shanghai")
     headers = mod._identity_headers(p)
-    assert headers["User-Agent"] == "ZCode/3.10.2"
-    assert headers["X-ZCode-App-Version"] == "3.10.2"
+    assert headers["User-Agent"] == "ZCode/3.14.4"
+    assert headers["X-ZCode-App-Version"] == "3.14.4"
     assert headers["X-ZCode-Agent"] == "glm"
     assert headers["X-Platform"] == "darwin-arm64"
     assert headers["X-Os-Category"] == "macos"
     assert headers["X-Device-Mid"] == "mid-1"
-    assert headers["X-Title"] == "Z Code@cli"
-    assert headers["HTTP-Referer"] == "https://zcode.z.ai/"
+    # 桌面端 electron 形态（有账号时不再用 cli）
+    assert headers["X-Title"] == "Z Code@electron"
+    assert headers["X-Release-Channel"] == "stable"
+    # Referer 无尾斜杠（messages / billing 形状统一）
+    assert headers["HTTP-Referer"] == "https://zcode.z.ai"
 
 
 def test_trace_headers_start_plan_never_send_query_id():
@@ -480,16 +495,16 @@ def test_provision_solver_fail_cache_preserves_reason_for_30s(channel_cls, monke
 
 
 def test_provision_solver_recovers_after_fail_cache(channel_cls, monkeypatch, tmp_path):
-    """配置就位后探测通过（临时目录模拟 solver.js + node_modules/happy-dom）。"""
+    """配置就位后探测通过（pw 路线：solver_pw.js + node_modules/puppeteer-core）。"""
     import os as _os
     mod = _module()
     p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
     _reset_provision(mod)
 
-    # 用真实临时目录模拟已装好的求解器：solver.js + node_modules/happy-dom
+    # 用真实临时目录模拟已装好的求解器：solver_pw.js + node_modules/puppeteer-core
     tmp = tempfile.mkdtemp()
-    _os.makedirs(_os.path.join(tmp, "node_modules", "happy-dom"), exist_ok=True)
-    solver_path = _os.path.join(tmp, "solver.js")
+    _os.makedirs(_os.path.join(tmp, "node_modules", "puppeteer-core"), exist_ok=True)
+    solver_path = _os.path.join(tmp, "solver_pw.js")
     with open(solver_path, "w") as fh:
         fh.write("// stub\n")
 
@@ -498,45 +513,256 @@ def test_provision_solver_recovers_after_fail_cache(channel_cls, monkeypatch, tm
     assert ok is True, msg
 
 
-def test_solver_path_auto_discovery(channel_cls, monkeypatch, tmp_path):
-    """自动发现三级：显式配置 > cwd 相对 .tmp-zcode2api > 都没有返回空。"""
+def test_provision_solver_legacy_requires_happy_dom(channel_cls, monkeypatch):
+    """legacy 路线（solver.js）校验 happy-dom 依赖，缺了给具体指引。"""
+    import os as _os
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+    _reset_provision(mod)
+
+    tmp = tempfile.mkdtemp()
+    solver_path = _os.path.join(tmp, "solver.js")
+    with open(solver_path, "w") as fh:
+        fh.write("// stub\n")
+
+    monkeypatch.setenv("ZCODE_CAPTCHA_SOLVER", "legacy")
+    monkeypatch.setattr(mod, "_solver_dir", lambda p_: tmp)
+    ok, msg = asyncio.run(mod._provision_solver(p))
+    assert ok is False
+    assert "happy-dom" in msg
+
+
+def test_solver_dir_and_script_discovery(channel_cls, monkeypatch, tmp_path):
+    """自动发现：显式脚本 > 显式目录 > cwd 相对 .tmp-zcode2api > 都没有返回空。"""
     import os as _os
     mod = _module()
     p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
 
-    # 1. 显式配置优先
-    p._channel = _StubChannel(captcha_solver_path=r"D:\explicit\solver.js")
-    assert mod._solver_path(p) == r"D:\explicit\solver.js"
+    # 1. 显式脚本路径优先（默认 pw 路线）
+    _os.makedirs(_os.path.join(tmp_path, "explicit"), exist_ok=True)
+    _os.makedirs(_os.path.join(tmp_path, "explicit", "node_modules", "puppeteer-core"), exist_ok=True)
+    explicit_script = _os.path.join(tmp_path, "explicit", "solver_pw.js")
+    with open(explicit_script, "w") as fh:
+        fh.write("// stub\n")
+    p._channel = _StubChannel(captcha_solver_path=explicit_script)
+    assert mod._solver_dir(p) == _os.path.join(tmp_path, "explicit")
+    assert mod._solver_script(p) == explicit_script
     p._channel = None
 
-    # 2. cwd 下 .tmp-zcode2api/captcha_node/solver.js 自动命中
+    # 2. cwd 下 .tmp-zcode2api/captcha_node 自动命中（默认解出 solver_pw.js）
     _os.makedirs(_os.path.join(tmp_path, ".tmp-zcode2api", "captcha_node"), exist_ok=True)
-    auto = _os.path.join(tmp_path, ".tmp-zcode2api", "captcha_node", "solver.js")
-    with open(auto, "w") as fh:
-        fh.write("// stub\n")
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("ZCODE_CAPTCHA_SOLVER", raising=False)
-    assert mod._solver_path(p) == auto
+    assert mod._solver_dir(p) == _os.path.join(tmp_path, ".tmp-zcode2api", "captcha_node")
+    assert mod._solver_script(p) == _os.path.join(tmp_path, ".tmp-zcode2api", "captcha_node", "solver_pw.js")
 
-    # 3. 完全独立的空目录 + 无环境变量 → 空串（后续探测给带指引的报错）
+    # 3. legacy 路线解出 solver.js
+    monkeypatch.setenv("ZCODE_CAPTCHA_SOLVER", "legacy")
+    assert mod._solver_script(p) == _os.path.join(tmp_path, ".tmp-zcode2api", "captcha_node", "solver.js")
+    monkeypatch.delenv("ZCODE_CAPTCHA_SOLVER", raising=False)
+
+    # 4. 完全独立的空目录 + 无环境变量 → 空串（后续探测给带指引的报错）
     # （tmp_path 的上级会被第 2 步命中，必须用独立 mkdtemp 隔离）
     monkeypatch.chdir(tempfile.mkdtemp())
-    assert mod._solver_path(p) == ""
+    assert mod._solver_dir(p) == ""
 
 
 # ==================== 额度摘要 ====================
 
 def test_summarize_quota_merges_same_model_windows():
+    """同模型多窗口合并 remaining/total/used；有 breakdown 时摘要出「剩/总/已用」。"""
+    mod = _module()
+    balances = [
+        {"show_name": "GLM-5.3", "total_units": 3000000, "used_units": 1000000, "remaining_units": 2000000},
+        {"show_name": "GLM-5.3", "total_units": 1000000, "used_units": 900000, "remaining_units": 100000},
+        {"show_name": "GLM-5-Turbo", "total_units": 500, "used_units": 500, "remaining_units": 0},
+    ]
+    quota, summary = mod._summarize_quota(balances)
+    assert quota == {"GLM-5.3": 2100000, "GLM-5-Turbo": 0}   # remaining 合并
+    # 摘要三段齐全，且合并了多窗口的总/已用
+    assert "GLM-5.3: 剩 2,100,000 / 总 4,000,000 / 已用 1,900,000" in summary
+    assert "GLM-5-Turbo: 剩 0 / 总 500 / 已用 500" in summary
+    assert mod._summarize_quota([]) == ({}, "")
+
+
+def test_summarize_quota_omits_breakdown_when_absent():
+    """上游没回 total_units/used_units 时只显示「剩」，不显示误导性的「总 0」。"""
     mod = _module()
     balances = [
         {"show_name": "GLM-5.3", "remaining_units": 100},
-        {"show_name": "GLM-5.3", "remaining_units": 50},   # 同模型多窗口合并
+        {"show_name": "GLM-5.3", "remaining_units": 50},
         {"show_name": "GLM-5-Turbo", "remaining_units": 0},
     ]
     quota, summary = mod._summarize_quota(balances)
     assert quota == {"GLM-5.3": 150, "GLM-5-Turbo": 0}
-    assert "GLM-5.3" in summary and "150" in summary
-    assert mod._summarize_quota([]) == ({}, "")
+    assert "GLM-5.3: 剩 150" in summary
+    assert "总" not in summary and "已用" not in summary
+
+
+# ==================== 验证码浏览器求解（进程内直驱 CDP）====================
+
+def test_captcha_client_id_resolution(channel_cls, monkeypatch):
+    """captcha_client_id 取值：账号字段 > 渠道配置 > 环境变量 > 空。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+    monkeypatch.delenv("ZCODE_CAPTCHA_CLIENT_ID", raising=False)
+    p._channel = None
+    assert mod._captcha_client_id(p) == ""
+    # 渠道配置
+    p._channel = _StubChannel(captcha_client_id="cid-chan")
+    assert mod._captcha_client_id(p) == "cid-chan"
+    # 环境变量
+    p._channel = None
+    monkeypatch.setenv("ZCODE_CAPTCHA_CLIENT_ID", "cid-env")
+    assert mod._captcha_client_id(p) == "cid-env"
+    # 账号字段优先
+    p2 = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}), captcha_client_id="cid-acct")
+    p2._channel = _StubChannel(captcha_client_id="cid-chan")
+    assert mod._captcha_client_id(p2) == "cid-acct"
+
+
+def _stub_browser(p, *, pool, run_js_ret, calls, find_sk=""):
+    """替身 p 的浏览器门：list_clients 返回 pool，run_js 返回 run_js_ret，find_tab 返回 find_sk。"""
+    async def _list_clients():
+        calls["list_clients"] = True
+        return [{"client_id": cid, "connected": True} for cid in pool]
+    async def _find_tab(cid, url_contains=""):
+        calls.setdefault("find_tab", []).append((cid, url_contains))
+        return find_sk
+    async def _set_default_tab(cid, sk):
+        calls.setdefault("set_default_tab", []).append((cid, sk))
+    async def _open_tab(cid, url="", **kw):
+        calls.setdefault("open_tab", []).append((cid, url))
+        return f"{cid}:tab1"
+    async def _run_js(cid, code, *, tab_id=""):
+        calls.setdefault("run_js", []).append((cid, code))
+        return run_js_ret
+    p.list_clients = _list_clients
+    p.find_tab = _find_tab
+    p.set_default_tab = _set_default_tab
+    p.open_tab = _open_tab
+    p.run_js = _run_js
+
+
+def _captcha_config_stub(monkeypatch, mod):
+    async def fake_config(p_):
+        return {"sceneId": "s", "region": "cn", "prefix": "no8xfe"}
+    monkeypatch.setattr(mod, "_captcha_config", fake_config)
+
+
+def test_solve_captcha_uses_browser_in_process(channel_cls, monkeypatch):
+    """求解走进程内 CDP：refresh pool → pick(轮询) → ensure_page(find_tab 命中复用) → run_js 拿 token。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+    _captcha_config_stub(monkeypatch, mod)
+    long_param = "V" * 300
+    calls = {}
+    _stub_browser(p, pool=["c1", "c2"], run_js_ret=long_param, calls=calls, find_sk="c1:tab1")
+    param, region = asyncio.run(mod._solve_captcha(p))
+    assert param == long_param
+    assert region == "cn"
+    # find_tab 命中 → 复用 set_default_tab，不 open_tab
+    assert ("c1", "https://zcode.z.ai") in calls["find_tab"]
+    assert ("c1", "c1:tab1") in calls["set_default_tab"]
+    assert "open_tab" not in calls
+    # run_js 在选中的 client 上跑，JS 含 scene/region/prefix
+    assert calls["run_js"][0][0] == "c1"
+    assert '"s"' in calls["run_js"][0][1] and '"cn"' in calls["run_js"][0][1]
+    assert "initAliyunCaptcha" in calls["run_js"][0][1]
+
+
+def test_solve_captcha_opens_tab_when_find_misses(channel_cls, monkeypatch):
+    """find_tab 未命中 → open_tab 新开 zcode 页（保证页面在）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+    _captcha_config_stub(monkeypatch, mod)
+    calls = {}
+    _stub_browser(p, pool=["c1"], run_js_ret="P" * 300, calls=calls, find_sk="")
+    asyncio.run(mod._solve_captcha(p))
+    assert ("c1", "https://zcode.z.ai") in calls["open_tab"]
+
+
+def test_solve_captcha_picks_pinned_client_id(channel_cls, monkeypatch):
+    """配了 captcha_client_id → run_js 在该 client 上跑（token 从该浏览器出）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}), captcha_client_id="cdp-9")
+    _captcha_config_stub(monkeypatch, mod)
+    calls = {}
+    _stub_browser(p, pool=["c1", "cdp-9", "c3"], run_js_ret="P" * 300, calls=calls)
+    asyncio.run(mod._solve_captcha(p))
+    assert calls["run_js"][0][0] == "cdp-9"
+
+
+def test_solve_captcha_pinned_client_not_in_pool_raises(channel_cls, monkeypatch):
+    """captcha_client_id 指定的浏览器不在在线池 → 报明确错误（不静默回落本地）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}), captcha_client_id="offline-x")
+    _captcha_config_stub(monkeypatch, mod)
+    calls = {}
+    _stub_browser(p, pool=["c1", "c2"], run_js_ret="P" * 300, calls=calls)
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(mod._solve_captcha(p))
+    assert "offline-x" in str(ei.value.detail) and "不在在线浏览器池" in str(ei.value.detail)
+
+
+def test_solve_captcha_browser_degraded_raises(channel_cls, monkeypatch):
+    """run_js 返回短 token（疑似降级）→ 抛降级错误（不静默回落本地）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+    _captcha_config_stub(monkeypatch, mod)
+    calls = {}
+    _stub_browser(p, pool=["c1"], run_js_ret="short", calls=calls)
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(mod._solve_captcha(p))
+    assert "降级" in str(ei.value.detail)
+
+
+def test_solve_captcha_browser_run_js_error_propagates(channel_cls, monkeypatch):
+    """run_js 抛错（浏览器报错）→ 不静默回落本地，照实上抛为 502。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+    _captcha_config_stub(monkeypatch, mod)
+
+    async def _list_clients():
+        return [{"client_id": "c1", "connected": True}]
+    async def _find_tab(cid, url_contains=""):
+        return "c1:tab1"
+    async def _set_default_tab(cid, sk):
+        pass
+    async def _run_js(cid, code, *, tab_id=""):
+        raise RuntimeError("browser crashed")
+    p.list_clients = _list_clients
+    p.find_tab = _find_tab
+    p.set_default_tab = _set_default_tab
+    p.run_js = _run_js
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(mod._solve_captcha(p))
+    assert ei.value.status_code == 502
+    assert "browser crashed" in str(ei.value.detail)
+
+
+def test_solve_captcha_falls_back_to_local_when_no_browser(channel_cls, monkeypatch, tmp_path):
+    """无在线浏览器 → 抛 _NoCaptchaBrowserError → 回落本地求解器分支（此处无求解器 → 报错）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+    p._channel = None
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ZCODE_CAPTCHA_SOLVER", raising=False)
+    _reset_provision(mod)
+    _captcha_config_stub(monkeypatch, mod)
+    calls = {}
+    _stub_browser(p, pool=[], run_js_ret=None, calls=calls)
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(mod._solve_captcha(p))
+    assert "求解器不可用" in str(ei.value.detail)
+    assert "run_js" not in calls
+
+
+def test_scheduled_tasks_declares_keepalive(channel_cls):
+    """SCHEDULED_TASKS 声明 keepalive（每 5 分钟），对应 spec 里的 keepalive 静态方法。"""
+    mod = _module()
+    assert mod.ZcodeChannel.SCHEDULED_TASKS == [{"id": "keepalive", "frequency_unit": "minutes", "frequency_value": 5}]
+    assert callable(getattr(mod.ZcodeChannel, "keepalive", None))
 
 
 # ==================== is_init / init_auth ====================
@@ -563,10 +789,13 @@ def test_init_auth_assigns_device_profile(channel_cls):
 
 
 def test_device_profile_shape_is_plausible():
+    """档案必须是成套桌面 SKU（platform/arch/os_version/screen 绑定），账号池不含 linux。"""
     mod = _module()
     profile = mod._new_device_profile()
-    assert (profile["fp_platform"], profile["fp_arch"]) in mod._PLATFORM_ARCHS
-    assert profile["fp_os_version"] in mod._OS_VERSIONS[profile["fp_platform"]]
+    combo = (profile["fp_platform"], profile["fp_arch"],
+             profile["fp_os_version"], profile["fp_screen"])
+    assert combo in mod._SKU_POOL, "档案必须是成套 SKU（禁止字段笛卡尔积）"
+    assert profile["fp_platform"] in ("darwin", "win32"), "账号池不含 linux"
     assert (profile["fp_language"], profile["fp_timezone"]) in mod._LOCALES
     import uuid as _uuid
     _uuid.UUID(profile["device_mid"])  # 合法 UUID
@@ -636,13 +865,16 @@ def test_parse_plan_extracts_grants_and_priority():
 
 
 def test_claim_headers_carry_captcha_and_version_floor(channel_cls):
+    """claim 头带验证码 + 版本兜底；X-Platform 跟账号档案走（禁止盖全局 darwin-arm64）。"""
     mod = _module()
     p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}),
-                       device_mid="m", fp_platform="linux", fp_arch="x64")
+                       device_mid="m", fp_platform="win32", fp_arch="x64",
+                       fp_os_version="10.0.26100")
     headers = mod._claim_headers(p, "param-1", "cn")
-    # 实测缺版本/平台头时即使验证码有效也 3007 —— 显式兜底 BILLING_APP_VERSION / X-Platform
+    # 实测缺版本/平台头时即使验证码有效也 3007 —— 显式兜底 BILLING_APP_VERSION
     assert headers["X-ZCode-App-Version"] == mod.BILLING_APP_VERSION
-    assert headers["X-Platform"] == mod.CLIENT_PLATFORM
+    # 平台必须跟账号档案走（profile.platform_full），不再盖全局 darwin-arm64
+    assert headers["X-Platform"] == "win32-x64"
     assert headers["X-Aliyun-Captcha-Verify-Param"] == "param-1"
     assert headers["X-Aliyun-Captcha-Verify-Region"] == "cn"
     assert headers["Authorization"] == f"Bearer {p.password}"
@@ -652,12 +884,27 @@ def test_claim_headers_carry_captcha_and_version_floor(channel_cls):
 
 
 def test_summarize_claims_formats_outcomes():
+    """领取摘要带每个套餐领到的 token 数（grant_units）。"""
     mod = _module()
     assert mod._summarize_claims([]) == ""
     assert mod._summarize_claims([{"ok": True, "plan_name": "A", "plan_id": "p1"}]) == "领取 1 个：A"
-    mixed = [{"ok": True, "plan_name": "A", "plan_id": "p1"},
+    # 带 grants：显示额度
+    with_units = [{"ok": True, "plan_name": "每日赠送", "plan_id": "p1",
+                   "grants": [{"name": "GLM-5.3", "units": 100000000, "period": "daily"}]}]
+    assert mod._summarize_claims(with_units) == "领取 1 个：每日赠送（GLM-5.3 1 亿）"
+    mixed = [{"ok": True, "plan_name": "A", "plan_id": "p1",
+              "grants": [{"name": "GLM-5.3", "units": 3000000}]},
              {"ok": False, "plan_name": "B", "plan_id": "p2", "message": "名额用完"}]
-    assert mod._summarize_claims(mixed) == "领取 1/2：A"
+    assert mod._summarize_claims(mixed) == "领取 1/2：A（GLM-5.3 3,000,000）"
+
+
+def test_fmt_units_humanizes_tokens():
+    mod = _module()
+    assert mod._fmt_units(100_000_000) == "1 亿"
+    assert mod._fmt_units(200_000_000) == "2 亿"
+    assert mod._fmt_units(3_000_000) == "3,000,000"
+    assert mod._fmt_units(0) == "0"
+    assert mod._fmt_units("junk") == "0"
 
 
 def test_refresh_auth_orchestrates_checkin_quota_claim(channel_cls):
@@ -747,8 +994,8 @@ def test_refresh_auth_steps_fail_independently(channel_cls):
     assert "plan_name" not in fields   # current 失败不写
 
 
-def test_claim_one_plan_retries_on_captcha_and_idempotent_on_1003(channel_cls):
-    """claim 流：3007 换码重试一次；1003 已领取过视为幂等成功。"""
+def test_claim_one_plan_3007_stops_and_1003_idempotent(channel_cls):
+    """claim 流：3007 拒码单次即止（出池下轮重试，不换码连打）；1003 已领取过视为幂等成功。"""
     mod = _module()
     p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
 
@@ -757,26 +1004,20 @@ def test_claim_one_plan_retries_on_captcha_and_idempotent_on_1003(channel_cls):
         captcha_calls.append(1)
         return f"param-{len(captcha_calls)}", "cn"
 
-    claim_responses = [
-        {"code": 3007, "msg": "verify failed"},   # 第一次：验证码被拒
-        {"code": 0, "data": {}},                    # 换码重试：成功
-    ]
-    post_calls = []
-    async def fake_billing(p_, method, path, **kw):
-        post_calls.append((method, path))
-        return claim_responses.pop(0)
-
-    mod._captcha_get = fake_captcha_get
     async def fake_config(p_):
         return {"region": "cn"}
+
+    # 3007：拒绝一次即止（不再第 2 次换码连打）
+    async def fake_billing_3007(p_, method, path, **kw):
+        return {"code": 3007, "msg": "verify failed"}
+    mod._captcha_get = fake_captcha_get
     mod._captcha_config = fake_config
-    mod._billing_request = fake_billing
+    mod._billing_request = fake_billing_3007
 
     result = asyncio.run(mod._claim_one_plan(p, {"plan_id": "p1", "name": "A"}))
-    assert result["ok"] is True
+    assert result["ok"] is False
     assert result["plan_id"] == "p1"
-    assert len(captcha_calls) == 2
-    assert all((m, ph) == ("POST", "/billing/claim") for m, ph in post_calls)
+    assert len(captcha_calls) == 1  # 3007 单次即止，不换码重试
 
     # 1003 幂等成功场景
     async def fake_billing_1003(p_, method, path, **kw):
@@ -786,6 +1027,67 @@ def test_claim_one_plan_retries_on_captcha_and_idempotent_on_1003(channel_cls):
     result2 = asyncio.run(mod._claim_one_plan(p, {"plan_id": "p2", "name": "B"}))
     assert result2["ok"] is True
     assert "已领取过" in result2["message"]
+
+
+def test_claim_one_plan_1005_carries_next_at(channel_cls):
+    """1005 名额用完附带 next_at（data.plan.ends_at 秒 → 毫秒），供退避记忆。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+
+    async def fake_captcha_get(p_):
+        return "param-1", "cn"
+
+    async def fake_config(p_):
+        return {"region": "cn"}
+
+    async def fake_billing(p_, method, path, **kw):
+        return {"code": 1005, "msg": "fully claimed",
+                "data": {"plan": {"ends_at": 1800}}}
+
+    mod._captcha_get = fake_captcha_get
+    mod._captcha_config = fake_config
+    mod._billing_request = fake_billing
+
+    result = asyncio.run(mod._claim_one_plan(p, {"plan_id": "p1", "name": "A"}))
+    assert result["ok"] is False
+    assert result["next_at"] == 1800 * 1000
+    assert "名额已用完" in result["message"]
+
+
+def test_step_claim_writes_next_run_at_on_quota_full(channel_cls):
+    """撞 1005 名额用完 → _step_claim 写 _next_run_at（毫秒），供框架到点补跑一次。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+    recovery_ms = 1_800_000_000_000
+
+    async def fake_claim(p_):
+        return [{"plan_id": "p1", "plan_name": "A", "grants": [],
+                 "ok": False, "message": "今日领取名额已用完", "next_at": recovery_ms}]
+
+    mod._auto_claim_plans = fake_claim
+    fields: dict = {}
+    asyncio.run(mod.ZcodeChannel._step_claim(p, fields))
+    # 私有键请求框架补跑
+    assert fields["_next_run_at"] == recovery_ms
+    # 摘要照常写（展示字段），_next_run_at 不是展示字段
+    assert fields["pending_claim"] and "A" in fields["pending_claim"]
+    assert fields["last_claim"] == "领取 0/1：无成功"
+
+
+def test_step_claim_omits_next_run_at_when_no_quota_signal(channel_cls):
+    """正常领取（无 1005）不写 _next_run_at —— 不做多余补跑。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password=_make_jwt({"sub": "u"}))
+
+    async def fake_claim(p_):
+        return [{"plan_id": "p1", "plan_name": "A", "grants": [],
+                 "ok": True, "message": "领取成功"}]
+
+    mod._auto_claim_plans = fake_claim
+    fields: dict = {}
+    asyncio.run(mod.ZcodeChannel._step_claim(p, fields))
+    assert "_next_run_at" not in fields
+    assert fields["last_claim"] == "领取 1 个：A"
 
 
 def test_auto_claim_skips_when_no_plans(channel_cls):

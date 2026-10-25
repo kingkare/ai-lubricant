@@ -134,7 +134,7 @@ def test_media_5xx_exhausts_to_unified_429(monkeypatch):
         ))
 
     assert exc.value.status_code == 429
-    assert exc.value.detail["kind"] == "upstream_exception"
+    assert exc.value.detail["kind"] == "retry_exhausted"
     assert exc.value.detail["upstream_status"] == 502
     assert account.released is True
 
@@ -234,7 +234,8 @@ def test_media_context_overflow_canonicalized(monkeypatch):
     assert exc.value.status_code == 400
     err = exc.value.detail["error"]
     assert err["code"] == "input_too_long"
-    assert err["message"] == "Input tokens exceed the maximum allowed limit"
+    # 固定文案必须带 Claude Code 的压缩触发锚点（"input is too long for requested model"）。
+    assert err["message"] == "Input is too long for requested model: it exceeds the model's context window"
     assert "输入太长" not in err["message"]
 
 
@@ -250,7 +251,7 @@ def test_tts_5xx_exhausts_to_unified_429(monkeypatch):
         ))
 
     assert exc.value.status_code == 429
-    assert exc.value.detail["kind"] == "upstream_exception"
+    assert exc.value.detail["kind"] == "retry_exhausted"
     assert account.released is True
 
 

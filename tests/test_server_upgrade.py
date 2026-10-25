@@ -30,6 +30,11 @@ from user_platform.marketplace.validator import (  # noqa: E402
 
 
 def _server_manifest(version="v260912", **over) -> dict:
+    """服务端版本 manifest（与 validator 的 server-versions 分支同形）。
+
+    与另三条发行线同构：一个升级包挂 GitHub Release，记 download_url + digest + size。
+    """
+    filename = f"ai-lubricant-{version}.tar.gz"
     base = {
         "id": f"server-suite-{version}",
         "kind": "server_app_version",
@@ -39,8 +44,16 @@ def _server_manifest(version="v260912", **over) -> dict:
         "version": version,
         "status": "published",
         "version_notes": "首个版本",
-        "release_tag": version,
-        "repo_url": "https://github.com/wuxin-gh/ai-lubricant",
+        "release_tag": f"server-{version}",
+        "download_url": f"https://github.com/wuxin-gh/ai-lubricant/releases/download/server-{version}/{filename}",
+        "digest": "sha256:" + "a" * 64,
+        "size_bytes": 25165824,
+        "assets": [{
+            "filename": filename,
+            "download_url": f"https://github.com/wuxin-gh/ai-lubricant/releases/download/server-{version}/{filename}",
+            "digest": "sha256:" + "a" * 64,
+            "size_bytes": 25165824,
+        }],
     }
     base.update(over)
     return base
@@ -62,33 +75,46 @@ def test_valid_server_manifest_passes():
     assert validate_manifest("server-versions", _server_manifest()) == []
 
 
-def test_release_tag_is_required():
-    """release_tag 是升级动作的输入，缺了整条链路无从下手。"""
+def test_download_url_is_required():
+    """download_url 是升级卡片与宿主执行器的直接输入，缺了整条链路无从下手。"""
     manifest = _server_manifest()
-    del manifest["release_tag"]
+    del manifest["download_url"]
     errors = validate_manifest("server-versions", manifest)
-    assert any("release_tag" in e for e in errors)
+    assert any("download_url" in e for e in errors)
+
+
+def test_download_url_must_be_https():
+    errors = validate_manifest(
+        "server-versions", _server_manifest(download_url="ftp://example.com/x.tar.gz")
+    )
+    assert any("download_url" in e for e in errors)
 
 
 @pytest.mark.parametrize(
-    "tag",
-    ["v260912; rm -rf /", "v260912 && curl evil", "v260912|x", "v 260912", "v260912\nx"],
+    "url",
+    ["https://x/y.tar.gz?token=abc", "https://x/y.tar.gz?sig=z", "https://x/y.tar.gz?access_key=k"],
 )
-def test_release_tag_rejects_shell_injection(tag):
-    """tag 会被交给部署机的 git checkout，空白/元字符一律拦掉。"""
-    errors = validate_manifest("server-versions", _server_manifest(release_tag=tag))
-    assert any("release_tag" in e for e in errors)
+def test_download_url_rejects_credential_query(url):
+    """带 token/sig 的临时直链不该入库（会过期，且泄漏凭据）。"""
+    errors = validate_manifest("server-versions", _server_manifest(download_url=url))
+    assert any("query" in e for e in errors)
 
 
-def test_repo_url_must_be_https_when_present():
-    errors = validate_manifest(
-        "server-versions", _server_manifest(repo_url="ftp://example.com/x")
-    )
-    assert any("repo_url" in e for e in errors)
-    # 留空允许：部署机可用 .env 的 SERVER_UPGRADE_REPO_URL 兜底
-    manifest = _server_manifest()
-    manifest.pop("repo_url")
-    assert validate_manifest("server-versions", manifest) == []
+def test_assets_must_be_non_empty():
+    errors = validate_manifest("server-versions", _server_manifest(assets=[]))
+    assert any("assets" in e for e in errors)
+
+
+def test_asset_digest_and_size_validated():
+    bad = _server_manifest(assets=[{
+        "filename": "ai-lubricant-v260912.tar.gz",
+        "download_url": "https://x/y.tar.gz",
+        "digest": "not-a-digest",
+        "size_bytes": 0,
+    }])
+    errors = validate_manifest("server-versions", bad)
+    assert any("digest" in e for e in errors)
+    assert any("size_bytes" in e for e in errors)
 
 
 def test_server_version_needs_no_summary():
@@ -108,7 +134,10 @@ def test_render_takes_highest_published_version():
     assert errors == []
     assert payload["version"] == "v260912"
     assert payload["version_notes"] == "新"
-    assert payload["release_tag"] == "v260912"
+    assert payload["release_tag"] == "server-v260912"
+    # 升级包信息投影到顶层（宿主执行器直接读这两个字段下载）
+    assert payload["download_url"].endswith("ai-lubricant-v260912.tar.gz")
+    assert payload["size_bytes"] == 25165824
 
 
 def test_render_excludes_draft():
@@ -138,24 +167,39 @@ def test_render_ignores_non_dict_and_blank_version():
 
 @pytest.fixture()
 def upgrade_env(tmp_path, monkeypatch):
-    """把状态目录与 releases 目录指向 tmp，并重置 catalog 内存快照。"""
+    """把状态目录/releases 指向 tmp，用 VERSION 文件设定当前版本，重置 catalog 快照。
+
+    版本来源是 ``VERSION`` 文件（不是环境变量）——文件随发布包走不会撒谎。
+    这里在 tmp 下造一个假的仓库根，monkeypatch ``project_paths.version_file``
+    指过去。
+    """
     state_dir = tmp_path / "alb"
     releases = tmp_path / "releases"
-    state_dir.mkdir()
-    releases.mkdir()
+    repo_root = tmp_path / "repo"
+    for d in (state_dir, releases, repo_root):
+        d.mkdir()
+    (repo_root / "VERSION").write_text("v260901", encoding="utf-8")
+
     monkeypatch.setenv("SERVER_UPGRADE_STATE_DIR", str(state_dir))
     monkeypatch.setenv("SERVER_RELEASES_DIR", str(releases))
-    monkeypatch.setenv("APP_VERSION", "v260901")
+
+    import project_paths
+
+    monkeypatch.setattr(project_paths, "version_file", lambda: repo_root / "VERSION")
 
     import server_release_catalog as catalog
 
     monkeypatch.setattr(catalog, "_snapshot", {
-        "version": "", "version_notes": "", "release_tag": "", "repo_url": "", "stale": True,
+        "version": "", "version_notes": "", "release_tag": "", "repo_url": "",
+        "download_url": "", "digest": "", "stale": True,
     })
 
     from user_platform import server_upgrade
 
-    return {"module": server_upgrade, "state_dir": state_dir, "releases": releases, "catalog": catalog}
+    return {
+        "module": server_upgrade, "state_dir": state_dir, "releases": releases,
+        "catalog": catalog, "repo_root": repo_root,
+    }
 
 
 def _register(catalog, version, **over):
@@ -181,7 +225,7 @@ def test_detect_reports_upgrade_available(upgrade_env):
 
 
 def test_detect_no_upgrade_when_current_matches(upgrade_env):
-    """登记的 release_tag 带 v、APP_VERSION 不带 v 也要判等（归一比较）。"""
+    """登记的 release_tag 带 v、VERSION 文件不带 v 也要判等（归一比较）。"""
     _register(upgrade_env["catalog"], "v260901")
     status = asyncio.run(upgrade_env["module"].detect())
     assert status["needs_upgrade"] is False

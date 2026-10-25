@@ -215,3 +215,212 @@ def test_ios_identity_is_readable_at_top_level():
     assert ios_info.get("udid") == "00008120-001175642EE0A01E"
     assert r.get("device_id") == "dev_S0fMXIX6EGkTG2a57j2zbg"
 
+
+# ── 孤儿认领：删除即释放 + 重新配对 ──────────────────────────────────────────
+#
+# 线上现象：删除 iOS 设备资源后，节点 devices.json + 凭据残留 → 扫描仍报
+# claimed=true，而服务端已无行 → 既接不进来也初始化不了（「找不到该设备的资源
+# id」）。根因是 DELETE 只删行、从不通知节点释放。修法：
+#   - delete_resource 删除前先 _release_ios_claim（删节点凭据），响应带 released；
+#   - claim_ios_device 支持 force（先 release 再 claim）修复已有孤儿。
+# 真实调用需要 PG + 节点，故用源码断言锁定契约。
+
+
+def test_delete_resource_releases_ios_claim():
+    """删除 iOS 设备必须先释放节点侧认领，否则会留下孤儿。"""
+    import inspect
+
+    from user_platform import routes_builtin_tools
+
+    src = inspect.getsource(routes_builtin_tools.delete_resource)
+    assert "_release_ios_claim" in src, (
+        "delete_resource 必须在删行前调用 _release_ios_claim，否则节点凭据残留成孤儿"
+    )
+    # 释放分支必须以 ios.udid + ios.node_id 双重门控，别误伤 android/cdp/mail。
+    assert 'get("ios")' in src, "应按 ios 块判定 iOS 设备"
+    assert "released" in src, "响应需带 released 供前端告警（节点离线时未释放）"
+    # 扁平化 DTO：不得读嵌套 data（与上面 test_no_nested_data_read 同口径）。
+    assert 'existing.get("data")' not in src
+
+
+def test_release_ios_claim_helper_is_best_effort():
+    """helper 存在且绝不抛（节点离线/RPC 失败返回 (False, 原因)）。"""
+    import inspect
+
+    from user_platform import routes_builtin_tools
+
+    assert callable(routes_builtin_tools._release_ios_claim)
+    src = inspect.getsource(routes_builtin_tools._release_ios_claim)
+    assert "ios_release_device" in src, "helper 必须调用节点的 release RPC"
+    assert "delete_credential=True" in src, "必须删节点侧凭据，否则仍是孤儿"
+    assert "NodeServerUnavailable" in src and "RPCError" in src, "必须吞掉节点离线/RPC 失败"
+    assert "raise" not in src, "helper 必须 best-effort 不抛"
+
+
+def test_release_device_route_reuses_helper():
+    """release-device 路由复用同一 helper（避免两处逻辑漂移）。"""
+    import inspect
+
+    from user_platform import routes_builtin_tools
+
+    src = inspect.getsource(routes_builtin_tools.release_ios_device)
+    assert "_release_ios_claim" in src
+
+
+def test_claim_route_supports_force_repair():
+    """认领路由支持 force（孤儿修复：先释放节点侧占用再重新认领）。"""
+    import inspect
+
+    from user_platform import routes_builtin_tools
+
+    src = inspect.getsource(routes_builtin_tools.claim_ios_device)
+    assert 'body.get("force")' in src, "认领路由需读 force 开关"
+    assert "ios_release_device" in src, "force 路径必须先释放节点侧占用"
+    # force-release 必须在 mint/claim 之前（否则 Claim 撞 already claimed）。
+    assert src.index("ios_release_device") < src.index("ios_claim_device"), (
+        "force-release 必须先于 claim 派发"
+    )
+
+
+# ── 自动续签：扁平化误读 + 到期门禁死锁 ──────────────────────────────────────
+#
+# 线上现象（用户报）：「续签账号为啥不自动进行」。两个既有 bug：
+#   1. _dispatch_renew 读 resource["data"]["device_id"]——扁平化 DTO 无 "data"
+#      层，device_id 恒空 → renew_wda 400，每次派发失败。
+#   2. _scan_once 把 profile_expires_at 当**硬前置**，而 prepare 从不落这个字段
+#      （只有 renew 完成后才回写）→ 第一行就 continue，自动续签永不触发。
+
+
+def test_auto_renew_dispatch_reads_flat_device_id():
+    """_dispatch_renew 必须读顶层 device_id，不得读嵌套 data。"""
+    import inspect
+
+    from user_platform import ios_auto_renew
+
+    src = inspect.getsource(ios_auto_renew._dispatch_renew)
+    assert 'resource.get("data")' not in src, (
+        "扁平化 DTO 无 data 层；读 resource['data']['device_id'] 恒空 → 派发必失败"
+    )
+    assert 'resource.get("device_id"' in src or "resource.get(\"device_id\"" in src, (
+        "应从顶层读 device_id"
+    )
+
+
+def test_auto_renew_scan_does_not_gate_on_unpersisted_expiry():
+    """_scan_once 不得把 profile_expires_at 当硬前置（它从不被落库）。"""
+    import inspect
+
+    from user_platform import ios_auto_renew
+
+    src = inspect.getsource(ios_auto_renew._scan_once)
+    # 旧 bug：`if not signing_profile_id or not expires_at: continue` —— 把到期时间
+    # 和 signing_profile_id 一起当硬前置。到期时间改从 inventory 现读。
+    assert "not signing_profile_id or not expires_at" not in src, (
+        "到期时间不得与 signing_profile_id 一起当硬前置——它从不落库，会让续签永不触发"
+    )
+    assert "profile_expires_at" in src, "应从节点 inventory 现读到期时间"
+    # inventory 必须在「到期判定」之前读到（先读节点、再判到期）。
+    assert src.index("_device_inventory_state") < src.index("_needs_renew"), (
+        "必须先读节点 inventory 拿到到期时间，再判定是否需要续签"
+    )
+
+
+def test_auto_renew_writes_back_inventory_expiry():
+    """扫描器把 inventory 现读的到期时间回写落库（前端徽章 + 下一轮判定）。"""
+    import inspect
+
+    from user_platform import ios_auto_renew
+
+    src = inspect.getsource(ios_auto_renew._scan_once)
+    assert "wda_profile_expires_at" in src, "应把 inventory 的到期时间回写落库"
+
+
+# ── 自动扫描对账：节点清单 ↔ 服务端资源行 ────────────────────────────────────
+#
+# 线上现象（用户报）：手机插着 USB 却恒显示「离线」（不自动在线）；点「添加」
+# 报 409「UDID 已被认领」——但用户明明没添加过。
+#
+# 根因：认领（POST /resources/ios-claims）一次做两件事（建行 + 给节点签发凭据），
+# 两半会脱钩（节点重启/换版本/被释放后节点侧凭据没了，服务端行还在）。
+#   - _merge_ios_inventory 曾按 device_id 匹配，节点未认领时 device_id 为空 →
+#     永远匹配不上 → present 永不更新 → 恒离线。
+#   - 冲突检查扫到同 UDID 的行就 409，不管节点侧是否还持有认领。
+# 修法：匹配改按 udid；新增 30s 对账任务收敛脏状态；认领冲突检查自愈。
+
+
+def test_merge_ios_inventory_matches_by_udid_not_device_id():
+    """_merge_ios_inventory 必须按 udid 匹配节点清单（device_id 会随认领丢失）。"""
+    import inspect
+
+    from user_platform import routes_builtin_tools
+
+    src = inspect.getsource(routes_builtin_tools._merge_ios_inventory)
+    assert 'targets.get(str(dev.get("udid")' in src, "应按 udid 匹配节点清单条目"
+    assert 'dev.get("device_id")' not in src, "不得再按 device_id 匹配（认领丢失时为空）"
+    assert 'ios_block.get("udid")' in src, "应按行的 ios.udid 建索引"
+
+
+def test_reconcile_decide_three_states():
+    """_decide 三态：扫不到→offline（保留）、未认领→delete（脏）、认领→update。"""
+    from user_platform import ios_device_reconcile as r
+
+    assert r.decide_reconcile(None) == "offline", "扫不到必须保留行（标离线），绝不删"
+    assert r.decide_reconcile({"claimed": False}) == "delete", "节点明确未认领→删陈旧行"
+    assert r.decide_reconcile({"claimed": True}) == "update"
+    assert r.decide_reconcile({}) == "delete", "缺 claimed 视为未认领（脏）"
+
+
+def test_reconcile_never_deletes_on_absence():
+    """铁律：只有「节点明确说未认领」才删行；「扫不到」一律保留（标离线）。"""
+    import inspect
+
+    from user_platform import ios_device_reconcile as r
+
+    # decide 的语义锁：None（absent）不是 delete。
+    assert r.decide_reconcile(None) != "delete"
+    # reconcile_once 里 delete 分支只由 decision=="delete" 驱动，且节点不可达整节点跳过。
+    src = inspect.getsource(r.reconcile_once)
+    assert 'if decision == "delete"' in src
+    assert "skipped_nodes" in src, "节点不可达应整节点跳过（绝不因此删行）"
+
+
+def test_reconcile_loop_has_interval_and_gate():
+    """对账任务：30s 常量 + settings.enabled 门禁 + CancelledError 上抛。"""
+    import inspect
+
+    from user_platform import ios_device_reconcile as r
+
+    assert r.RECONCILE_INTERVAL_SECONDS == 30
+    src = inspect.getsource(r.sync_loop)
+    assert "settings.enabled" in src, "compat 关闭时循环应自查退出"
+    assert "CancelledError" in src and "raise" in src, "取消必须上抛，别吞"
+
+
+def test_claim_conflict_check_self_heals_stale_row():
+    """认领冲突检查自愈：节点无认领则删陈旧行继续，节点仍持认领才 409。"""
+    import inspect
+
+    from user_platform import routes_builtin_tools
+
+    src = inspect.getsource(routes_builtin_tools.claim_ios_device)
+    assert "_ios_row_is_stale" in src, "冲突检查应核对节点侧是否真持有认领"
+    # 陈旧则删行继续（不是无条件 409）。
+    assert "delete_resource" in src, "陈旧行应删掉让本次认领继续"
+    # 仍持认领时保持 409。
+    assert "已被认领" in src
+
+
+def test_ios_row_is_stale_is_conservative_when_node_unreachable():
+    """节点不可达时 _ios_row_is_stale 返回 False（保守，不误删好行）。"""
+    import inspect
+
+    from user_platform import routes_builtin_tools
+
+    src = inspect.getsource(routes_builtin_tools._ios_row_is_stale)
+    assert "NodeServerUnavailable" in src and "RPCError" in src
+    # 节点不可达分支返回 False。
+    assert "return False" in src
+
+
+
+

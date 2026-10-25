@@ -151,8 +151,56 @@ publish_snapshot() {
   echo "$new"
 }
 
-# ── 第 0 步：预检 + 自愈 ──────────────────────────────────────────────────
+# _build_server_bundle：打服务端升级包并上传到主仓 Release。
+#
+# 为什么要自己打：GitHub 的 tag 源码包不含子模块内容（.gitmodules 里的 gitlink
+# 在 archive 里是空目录），部署机解压后 node_server/ 与 user-frontend/ 是空的，
+# docker build 必失败。所以要打一个自包含包：
+#   主仓入库文件（含 VERSION） + node_server 入库文件 + user-frontend 入库文件（含 dist）
+#
+# 内容一律取「本次发布的公开快照」（$new / ${PUB_SHA[$p]}），不取 HEAD 工作区：
+# 快照才是真正推上 GitHub 的那份，且 git archive 只含入库文件（user-frontend
+# 工作区 1.1G 的 node_modules 天然被排除）。
+#
+# 上传失败不中止发布（快照与 tag 已就位，包可事后补传），只打警告。
+_build_server_bundle() {
+  local main_sha="$1"
+  local bundle="ai-lubricant-${RELEASE_TAG}.tar.gz"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' RETURN
+  local stage="$tmpdir/ai-lubricant"
+  mkdir -p "$stage"
 
+  # 主仓快照（公开快照 SHA，不是 HEAD 工作区——快照才是推上 GitHub 的那份）
+  git -C . archive "$main_sha" | tar -x -C "$stage" || {
+    echo "✗ 主仓打包失败" >&2; return 1; }
+  # 两个必需子模块的快照（公开 SHA）：archive 出来是目录内容，直接铺到对应路径
+  for p in node_server user-frontend; do
+    rm -rf "$stage/$p"
+    mkdir -p "$stage/$p"
+    git -C "$p" archive "${PUB_SHA[$p]}" | tar -x -C "$stage/$p" || {
+      echo "✗ 子模块 $p 打包失败" >&2; return 1; }
+  done
+
+  # VERSION 文件：部署机/容器据此回答「当前运行版本」（比 env 可靠，不会被忘传）
+  printf '%s\n' "$RELEASE_TAG" > "$stage/VERSION"
+
+  ( cd "$tmpdir" && tar -czf "$bundle" ai-lubricant ) || {
+    echo "✗ 压缩失败" >&2; return 1; }
+  local size; size="$(du -h "$tmpdir/$bundle" | cut -f1)"
+  echo "  · 包已生成：$bundle（$size）"
+
+  # 上传到主仓 Release（复用市场侧的 GitHub 能力，token 同源）
+  python3 "$(dirname "$0")/publish_server_bundle.py" \
+    --bundle "$tmpdir/$bundle" \
+    --tag "$RELEASE_TAG" \
+    --owner "$(echo "$GH_BASE" | sed -E 's#.*/([^/]+)$#\1#')" \
+    --repo "$MAIN_REPO" \
+    --notes "服务端升级包 ${RELEASE_TAG}（自包含：主仓 + node_server + user-frontend）" \
+    || { echo "⚠ Release 上传失败（快照与 tag 已就位，可事后补传）" >&2; return 0; }
+}
+
+# ── 第 0 步：预检 + 自愈 ──────────────────────────────────────────────────
 ensure_proxy
 
 # 老脚本残留自愈：子仓/主仓当前分支若是 public-snapshot（上次发布崩在切分支时留下），
@@ -290,6 +338,22 @@ tree="$(GIT_INDEX_FILE="$idx" git write-tree)"
 rm -f "$idx"; trap - EXIT
 new="$(publish_snapshot . "$parent" "$tree" "release snapshot from master @ $(git rev-parse --short master)")"
 echo "  [主仓] 快照 $(git rev-parse --short "$new")（$(diff_summary . "$parent" "$new")）"
+
+# ── 第 4 步：打服务端升级包并上传 Release ─────────────────────────────────
+# 部署机升级要的是「一个能直接解压构建的自包含包」，而 GitHub 的 tag 源码包
+# 不含子模块内容（gitlink 是空目录）——所以必须自己打：主仓入库文件 +
+# node_server + user-frontend 两个子模块的入库文件（.dockerignore 排除了
+# nodes/mobile/device-control，镜像不需要）。
+#
+# 用 git archive 而不是 tar 目录：user-frontend 工作区有 1.1G（含 node_modules），
+# 但入库的只有源码 + dist（15M）。git archive 只取入库文件，天然干净。
+#
+# 产物：ai-lubricant-<tag>.tar.gz（约 20M），上传到主仓 Release，供部署机下载。
+if [ "$NO_TAG" != "1" ]; then
+  echo ""
+  echo "=== 4/4 打服务端升级包 → Release ==="
+  _build_server_bundle "$new"
+fi
 
 # ── 报告 ──────────────────────────────────────────────────────────────────
 

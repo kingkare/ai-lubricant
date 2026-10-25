@@ -35,14 +35,17 @@ _TIMEOUT = 30
 def _headers(session: dict[str, Any], anisette_headers: dict[str, str]) -> dict[str, str]:
     # isideload DeveloperSession::get_headers：anisette 三头 + GS token + 身份 id，
     # 叠在 GrandSlam base_headers 上（plist Accept + Client-Info + Xcode 头）。
-    # 远程 v3 anisette 不返回 X-Mme-Client-Info，取空会 404——落 isideload 固定值。
+    # X-Mme-Client-Info 用 Windows 身份（见 gsa.CLIENT_INFO_WINDOWS 注释）——
+    # Apple 自 2026-10-12 拒 Mac+Xcode 身份的请求（-80045）。开发者服务用与
+    # 登录同一个 Windows 身份，同 session 不换身份。
+    from .gsa import CLIENT_INFO_WINDOWS
     headers = {
         "Content-Type": "text/x-xml-plist",
         "User-Agent": "akd/1.0 CFNetwork/808.1.4",
         "Accept": "text/x-xml-plist",
         "Accept-Language": "en-us",
         "X-Mme-Client-Info": anisette_headers.get("X-Mme-Client-Info")
-        or "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+        or CLIENT_INFO_WINDOWS,
         "X-Apple-App-Info": _APP_INFO,
         "X-Xcode-Version": "27.0 (27A5218g)",
         "X-Apple-I-Identity-Id": session["adsid"],

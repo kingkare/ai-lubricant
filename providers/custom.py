@@ -28,6 +28,9 @@ from message_utils import (
     normalize_anthropic_sse_event,
     coerce_anthropic_system,
     strip_assistant_reasoning_content,
+    repack_tool_result_blocks,
+    cleanup_orphan_tool_calls,
+    split_oversized_messages,
 )
 from providers.base import BaseProvider, make_insecure_connector, format_aiohttp_error, IncompleteStreamError, EmptyNonStreamResponseError, is_degraded_function_error, normalize_upstream_error_message
 from tool_utils import parse_tool_calls_from_content
@@ -181,6 +184,15 @@ def _account_template_context(kwargs: dict) -> dict:
     return account
 
 
+def _upstream_error_detail(message: str, error_type: str, code: object) -> dict:
+    """上游错误的标准 ``{"error": {"message","type","code"}}`` 信封（对齐 base._openai_sse_error_exception）。
+
+    type 取上游原值（缺失时 "upstream_error"），code 保留上游业务码原文（如 "40201"）——
+    状态码塌缩成 400 后，业务码靠这里透传给客户端做诊断，不再被丢弃。
+    """
+    return {"error": {"message": message, "type": error_type, "code": str(code)}}
+
+
 class CustomProvider(BaseProvider):
     """User-defined compatible provider."""
 
@@ -232,9 +244,11 @@ class CustomProvider(BaseProvider):
             "User-Agent": "Codex Desktop/0.137.0-alpha.4 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.602.40724)",
             "x-codex-beta-features": "terminal_resize_reflow",
         },
+        # opencode 的会话头（x-session-affinity / x-session-id）由 _opencode_headers
+        # 每请求现场生成——真实客户端这两者恒为同一会话 ID，且随会话变化；写死常量会
+        # 留下「全站同一 session」的可判别指纹。
         "opencode": {
-            "User-Agent": "opencode/1.16.2 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
-            "x-session-affinity": "ses_15d3045e0ffeMENYCSJKGFbI37",
+            "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
         },
         "cursor": {
             "User-Agent": "Cursor/0.42.3 (darwin arm64)",
@@ -707,6 +721,13 @@ class CustomProvider(BaseProvider):
             return False
 
     async def _fetch_models_from_api(self) -> list[dict]:
+        """拉上游模型列表。
+
+        请求与取值在同一个 try 里：任何一步抛异常（网络/超时/非 200/非 JSON/格式不符）
+        都算本次拉取不可信——写 _last_fetch_models_error 并返回空列表，调用方据此跳过
+        本轮对账。除此之外一律如实返回：上游正常返回空列表就是「上游没有模型」，
+        由调用方按正常结果处理，不在这里做任何特殊判断。
+        """
         if not self.base_url:
             self._last_fetch_models_error = "base_url 未配置"
             return []
@@ -717,23 +738,25 @@ class CustomProvider(BaseProvider):
                 async with session.get(models_url, headers=self._headers("gemini", apply_preset=False) if self.protocol == "gemini" else self._headers(), proxy=self.proxy) as response:
                     text = await response.text()
                     if response.status != 200:
-                        err = f"GET {models_url} → HTTP {response.status}"
-                        self._last_fetch_models_error = err
+                        self._last_fetch_models_error = f"GET {models_url} → HTTP {response.status}"
                         logger.warning(
                             f"[Custom] fetch models failed: provider={self.PROVIDER_NAME} "
-                            f"username={self.username} {err}"
+                            f"username={self.username} {self._last_fetch_models_error}"
                         )
                         return []
-                    try:
-                        data = json.loads(text)
-                    except (json.JSONDecodeError, ValueError) as e:
-                        err = f"GET {models_url} 返回非 JSON: {type(e).__name__}; body_len={len(text)}"
-                        self._last_fetch_models_error = err
-                        logger.warning(
-                            f"[Custom] fetch models invalid JSON: provider={self.PROVIDER_NAME} "
-                            f"username={self.username} {err}"
-                        )
-                        return []
+                    data = json.loads(text)
+                    # 取值也在 try 内：拿不到约定的模型数组就是取值异常，抛出去与
+                    # 网络/超时同一条出口（本次不可信）。这里不做任何兜底猜测——
+                    # 兜底才会把错误信封当空列表，进而把模型表清空。
+                    if self.protocol == "gemini":
+                        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+                            raise ValueError(f"模型列表格式不符: 期望 {{\"models\": 数组}}，实际 {type(data).__name__}")
+                        models = normalize_gemini_models(data, owner=self.PROVIDER_NAME or "custom")
+                    else:
+                        raw_models = data.get("data") if isinstance(data, dict) else data
+                        if not isinstance(raw_models, list):
+                            raise ValueError(f"模型列表格式不符: 期望数组，实际 {type(raw_models).__name__}")
+                        models = self._normalize_models(raw_models)
         except Exception as e:
             err = format_aiohttp_error(e, models_url)
             self._last_fetch_models_error = err
@@ -744,10 +767,7 @@ class CustomProvider(BaseProvider):
             return []
 
         self._last_fetch_models_error = ""
-        if self.protocol == "gemini":
-            return normalize_gemini_models(data, owner=self.PROVIDER_NAME or "custom")
-        raw_models = data.get("data") if isinstance(data, dict) else data
-        return self._normalize_models(raw_models or [])
+        return models
 
     def _normalize_models(self, raw_models: list) -> list[dict]:
         models = []
@@ -787,7 +807,9 @@ class CustomProvider(BaseProvider):
             }
             return
 
-        endpoint = self._resolve_build_endpoint(self.protocol, kwargs.get("client_preset"))
+        endpoint = self._resolve_build_endpoint(
+            self.get_effective_channel_protocol(model_id, kwargs), kwargs.get("client_preset")
+        )
         if endpoint == "anthropic":
             async for chunk in self._anthropic_stream_chat(model_id, messages, **kwargs):
                 yield chunk
@@ -803,8 +825,13 @@ class CustomProvider(BaseProvider):
             return
 
         data = self._build_protocol_payload("openai", model_id, messages, upstream_stream, **kwargs)
-        self._validate_final_payload_context(model_id, data, kwargs)
+        # 出站要素（体/头/路径）先记录再校验上下文预算：预算超限在发送前抛错（请求根本
+        # 不会发出），若先校验，报错请求的供应商请求体/头/路径全部缺失，详情页无从排障。
+        # 正常路径下 send_sse_request 会用相同值重新记录，无副作用。
         await self.record_router_request_body(data, kwargs)
+        await self.record_router_request_headers(self._headers("openai", kwargs=kwargs), kwargs)
+        await self.record_router_request_path(self._chat_url(kwargs), kwargs)
+        self._validate_final_payload_context(model_id, data, kwargs)
         completed = False
         has_output = False
         pending_usage = None
@@ -984,7 +1011,9 @@ class CustomProvider(BaseProvider):
         upstream_stream = self._resolve_upstream_stream(False)
         if upstream_stream:
             return await self._collect_stream_chat_result(model_id, messages, **kwargs)
-        endpoint = self._resolve_build_endpoint(self.protocol, kwargs.get("client_preset"))
+        endpoint = self._resolve_build_endpoint(
+            self.get_effective_channel_protocol(model_id, kwargs), kwargs.get("client_preset")
+        )
         if endpoint == "anthropic":
             return await self._anthropic_non_stream_chat(model_id, messages, **kwargs)
         if endpoint == "responses":
@@ -994,12 +1023,14 @@ class CustomProvider(BaseProvider):
             return await self._gemini_non_stream_chat(model_id, messages, **kwargs)
 
         data = self._build_protocol_payload("openai", model_id, messages, upstream_stream, **kwargs)
-        self._validate_final_payload_context(model_id, data, kwargs)
+        # 出站要素（体/头/路径）先记录再校验上下文预算：预算超限在发送前抛错，
+        # 记录若在校验之后，报错请求的供应商请求信息整块缺失。
         await self.record_router_request_body(data, kwargs)
         request_headers = self._headers("openai", kwargs=kwargs)
         await self.record_router_request_headers(request_headers, kwargs)
         chat_url = self._chat_url(kwargs)
         await self.record_router_request_path(chat_url, kwargs)
+        self._validate_final_payload_context(model_id, data, kwargs)
         session = self._get_session()
         try:
             request_context = session.post(
@@ -1098,7 +1129,9 @@ class CustomProvider(BaseProvider):
         if choice.get("finish_reason") != "stop":
             return False
         message = choice.get("message") or {}
-        if message.get("content") or message.get("reasoning_content") or message.get("tool_calls"):
+        # thinking / reasoning 是真实模型输出：只带思考、正文为空的非流式响应不是空响应。
+        if (message.get("content") or message.get("reasoning_content") or message.get("reasoning")
+                or message.get("thinking") or message.get("tool_calls")):
             return False
         usage = body.get("usage")
         if not isinstance(usage, dict):
@@ -1151,10 +1184,15 @@ class CustomProvider(BaseProvider):
             data["model"] = self._upstream_model_id(model_id)
             data["stream"] = stream
             data = sanitize_anthropic_request_body(data)
+            # 原生 anthropic 消息是 content block 列表，切分器只认纯字符串 content，
+            # 故先做一次「单 block 文本 → 字符串」归一，切完再还原为 block 列表。
+            data["messages"] = self._apply_message_split_anthropic(data.get("messages"), model_id)
             data = self._apply_system_type(data, kwargs)
             return self._apply_client_preset_body(data, "anthropic", kwargs.get("client_type"), apply_defaults=False, client_preset_override=kwargs.get("client_preset"), request_kwargs=kwargs)
-        # 同协议直通：Anthropic 客户端/渠道本身就是 anthropic 时，不把 content 字符串二次转换成 block。
-        if self.protocol == "anthropic" and not (kwargs.get("_from_openai") or kwargs.get("_from_responses")):
+        # 同协议直通：本次生效的协议行就是 anthropic 时，不把 content 字符串二次转成 block。
+        # 用生效协议而非渠道级首行——多协议行渠道下首行可能是别的协议，会误走转换分支。
+        if self.get_effective_channel_protocol(model_id, kwargs) == "anthropic" \
+                and not (kwargs.get("_from_openai") or kwargs.get("_from_responses")):
             data = {
                 "model": self._upstream_model_id(model_id),
                 "messages": [],
@@ -1790,8 +1828,11 @@ class CustomProvider(BaseProvider):
 
     async def _responses_stream_chat(self, model_id: str, messages: list[dict], **kwargs):
         data = self._build_protocol_payload("responses", model_id, messages, True, **kwargs)
-        self._validate_final_payload_context(model_id, data, kwargs)
+        # 同 openai 流式：出站要素先记录，再做会抛错的上下文预算校验。
         await self.record_router_request_body(data, kwargs)
+        await self.record_router_request_headers(self._headers("responses", kwargs=kwargs), kwargs)
+        await self.record_router_request_path(self._chat_url(kwargs), kwargs)
+        self._validate_final_payload_context(model_id, data, kwargs)
         started = False
         cumulative_usage = {}
         tool_index_map = {}
@@ -1954,12 +1995,13 @@ class CustomProvider(BaseProvider):
 
     async def _responses_non_stream_chat(self, model_id: str, messages: list[dict], **kwargs) -> dict:
         data = self._build_protocol_payload("responses", model_id, messages, False, **kwargs)
-        self._validate_final_payload_context(model_id, data, kwargs)
+        # 同 openai 非流式：出站要素先记录，再做会抛错的上下文预算校验。
         await self.record_router_request_body(data, kwargs)
         request_headers = self._headers("responses", kwargs=kwargs)
         await self.record_router_request_headers(request_headers, kwargs)
         chat_url = self._chat_url(kwargs)
         await self.record_router_request_path(chat_url, kwargs)
+        self._validate_final_payload_context(model_id, data, kwargs)
         session = self._get_session()
         async with session.post(
             chat_url,
@@ -2230,6 +2272,28 @@ class CustomProvider(BaseProvider):
         payload = self._apply_protocol_defaults(payload, endpoint)
         return self._apply_client_body_defaults(payload, endpoint, client_type, override, request_kwargs)
 
+    def _body_marker_preset_explicit(self, override: str | None, request_kwargs: dict | None) -> bool:
+        """本次出站 body 是否处于「显式客户端模拟」。
+
+        身份首句（marker）只在显式模拟时注入。未配置 client_preset 时
+        `_effective_client_preset` 按协议兜到默认 preset（anthropic→claude-code、
+        responses→codex-cli…），那只是伪装默认值（metadata/thinking 等）的取数依据，
+        不代表要替客户端冒充那个身份——把兜底 preset 的身份句塞进 system/instructions，
+        会让普通流量在非模拟渠道上凭空多出 Claude Code/Codex 首句。需要伪装就在协议行
+        （或渠道）显式配 client_preset。
+
+        判定口径与 header 层（`_headers`）对齐：per-call override > 本次生效协议行 >
+        渠道派生视图（第一条 enabled 行）。
+        """
+        eff = override
+        if not eff:
+            active = self._active_chat_protocol(request_kwargs)
+            if isinstance(active, dict) and active.get("client_preset"):
+                eff = str(active.get("client_preset")).lower()
+        if not eff:
+            eff = self.client_preset
+        return bool(eff) and str(eff).lower() != "none"
+
     def _apply_client_preset_body(self, payload: dict, endpoint: str, client_type: str | None = None, apply_defaults: bool = True, client_preset_override: str | None = None, request_kwargs: dict | None = None) -> dict:
         """应用客户端 preset：headers + system message 标记注入。
 
@@ -2241,8 +2305,13 @@ class CustomProvider(BaseProvider):
             return payload
         preset_name = self._effective_client_preset(endpoint, client_preset_override)
         # marker 可能依赖出站 model（WorkBuddy 声明句），故在 payload 定型后按其 model 生成。
-        marker = self._client_marker(preset_name, payload.get("model"))
-        stale_prefix = self._client_marker_prefix(preset_name)
+        # 仅在显式模拟时注入：非模拟（client_preset=none / 协议默认兜底）不追加身份首句。
+        if self._body_marker_preset_explicit(client_preset_override, request_kwargs):
+            marker = self._client_marker(preset_name, payload.get("model"))
+            stale_prefix = self._client_marker_prefix(preset_name)
+        else:
+            marker = ""
+            stale_prefix = ""
         if apply_defaults:
             payload = self._apply_protocol_and_client_defaults(payload, endpoint, client_type, client_preset_override, request_kwargs)
         if endpoint == "responses" and "tools" in payload:
@@ -2448,6 +2517,21 @@ class CustomProvider(BaseProvider):
             return cp
         return None
 
+    def resolve_chat_protocol_row(self, model_id: str | None = None,
+                                  kwargs: dict | None = None) -> dict | None:
+        """本次请求生效的对话协议行（唯一真相源，覆盖 base 的 None 占位）。
+
+        优先级：路由层钉住的行（`_endpoint_config`，已决定 path/鉴权/模型绑定）>
+        按模型重选。**不再回退渠道级首行**——首行只代表它自己那条协议，
+        多协议行渠道下用它判定线格式会把「本次选中 chat 行」误当成 anthropic。
+
+        没有协议行（旧配置 / 无协议行渠道）时返回 None，调用方回退渠道级 protocol。
+        """
+        row = self._active_chat_protocol(kwargs)
+        if isinstance(row, dict) and row.get("protocol"):
+            return row
+        return self._select_chat_protocol(model_id)
+
     def get_chat_protocol_candidates(self, model_id: str | None = None,
                                      request_protocol: str | None = None) -> list[dict]:
         """供 ModelClientPool 收集候选。勾选模型优先 → 同协议优先（与 Channel 一致）。"""
@@ -2483,6 +2567,98 @@ class CustomProvider(BaseProvider):
             return self._build_gemini_payload(model_id, messages, **kwargs)
         raise ValueError(f"unsupported protocol endpoint: {endpoint}")
 
+    def _message_split_config(self) -> tuple[bool, int]:
+        """解析生效的切分配置（渠道级覆盖全局）。返回 (启用, 单条 token 上限)。"""
+        enabled, max_tokens = Config.message_split_settings()
+        channel_enabled = self._channel_get("message_split_enabled", None)
+        if channel_enabled is not None:
+            enabled = bool(channel_enabled)
+        channel_max = self._channel_get("message_split_max_tokens", None)
+        if channel_max is not None:
+            try:
+                channel_max = int(channel_max)
+                if channel_max > 0:
+                    max_tokens = channel_max
+            except (TypeError, ValueError):
+                pass
+        return enabled, max_tokens
+
+    def _apply_message_split(self, messages: list[dict], model_id: str) -> list[dict]:
+        """按配置把超长单条消息切成多条连续同角色消息（默认关，零改动返回原列表）。
+
+        配置优先级：渠道级 message_split_* > 全局 message_split.*。
+        渠道级可只覆盖其中一项（如只改阈值、沿用全局的启用状态）。
+        """
+        enabled, max_tokens = self._message_split_config()
+        if not enabled:
+            return messages
+        split = split_oversized_messages(messages, max_tokens, model_id)
+        if split is not messages:
+            logger.info(
+                f"[message-split] provider={self.PROVIDER_NAME} model={model_id} "
+                f"max_tokens={max_tokens} messages {len(messages)} -> {len(split)}"
+            )
+        return split
+
+    def _apply_message_split_anthropic(self, messages, model_id: str):
+        """anthropic 原生消息（content 为 block 列表）的超长单条切分。
+
+        切分器只处理纯字符串 content，故把「单个 text block」的消息降级成字符串
+        参与切分，切完再还原成 block 列表。含多个 block / tool_use / tool_result /
+        图片的消息原样跳过（与 openai 侧同一口径：配对与多模态不可拆）。
+        """
+        if not isinstance(messages, list) or not messages:
+            return messages
+        enabled, max_tokens = self._message_split_config()
+        if not enabled:
+            return messages
+
+        # 降级：单 text block 且无其它字段 → content 字符串（其余保持 block 形态）。
+        normalized: list[dict] = []
+        flattenable: set[int] = set()
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                normalized.append(msg)
+                continue
+            content = msg.get("content")
+            if (
+                msg.get("role") in ("user", "assistant")
+                and isinstance(content, list)
+                and len(content) == 1
+                and isinstance(content[0], dict)
+                and content[0].get("type") == "text"
+                and isinstance(content[0].get("text"), str)
+                and set(content[0].keys()) <= {"type", "text"}
+            ):
+                flat = dict(msg)
+                flat["content"] = content[0]["text"]
+                normalized.append(flat)
+                flattenable.add(idx)
+            else:
+                normalized.append(msg)
+
+        if not flattenable:
+            return messages
+
+        split = split_oversized_messages(normalized, max_tokens, model_id)
+        if split is normalized:
+            return messages
+
+        # 还原：仍为字符串的 content 包回 [{"type":"text","text":...}]。
+        out: list[dict] = []
+        for msg in split:
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                restored = dict(msg)
+                restored["content"] = [{"type": "text", "text": msg["content"]}]
+                out.append(restored)
+            else:
+                out.append(msg)
+        logger.info(
+            f"[message-split] provider={self.PROVIDER_NAME} model={model_id} "
+            f"max_tokens={max_tokens} anthropic messages {len(messages)} -> {len(out)}"
+        )
+        return out
+
     def _build_openai_payload(self, model_id: str, messages: list[dict], stream: bool, **kwargs) -> dict:
         payload = {
             "model": self._upstream_model_id(model_id),
@@ -2492,6 +2668,16 @@ class CustomProvider(BaseProvider):
         # openai 协议行 send_reasoning_content=false：不把 assistant.reasoning_content 透传给上游。
         # 在 _copy_present 之前剥离，确保后续 codex-openai 的 input 转换也用剥离后的消息。
         payload["messages"] = self._apply_reasoning_passthrough(messages, kwargs)
+        # tool 配对安全网（移植自 workbuddy2api tool_pairing.go）：先重排再清理。残缺配对的
+        # tool_calls/tool 结果会让上游对之后每条消息都回 400 code=11148 并顶死整条会话，
+        # 而坏历史来自客户端且会被反复重放——网关是最后一道防线。无工具流量时两步都是
+        # 零改动返回原列表，非工具请求零开销。
+        payload["messages"] = cleanup_orphan_tool_calls(
+            repack_tool_result_blocks(payload["messages"])
+        )
+        # 超长单条消息切分（部分上游对单条另设 token 上限，见 split_oversized_messages）。
+        # 放在 tool 配对修复之后：切分只动纯文本消息，不影响已修复的配对关系。
+        payload["messages"] = self._apply_message_split(payload["messages"], model_id)
         if kwargs.get("_from_anthropic"):
             payload_keys = self.OPENAI_FROM_ANTHROPIC_PAYLOAD_KEYS
         elif kwargs.get("_from_responses"):
@@ -2620,6 +2806,63 @@ class CustomProvider(BaseProvider):
         if tool_choice in ("auto", "none"):
             return {"type": tool_choice}
         return tool_choice
+
+    # opencode 的 ID 字母表与随机段长度（抓包/二进制实测）：12 位 hex 时间戳段
+    # + 14 位 base62 随机段，总长 26。
+    _OPENCODE_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    _OPENCODE_ID_RAND_LEN = 14
+    # 同一毫秒内的计数器（真实客户端按毫秒分槽自增，避免同毫秒 ID 撞车）。
+    _OPENCODE_ID_LAST_MS = 0
+    _OPENCODE_ID_COUNTER = 0
+
+    @classmethod
+    def _opencode_identifier(cls, prefix: str, *, descending: bool, now_ms: int | None = None) -> str:
+        """按真实 opencode 算法生成 ``ses_`` / ``msg_`` 形态的 ID。
+
+        二进制实测算法（1.16/1.18 一致）::
+
+            v = Date.now() * 4096 + counter        # counter 每毫秒归零自增
+            hex12 = 48bit(v 或 ~v) 的 12 位十六进制
+            id = prefix + hex12 + 14 位 base62 随机
+
+        ``ses_`` 走 ``~v``（降序，便于按时间倒排），``msg_`` 走 ``v``（升序）。
+        拼 uuid4/固定常量都会留下可判别差异：前者时间戳段是随机的，后者全站同值。
+        """
+        ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        if ms != cls._OPENCODE_ID_LAST_MS:
+            cls._OPENCODE_ID_LAST_MS = ms
+            cls._OPENCODE_ID_COUNTER = 0
+        cls._OPENCODE_ID_COUNTER += 1
+        value = ms * 0x1000 + cls._OPENCODE_ID_COUNTER
+        field = (~value) & ((1 << 48) - 1) if descending else value & ((1 << 48) - 1)
+        hex12 = field.to_bytes(6, "big").hex()
+        rand = "".join(
+            secrets.choice(cls._OPENCODE_ID_ALPHABET) for _ in range(cls._OPENCODE_ID_RAND_LEN)
+        )
+        return f"{prefix}_{hex12}{rand}"
+
+    @classmethod
+    def _opencode_headers(cls, headers: dict, kwargs: dict | None = None) -> dict:
+        """为 opencode 伪装请求现场生成会话头。
+
+        真实客户端对「provider 名不以 opencode 开头」的上游（即第三方中转，也是本
+        平台渠道的常态）发的是 ``x-session-affinity`` + ``x-session-id``，两者恒为
+        同一会话 ID（实测同值）。provider 名以 opencode 开头的自家网关走另一套
+        ``x-opencode-*`` 头，本平台渠道不指向那里，故不模拟。
+
+        入站透传了 ``client_session_id``（同协议直通场景）时沿用入站值，否则现场生成
+        ——写死常量会让全站流量共用同一 session，是可直接判别的伪装特征。
+        头名用全小写：实测真客户端这两个头在线上就是小写（不同于 Authorization /
+        User-Agent 的原始大小写），按线上字节对齐。
+        """
+        kwargs = kwargs or {}
+        session_id = str(kwargs.get("client_session_id") or "").strip()
+        if not session_id:
+            session_id = cls._opencode_identifier("ses", descending=True)
+        next_headers = dict(headers)
+        next_headers["x-session-affinity"] = session_id
+        next_headers["x-session-id"] = session_id
+        return next_headers
 
     @staticmethod
     def _workbuddy_headers(headers: dict, kwargs: dict | None = None) -> dict:
@@ -2883,6 +3126,8 @@ class CustomProvider(BaseProvider):
         preset = dict(self.CLIENT_PRESETS.get(preset_name) or {})
         if preset_name in self.CODEX_PRESETS:
             preset = self._codex_preset_headers(preset, preset_name, kwargs)
+        elif preset_name in ("opencode", "opencode-cli"):
+            preset = self._opencode_headers(preset, kwargs)
         elif preset_name == "workbuddy":
             preset = self._workbuddy_headers(preset, kwargs)
             # WorkBuddy 的 OpenAI 请求同时携带 Bearer 与同源 x-api-key；
@@ -2909,12 +3154,12 @@ class CustomProvider(BaseProvider):
         # x-client-request-id）已由 _codex_headers 按同一 identity 统一注入，这里不再分别
         # 覆盖——否则会把 thread/window/turn 留在旧值而只改 session-id，造成跨字段不一致
         # （真实 codex 客户端这几者同源，对不上即被判别为伪装）。
+        # opencode 的会话头已由 _opencode_headers 统一注入（x-session-affinity 与
+        # x-session-id 必须同值），这里不再单独覆盖，避免只改一个而让两者不一致。
         if client_session_id and preset_name not in self.CODEX_PRESETS:
             if preset_name == "claude-code":
                 headers["x-claude-code-session-id"] = str(client_session_id)
-            elif preset_name in ("opencode", "opencode-cli"):
-                headers["x-session-affinity"] = str(client_session_id)
-            else:
+            elif preset_name not in ("opencode", "opencode-cli"):
                 headers.setdefault("x-session-id", str(client_session_id))
         if client_request_id and preset_name not in self.CODEX_PRESETS:
             headers["x-client-request-id"] = str(client_request_id)
@@ -2950,7 +3195,8 @@ class CustomProvider(BaseProvider):
 
     def _anthropic_headers(self, data: dict, kwargs: dict | None = None, apply_preset: bool = True) -> dict:
         headers = self._headers("anthropic", apply_preset=apply_preset, kwargs=kwargs)
-        if self.protocol != "anthropic":
+        # 本次生效协议行决定是否补 anthropic-beta，不读渠道级首行。
+        if self.get_effective_channel_protocol(None, kwargs) != "anthropic":
             return headers
         beta = self._anthropic_beta_for_payload(data)
         if beta:
@@ -3104,27 +3350,71 @@ class CustomProvider(BaseProvider):
         return value
 
     @staticmethod
-    def _raise_upstream_error(err, default_status: int = 502):
-        """根据上游 error 体抛出 HTTPException。"""
+    def _upstream_error_status(code, default_status: int = 400) -> int:
+        """把上游 error 体的 code 归类成网关状态码（`_raise_upstream_error` 与裸 JSON 尾帧同源口径）。
+
+        - code 是合法 HTTP 状态（400~599）→ 原样返回（供应商做了映射，尊重）；
+        - 否则（越界业务码 40201/qoder 112、字符串码 "server_error"、或压根没给 code）
+          → **统一 400**（供应商没做映射）。
+
+        为什么是 400 而不是 502：502 命中渠道冻结规则「502 → 冻结账号到今天」，一个
+        「免费额度已用完」把整号停摆一整天。400 不命中任何冻结规则（`apply_freeze_policy`
+        只认 403/429/exception）→ 不冻号；且非参数类文案判不了 non_retryable → `classify_failure`
+        落 retryable → 换候选；候选耗尽后由 `_terminal_429_from_last_error` 统一收口 429。
+        上游若真是瞬时故障会回合法 5xx（走上面原样返回那条），仍按上游异常重试。
+
+        两处调用点共用本函数，避免「状态码分类」在 SSE 嵌套帧与裸 JSON 尾帧之间口径漂移。
+        """
+        try:
+            status = int(code) if code is not None else 0
+        except (TypeError, ValueError):
+            return default_status
+        if 400 <= status < 600:
+            return status
+        return default_status
+
+    @staticmethod
+    def _raise_upstream_error(err, default_status: int = 400):
+        """根据上游 error 体抛出 HTTPException（detail 归一成标准 ``{"error": {...}}`` 信封）。
+
+        状态码交 `_upstream_error_status`：供应商映射了（合法 HTTP 码）就尊重，没映射统一 400。
+        `default_status` 仅在 code 不可用时兜底——唯一显式传真实 HTTP 状态的调用点是媒体生成
+        的 `self._raise_upstream_error(data, response.status)`，那里上游确给了 4xx/5xx。
+        """
         if isinstance(err, dict):
-            code = err.get("code") or err.get("status") or err.get("status_code")
-            code_text = str(code or "").lower()
-            try:
-                status = int(code) if code is not None else 0
-            except (TypeError, ValueError):
-                status = 0
-            if not (400 <= status < 600):
-                if "rate_limit" in code_text or "cooldown" in code_text:
-                    status = 429
-                else:
-                    status = default_status
-            detail = err.get("message") or json.dumps(err, ensure_ascii=False)
+            # spec 常把整包 body（{"type":"error","error":{...}}）传进来，向下钻一层再取字段。
+            inner = err.get("error")
+            source = inner if isinstance(inner, dict) else err
+            code = source.get("code") or source.get("status") or source.get("status_code")
+            message = str(source.get("message") or "")
+            err_type = str(source.get("type") or "") or "upstream_error"
+            if is_degraded_function_error(message):
+                raise HTTPException(
+                    status_code=503,
+                    detail=_upstream_error_detail(
+                        normalize_upstream_error_message(message),
+                        "server_error",
+                        "upstream_function_degraded",
+                    ),
+                )
+            status = CustomProvider._upstream_error_status(code, default_status)
+            detail = _upstream_error_detail(
+                message or f"HTTP {status}", err_type,
+                str(code) if code is not None else "upstream_error",
+            )
         else:
-            status = default_status
-            detail = str(err)
-        if is_degraded_function_error(detail):
-            status = 503
-            detail = normalize_upstream_error_message(detail)
+            text = str(err)
+            if is_degraded_function_error(text):
+                raise HTTPException(
+                    status_code=503,
+                    detail=_upstream_error_detail(
+                        normalize_upstream_error_message(text),
+                        "server_error",
+                        "upstream_function_degraded",
+                    ),
+                )
+            detail = _upstream_error_detail(text, "upstream_error", "upstream_error")
+            status = CustomProvider._upstream_error_status(None, default_status)
         raise HTTPException(status_code=status, detail=detail)
 
     @staticmethod
@@ -3163,7 +3453,16 @@ class CustomProvider(BaseProvider):
         if extracted is None:
             return
         message, code = extracted
-        err = {"message": message} if code is None else {"message": message, "code": code}
+        # 保留上游 type（信封 detail 里要透传，丢失会让客户端拿不到原始错误类型）。
+        err_type = None
+        err_obj = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err_obj, dict):
+            err_type = err_obj.get("type")
+        err = {"message": message}
+        if code is not None:
+            err["code"] = code
+        if err_type is not None:
+            err["type"] = err_type
         cls._raise_upstream_error(err)
 
     @classmethod
@@ -3208,7 +3507,15 @@ class CustomProvider(BaseProvider):
         except (json.JSONDecodeError, ValueError):
             return
         if isinstance(obj, dict) and (obj.get("error") or obj.get("errors")):
-            raise HTTPException(status_code=502, detail=obj)
+            # 状态码与 `_raise_upstream_error` 同源（共用 `_upstream_error_status`）：
+            # 供应商映射了就尊重，没映射统一 400（不冻结、换候选）；detail 仍是完整错误体。
+            extracted = CustomProvider._extract_upstream_error(obj)
+            if extracted is not None:
+                _message, code = extracted
+                status = CustomProvider._upstream_error_status(code, 400)
+            else:
+                status = 400
+            raise HTTPException(status_code=status, detail=obj)
 
     @property
     def invitation_interval(self):

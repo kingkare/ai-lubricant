@@ -11,14 +11,13 @@
 """
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from agent.mcp_client import MCPManager
 
 
 class CdpClient:
-    """cdp-bridge MCP 的方法式客户端。一个实例持一个 tab 租约 holder。"""
+    """cdp-bridge MCP 的方法式客户端。"""
 
     SERVICE = "cdp-bridge"
 
@@ -26,13 +25,10 @@ class CdpClient:
         self,
         token: str = "",
         *,
-        holder: str = "",
         session_id: str = "",
     ) -> None:
-        # 复用既有 MCPManager：token 即 MCP 服务 token；holder 默认与 agent 的
-        # ``agent:{uuid}`` 区分开，让 SDK 调用不与 agent 的 tab 租约互相踩。
+        # 复用既有 MCPManager：token 即 MCP 服务 token。
         self._mgr = MCPManager(service_tokens={self.SERVICE: token or ""})
-        self._mgr.lease_id = holder or f"cdp_sdk:{uuid.uuid4().hex[:16]}"
         if session_id:
             self._mgr.cdp_session_id = str(session_id)
 
@@ -150,21 +146,21 @@ class CdpClient:
 
     async def network_start(self, *, tab_id: str = "", url_pattern: str = "") -> list[dict]:
         """开始抓取某标签页的网络请求（附加调试器并保持）。"""
-        return await self.call("browser_network_start", {
+        return await self.call("browser_watch_network", {
             "tab_id": tab_id,
             "url_pattern": url_pattern,
         })
 
     async def network_get(self, *, tab_id: str = "") -> list[dict]:
         """读取目前已抓取的网络请求（不停止抓取）。"""
-        return await self.call("browser_network_get", {"tab_id": tab_id})
+        return await self.call("browser_read_network", {"tab_id": tab_id})
 
     async def network_stop(self, *, tab_id: str = "") -> list[dict]:
         """停止抓取网络请求，分离调试器，返回全部已抓请求。"""
-        return await self.call("browser_network_stop", {"tab_id": tab_id})
+        return await self.call("browser_unwatch_network", {"tab_id": tab_id})
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
 
     async def close(self) -> None:
-        """释放本实例 holder 持有的 CDP tab 租约（= MCPManager.close 对 cdp 的处理）。"""
+        """关闭底层 MCPManager（终止其启动的子进程）。"""
         await self._mgr.close()

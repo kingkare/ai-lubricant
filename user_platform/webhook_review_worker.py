@@ -370,8 +370,8 @@ async def execute_claude_delegate(
         "sub_type": "pr_review",
         "mode": "default",
         "task_role": "manual",
-        # The review already holds a ReviewNodeLease slot, so it must not take the
-        # exclusive TaskNodeBinding (that would cap a node at one review).
+        # The review already holds a ReviewNodeLease slot, so it must not take
+        # an exclusive node binding (that would cap a node at one review).
         "_review_lease_id": lease_id,
         "extra": {
             "project_id": str(project.id),

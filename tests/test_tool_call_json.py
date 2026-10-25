@@ -426,3 +426,64 @@ def test_prompt_forbids_stating_intent_without_calling():
     assert "立刻发出调用" in prompt or "没有中间状态" in prompt
     # 禁止把调用推迟到下一轮
     assert "下一轮" in prompt
+
+
+# ---- GLM-4 chat-template 形态：训练惯性协议词，实测弱模型会吐 ----
+
+_GLM_BLOCK_OPEN = "<" + "tool_calls>"
+_GLM_BLOCK_CLOSE = "</" + "tool_calls>"
+_GLM_INVOKE_OPEN = "<" + "invoke name="
+
+
+def _glm(payload: str) -> str:
+    """包一个 GLM-4 ``<tool_calls><invoke>`` 块（payload 为 invoke 内容）。"""
+    return _GLM_BLOCK_OPEN + payload + _GLM_BLOCK_CLOSE
+
+
+def _glm_param(name: str, value: str) -> str:
+    return f'<parameter name="{name}">{value}</parameter>'
+
+
+def test_glm_tool_calls_parsed():
+    """GLM-4 形态被正确解析为 tool_call，XML 块从正文剥除。"""
+    inner = '<invoke name="Grep">' + _glm_param("path", "main.py") + _glm_param("-n", "true") + '</invoke>'
+    content = "好的，我来查。\n" + _glm(inner)
+    cleaned, tcs = parse_tool_calls_from_content(content)
+    assert _names(tcs) == ["Grep"]
+    args = json.loads(tcs[0]["function"]["arguments"])
+    assert args["path"] == "main.py"
+    assert args["-n"] is True
+    assert "tool_calls" not in cleaned
+    assert "invoke" not in cleaned
+    assert "好的，我来查" in cleaned
+
+
+def test_glm_multiple_invokes_in_one_block():
+    """单个 <tool_calls> 块内的多个 invoke 都被解析。"""
+    inv1 = '<invoke name="Glob">' + _glm_param("pattern", "**/*.py") + '</invoke>'
+    inv2 = '<invoke name="Read">' + _glm_param("path", "a.py") + '</invoke>'
+    content = _glm(inv1 + "\n" + inv2)
+    _, tcs = parse_tool_calls_from_content(content)
+    assert _names(tcs) == ["Glob", "Read"]
+
+
+def test_glm_streaming_extract():
+    """流式路径下，find_tool_call_start 和 extract_complete_tool_calls 正确切出 GLM 块。"""
+    inner = '<invoke name="Read">' + _glm_param("path", "main.py") + '</invoke>'
+    content = "前置文本。" + _glm(inner) + "尾部。"
+    assert find_tool_call_start(content) == len("前置文本。")
+    prefix, blocks, rest = extract_complete_tool_calls(content)
+    assert prefix == "前置文本。"
+    assert len(blocks) == 1
+    assert rest == "尾部。"
+    _, tcs = parse_tool_calls_from_content(blocks[0])
+    assert _names(tcs) == ["Read"]
+
+
+def test_glm_incomplete_block_held_in_buffer():
+    """未闭合的 GLM 块留在 buffer 中，不提前下发。"""
+    content = "前置。" + _GLM_BLOCK_OPEN + '<invoke name="Read">'
+    prefix, blocks, rest = extract_complete_tool_calls(content)
+    assert prefix == "前置。"
+    assert blocks == []
+    assert rest.startswith("<tool_calls")

@@ -415,8 +415,15 @@ def test_sync_once_runs_full_without_rate_limit(monkeypatch):
 
 
 # ── 探针复用（零网络）与预算护栏 ─────────────────────────────────────────────
-def _hint(*, error="", fetched_at="2026-09-07T00:00:00+00:00", updated="2026-01-01T00:00:00+00:00"):
-    return {"probe_error": error, "fetched_at": fetched_at, "upstream_updated_at": updated,
+def _fresh_ts() -> str:
+    """默认 fetched_at 取「现在」——别硬编码日期：复用窗口 7 天，硬编码必然日期腐烂
+    （2026-09-07 的默认值在 09-14 后就让所有复用断言全红）。"""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _hint(*, error="", fetched_at=None, updated="2026-01-01T00:00:00+00:00"):
+    return {"probe_error": error, "fetched_at": fetched_at or _fresh_ts(), "upstream_updated_at": updated,
             "stack": {"languages": {"Python": 10}}, "stack_tags": ["python"]}
 
 

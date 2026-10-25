@@ -86,6 +86,7 @@ def test_team_runtime_routes_mounted(client):
         ("get", "/api/v1/teams/nodes/n-1"),
         ("get", "/api/v1/teams/nodes/n-1/upgrade-defaults"),
         ("post", "/api/v1/teams/nodes/n-1/upgrade"),
+        ("get", "/api/v1/teams/nodes/n-1/upgrade-status"),
         ("post", "/api/v1/teams/nodes/n-1/editors/claude/upgrade"),
         ("get", "/api/v1/teams/nodes/n-1/proxy-config"),
         ("put", "/api/v1/teams/nodes/n-1/proxy-config"),
@@ -129,6 +130,7 @@ def test_team_runtime_routes_mounted(client):
         ("delete", "/api/v1/teams/nodes/m-1"),
         ("post", "/api/v1/teams/nodes/m-1/upgrade"),
         ("get", "/api/v1/teams/nodes/m-1/upgrade-defaults"),
+        ("get", "/api/v1/teams/nodes/m-1/upgrade-status"),
         ("put", "/api/v1/teams/nodes/m-1/proxy-config"),
         ("post", "/api/v1/teams/nodes/m-1/editors/claude/upgrade"),
     ],
@@ -143,6 +145,7 @@ def test_management_node_rejected(client, method, path):
         ("delete", "/api/v1/teams/nodes/n-1"),
         ("post", "/api/v1/teams/nodes/n-1/upgrade"),
         ("get", "/api/v1/teams/nodes/n-1"),
+        ("get", "/api/v1/teams/nodes/n-1/upgrade-status"),
     ],
 )
 def test_no_grant_rejected(client, method, path):
@@ -154,6 +157,7 @@ def test_no_grant_rejected(client, method, path):
     [
         ("delete", "/api/v1/teams/nodes/n-1"),
         ("post", "/api/v1/teams/nodes/n-1/upgrade"),
+        ("get", "/api/v1/teams/nodes/n-1/upgrade-status"),
     ],
 )
 def test_granted_but_node_missing(client, method, path):

@@ -76,6 +76,8 @@ EVENT_DEVICE_STATUS = "device_status"
 # ── 命令词汇表（spec §8）────────────────────────────────────────────────────
 # 服务端不得下发设备未在 capabilities 里声明的 cmd；真下发了设备会回
 # unsupported。这个元组是"协议认识哪些命令"的单一来源，工具定义从它派生。
+# 16 条 v0 核心 + 2 条无特权扩展（get_foreground_app / open_url）；两端
+# （Android Capabilities.ALL、iOS caps.All）与本元组必须同步，加命令一次改五处。
 COMMANDS: tuple[str, ...] = (
     "get_screen_state",
     "tap",
@@ -93,6 +95,8 @@ COMMANDS: tuple[str, ...] = (
     "press_recents",
     "open_app",
     "list_apps",
+    "get_foreground_app",
+    "open_url",
 )
 
 # press_key 的取值（spec §8.6）。音量/电源键在 v0 故意排除。
@@ -110,8 +114,12 @@ PRESS_KEYS: tuple[str, ...] = (
     "dpad_center",
 )
 
-# 只读命令：spec §5 要求设备串行化所有会改 UI 状态的命令，这两个例外可并发。
-READ_ONLY_COMMANDS: frozenset[str] = frozenset({"get_screen_state", "list_apps"})
+# 只读命令：spec §5 要求设备串行化所有会改 UI 状态的命令，这几个例外可并发。
+# get_foreground_app 只读一个 volatile 字段、open_url 会拉起浏览器（属变更类，
+# 必须占串行锁），所以只前者入列。
+READ_ONLY_COMMANDS: frozenset[str] = frozenset(
+    {"get_screen_state", "list_apps", "get_foreground_app"}
+)
 
 
 def clamp_call_timeout(ms: int | None) -> int:

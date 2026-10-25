@@ -79,7 +79,10 @@ def test_windows_installer_uses_one_fixed_entry_and_migrates_legacy_tasks():
     assert "-EncodedCommand" in body
     assert "--install --install-only --yes" in body
     assert "schtasks.exe /Create /F /SC ONLOGON" in body
-    assert "StartsWith($root" in body  # process cleanup is path-scoped
+    # 不再 PowerShell Stop-Process -Force 强杀旧节点：二进制 --install --yes 自带
+    # 优雅换绑（taskkill /PID 不带 /F + 等锁释放）。强杀会让 owner.json 残留死 PID，
+    # 新二进制 trustedOwner 校验失败报「节点被锁」。
+    assert "Stop-Process" not in body
     # 海外默认（不传 mirror_fields）不得烘焙任何国内镜像源。
     assert "NPM_CONFIG_REGISTRY" not in body
 
@@ -314,6 +317,112 @@ def test_one_click_docker_uses_fixed_container_name():
     assert "bakes runtime + editor CLIs" in body
     # 第二次（镜像存在）跳过下载与 build。
     assert "already present; skipping build" in body
+
+
+def test_installers_show_download_progress_and_step_counter():
+    """入驻脚本要有一条实时下载进度条 + 整体「第 n/总 步」进度提示 + 出口代理打印。
+
+    进度条来自 ``curl --progress-bar``（同时去掉 -s，-s 会把进度表一起静默）；
+    整体进度来自 ``step`` 计数函数（standalone）与 ``[n/6]`` 前缀（Windows）。
+    出口代理行是入驻排障第一现场：打印实际生效的 mode/url/prefix，network URL
+    的凭据必须抹成 ``****``（且必须是纯 bash 参数展开——写 sed 的反向引用会被
+    Python f-string 当八进制转义吃掉）。
+    """
+    proxy = {
+        "proxy_mode": "network",
+        "proxy_url": "http://alice:s3cret@10.0.0.5:7890",
+        "proxy_url_prefix": "",
+    }
+    standalone = render_install_script(
+        BOOTSTRAP,
+        public_base_url="https://model.example.test",
+        agent_image="example/node:latest",
+        execution_assets={
+            ("linux", "amd64"): {"version": "v1", "url": "https://github.com/e/d/node-execution-linux-amd64", "sha256": "e" * 64},
+        },
+        runtime_assets={
+            ("linux", "amd64"): {"version": "v1", "url": "https://github.com/e/d/node-runtime.tar.gz", "sha256": "f" * 64},
+        },
+        proxy_fields=proxy,
+    )
+    # 每条下载都走 --progress-bar；-fsSL 已不再出现（-s 会吞掉进度条）。
+    assert "--progress-bar" in standalone
+    assert "-fsSL" not in standalone
+    # 整体入驻进度：固定总步数 + step 计数函数 + 每个阶段一条 step 调用。
+    assert "STEP_TOTAL=6" in standalone
+    assert "STEP_NO=$((STEP_NO + 1))" in standalone
+    assert standalone.count("step \"") >= 5
+    assert "入驻完成" in standalone
+    # 旧节点交给二进制的 --install --yes 优雅换绑（SIGTERM+等锁释放+清 owner.json），
+    # 安装脚本不再 pkill -f 强杀：强杀来不及清 owner.json，新二进制 trustedOwner
+    # 校验到 PID 已死会直接报「another node holds the host lock but its process
+    # could not be verified」，即用户看到的「节点被锁」。
+    assert "pkill" not in standalone
+    # 出口代理打印 + 凭据脱敏（渲染出的 bash 执行结果必须是 scheme://****@host）。
+    assert "egress proxy:" in standalone
+    assert "download: $url" in standalone
+    _assert_egress_mask(standalone, "http://****@10.0.0.5:7890")
+    # 绝不能把 sed 反向引用写进 f-string（会退化成 chr(1) 静默坏掉脱敏）。
+    assert "sed -E" not in standalone
+
+    win = render_install_bat(
+        BOOTSTRAP,
+        public_base_url="https://model.example.test",
+        assets={("windows", "amd64"): {"version": "v1", "url": "https://github.com/e/d/node-execution-windows-amd64.exe", "sha256": "a" * 64}},
+        runtime_assets={("windows", "amd64"): {"version": "v1", "url": "https://github.com/e/d/node-runtime.tar.gz", "sha256": "b" * 64}},
+        proxy_fields=proxy,
+    )
+    assert "--progress-bar" in win
+    # Windows 步骤前缀是纯 ASCII：cmd 用 OEM 码页解析 .bat，中文会乱码。
+    assert "[1/5] detect system arch" in win
+    assert "[5/5] install complete" in win
+    assert "egress proxy:" in win
+    assert "download: %DL_URL%" in win
+
+
+def _assert_egress_mask(script: str, want: str) -> None:
+    """Run the rendered egress-proxy block verbatim in bash and assert masking.
+
+    The block is pure bash (case + parameter expansion), so extracting it from
+    the rendered script and executing it proves the shipping behaviour instead
+    of re-implementing it in the test.
+    """
+    import subprocess
+
+    lines = script.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith("PROXY_MODE="))
+    end = next(i for i, l in enumerate(lines) if "egress proxy:" in l)
+    block = "#!/usr/bin/env bash\n" + "\n".join(lines[start : end + 1]) + "\n"
+    out = subprocess.run(["bash", "-c", block], capture_output=True, text=True).stdout
+    assert want in out, out
+
+
+def test_installers_print_egress_proxy_before_download():
+    """url_prefix 形态：代理行显示 prefix，下载行显示改写后的最终 URL。"""
+    body = render_install_script(
+        BOOTSTRAP,
+        public_base_url="https://model.example.test",
+        agent_image="example/node:latest",
+        execution_assets={
+            ("linux", "amd64"): {"version": "v1", "url": "https://github.com/e/d/node-execution-linux-amd64", "sha256": "e" * 64},
+        },
+        runtime_assets={
+            ("linux", "amd64"): {"version": "v1", "url": "https://github.com/e/d/node-runtime.tar.gz", "sha256": "f" * 64},
+        },
+        proxy_fields={"proxy_mode": "url_prefix", "proxy_url": "", "proxy_url_prefix": "https://ghfast.top"},
+    )
+    import subprocess
+
+    lines = body.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith("PROXY_MODE="))
+    end = next(i for i, l in enumerate(lines) if "egress proxy:" in l)
+    out = subprocess.run(
+        ["bash", "-c", "#!/usr/bin/env bash\n" + "\n".join(lines[start : end + 1])],
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "mode=url_prefix" in out
+    assert "https://ghfast.top" in out
 
 
 def test_server_templates_use_fixed_persisted_entries():

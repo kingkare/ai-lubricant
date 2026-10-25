@@ -154,6 +154,10 @@ async def authorization_options(user: User = Depends(get_current_user)) -> dict:
 
 @router.get("/instance-authorizations")
 async def instance_authorizations(user: User = Depends(get_current_user)) -> dict:
+    """获取「工具资源 → MCP 用户」授权的只读概览。
+
+    按 resource_id 分组返回各自的参数行（mcp_grants 的 param 行，仅本人拥有）。
+    """
     import mcp_plugin_store as store
 
     return {"resources": await store.list_owned_resource_principal_params(str(user.id))}
@@ -161,6 +165,7 @@ async def instance_authorizations(user: User = Depends(get_current_user)) -> dic
 
 @router.get("")
 async def list_principals(user: User = Depends(get_current_user)) -> dict:
+    """获取当前用户名下的 MCP 用户（principal）列表。"""
     import mcp_plugin_store as store
 
     return {"principals": await store.list_owned_mcp_principals(str(user.id))}
@@ -168,6 +173,11 @@ async def list_principals(user: User = Depends(get_current_user)) -> dict:
 
 @router.post("")
 async def create_principal(body: CreatePrincipalReq, user: User = Depends(get_current_user)) -> dict:
+    """创建用户自有的 MCP 用户（principal）。
+
+    ``usage_type`` 仅允许 external / agent；external 创建时返回一次明文 token，
+    agent 只返回掩码。名称必填、重名返回 409。
+    """
     import mcp_plugin_store as store
 
     if not body.name.strip():
@@ -189,6 +199,11 @@ async def create_principal(body: CreatePrincipalReq, user: User = Depends(get_cu
 async def update_principal(
     principal_id: int, body: UpdatePrincipalReq, user: User = Depends(get_current_user),
 ) -> dict:
+    """更新 MCP 用户基础信息（名称/描述/启用状态）。
+
+    自有 principal 直接改；agent/task 类型的可管理 principal 同样允许用户配置；
+    平台 external principal 只能在管理端修改（403），都不存在时返回 404。
+    """
     import mcp_plugin_store as store
 
     if body.name is not None and not body.name.strip():
@@ -214,6 +229,10 @@ async def update_principal(
 
 @router.delete("/{principal_id}")
 async def delete_principal(principal_id: int, user: User = Depends(get_current_user)) -> dict:
+    """删除当前用户名下的 MCP 用户。
+
+    仅自有 principal 可删；不存在返回 404。
+    """
     import mcp_plugin_store as store
 
     if not await store.delete_owned_mcp_principal(principal_id, str(user.id)):
@@ -223,6 +242,10 @@ async def delete_principal(principal_id: int, user: User = Depends(get_current_u
 
 @router.post("/{principal_id}/rotate-token")
 async def rotate_token(principal_id: int, user: User = Depends(get_current_user)) -> dict:
+    """重签 MCP 用户令牌：旧令牌立即失效，返回新令牌。
+
+    仅自有 principal 可重签；不存在返回 404。
+    """
     import mcp_plugin_store as store
 
     row = await store.rotate_owned_mcp_principal_token(principal_id, str(user.id))
@@ -235,6 +258,10 @@ async def rotate_token(principal_id: int, user: User = Depends(get_current_user)
 async def set_token_status(
     principal_id: int, body: SetTokenStatusReq, user: User = Depends(get_current_user),
 ) -> dict:
+    """设置 MCP 用户令牌状态（active / disabled）。
+
+    状态值不合法返回 400；仅自有 principal 可改，不存在返回 404。
+    """
     import mcp_plugin_store as store
 
     try:
@@ -250,6 +277,10 @@ async def set_token_status(
 
 @router.get("/{principal_id}/params")
 async def list_params(principal_id: int, user: User = Depends(get_current_user)) -> dict:
+    """获取 MCP 用户的参数行（只读，含平台 principal 以便诊断）。
+
+    principal 不可管理返回 404。
+    """
     import mcp_plugin_store as store
 
     # Reading platform principal params is useful for diagnostics; writes below
@@ -263,6 +294,12 @@ async def list_params(principal_id: int, user: User = Depends(get_current_user))
 async def replace_params(
     principal_id: int, body: ReplaceParamsReq, user: User = Depends(get_current_user),
 ) -> dict:
+    """整体替换 MCP 用户的参数行。
+
+    自有 principal 直接放行；agent/task 类可管理 principal 也允许用户配置；
+    平台 external principal 返回 403。保存后重下发 builtin principal，
+    让活跃 driver 的客户端/邮箱资源与参数保持一致。
+    """
     import mcp_plugin_store as store
 
     # 写入口径与 list/read 对齐：自有 principal 直接放行；agent/task principal（含
@@ -294,6 +331,10 @@ async def replace_params(
 
 @router.get("/{principal_id}/grants")
 async def list_grants(principal_id: int, user: User = Depends(get_current_user)) -> dict:
+    """获取 MCP 用户的统一授权行（service 行 + param 行，只读）。
+
+    principal 不可管理返回 404。
+    """
     import mcp_plugin_store as store
 
     # 读取口径与 list_params 一致：自有 principal 或 agent/task 可管理 principal 都可读。
@@ -306,6 +347,12 @@ async def list_grants(principal_id: int, user: User = Depends(get_current_user))
 async def replace_grants(
     principal_id: int, body: ReplaceGrantsReq, user: User = Depends(get_current_user),
 ) -> dict:
+    """整体替换 MCP 用户的统一授权（service 行 + param 行）。
+
+    写入口径与 replace_params 一致：自有 / agent-task principal 放行，平台
+    external principal 返回 403；授权值无效返回 404、400。保存后重下发 builtin
+    principal，使活跃 driver 的资源与刚校验过的授权一致。
+    """
     import mcp_plugin_store as store
 
     # 写入口径与 replace_params 对齐。

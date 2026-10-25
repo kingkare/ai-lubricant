@@ -86,172 +86,6 @@ async def _fake_team_id(_uid: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_resolve_folds_skill_ids_into_config(monkeypatch):
-    async def fake_resolve(user_id, team_id, resource_type, bindings, *, request_base_url=""):
-        assert resource_type == "skill"
-        assert bindings == [{"resource_id": "sk-1"}, {"resource_id": "sk-2"}]
-        return [{"name": "sk-1", "source": "archive", "url": "https://x"}, {"name": "sk-2", "source": "archive", "url": "https://y"}]
-
-    monkeypatch.setattr(routes_task, "resolve_reference_specs", fake_resolve)
-    monkeypatch.setattr(routes_task, "resolve_team_id", _fake_team_id)
-
-    req = {"extra": {"skill_ids": ["sk-1", "sk-2"]}}
-    patch = await routes_task._resolve_task_resource_configs(_user(), req, _request())
-    assert [s["name"] for s in patch["skill_config"]] == ["sk-1", "sk-2"]
-
-
-@pytest.mark.asyncio
-async def test_resolve_folds_collection_dict_bindings_with_entries(monkeypatch):
-    """集合子技能勾选：skill_ids 里 {resource_id, entries} 原样下传给 resolve，
-    resolve 按 entries 过滤只下发勾中的子技能（第二期任务勾选链路）。"""
-    captured: list[dict] = []
-
-    async def fake_resolve(user_id, team_id, resource_type, bindings, *, request_base_url=""):
-        assert resource_type == "skill"
-        captured.extend(bindings)
-        return [{"name": b.get("resource_id"), "source": "github"} for b in bindings]
-
-    monkeypatch.setattr(routes_task, "resolve_reference_specs", fake_resolve)
-    monkeypatch.setattr(routes_task, "resolve_team_id", _fake_team_id)
-
-    req = {"extra": {"skill_ids": [
-        "sk-plain",
-        {"resource_id": "col-1", "entries": ["pdf", "slides"]},
-        {"resource_id": "col-2"},  # 集合不带 entries = 整个集合
-    ]}}
-    patch = await routes_task._resolve_task_resource_configs(_user(), req, _request())
-    assert {"resource_id": "sk-plain"} in captured
-    assert {"resource_id": "col-1", "entries": ["pdf", "slides"]} in captured
-    assert {"resource_id": "col-2"} in captured
-    assert len(patch["skill_config"]) == 3
-
-
-@pytest.mark.asyncio
-async def test_resolve_folds_plugin_collection_dict_bindings_with_entries(monkeypatch):
-    """插件与技能走同一套绑定形状：plugin_ids 里的 {resource_id, entries} 也必须
-    原样下传。回归护栏——plugin_ids 曾误标成 list[str]，导致前端任何非空插件选择
-    在 pydantic 校验阶段就 422（skill_ids 是 list[Any] 所以没暴露）。"""
-    captured: list[dict] = []
-
-    async def fake_resolve(user_id, team_id, resource_type, bindings, *, request_base_url=""):
-        assert resource_type == "plugin"
-        captured.extend(bindings)
-        return [{"name": b.get("resource_id"), "source": "github"} for b in bindings]
-
-    monkeypatch.setattr(routes_task, "resolve_reference_specs", fake_resolve)
-    monkeypatch.setattr(routes_task, "resolve_team_id", _fake_team_id)
-
-    req = {"extra": {"plugin_ids": [
-        "pl-plain",
-        {"resource_id": "col-1", "entries": ["pdf", "slides"]},
-        {"reference_id": "ref-2"},
-    ]}}
-    patch = await routes_task._resolve_task_resource_configs(_user(), req, _request())
-    assert {"resource_id": "pl-plain"} in captured
-    assert {"resource_id": "col-1", "entries": ["pdf", "slides"]} in captured
-    assert {"reference_id": "ref-2"} in captured
-    assert len(patch["plugin_config"]) == 3
-
-
-def test_task_extra_config_accepts_dict_bindings_for_both_kinds():
-    """schema 层护栏：skill_ids 与 plugin_ids 必须同形状（list[Any]），否则集合
-    绑定在进路由逻辑之前就被 pydantic 拒掉。"""
-    req = routes_task.CreateTaskReq(
-        content="",
-        extra={
-            "skill_ids": [{"reference_id": "a", "entries": ["x"]}],
-            "plugin_ids": [{"reference_id": "b", "entries": ["y"]}, "plain"],
-        },
-    )
-    assert req.extra.skill_ids == [{"reference_id": "a", "entries": ["x"]}]
-    assert req.extra.plugin_ids == [{"reference_id": "b", "entries": ["y"]}, "plain"]
-
-
-@pytest.mark.asyncio
-async def test_resolve_routes_reference_id_bindings_to_new_store(monkeypatch):
-    """{reference_id} 绑定路由到新表 resource_store（统一资源池）；旧 resource_id 走旧链路。"""
-    import resource_store as rstore
-    from user_platform import resource_reference_service as refsvc
-
-    async def fake_team_admin(user_id, team_id):
-        return False
-
-    async def fake_visible(user_id, team_id, *, resource_type=None, is_admin=False):
-        # skill 主类型会连查 skills 集合与 plugin 容器（带 entries 的插件）。
-        assert resource_type in ("skill", "skills", "plugin")
-        return [{
-            "id": "new-ref-1", "params": {}, "display_name": "", "version": "",
-            "resource": {
-                "resource_type": "skills",
-                "resource_data": {
-                    "clone_url": "https://github.com/o/r.git", "ref": "main",
-                    "entries": [{"name": "pdf", "path": "skills/pdf", "entry": "SKILL.md"}],
-                },
-                "source_data": {"repo_full_name": "o/r"}, "name": "o/r",
-                "display_name": "", "version": "",
-            },
-        }]
-
-    async def fake_specs(references, bindings, *, request_base_url=""):
-        assert bindings == [{"reference_id": "new-ref-1", "entries": ["pdf"]}]
-        return [{"name": "o/r/pdf", "source": "github", "url": "https://github.com/o/r.git",
-                 "path": "skills/pdf", "ref": "main"}]
-
-    async def no_refs(*_a, **_kw):
-        return []
-
-    monkeypatch.setattr(refsvc, "_team_is_admin", fake_team_admin)
-    monkeypatch.setattr(rstore, "visible_references", fake_visible)
-    monkeypatch.setattr(rstore, "resolve_specs", fake_specs)
-    monkeypatch.setattr(refsvc, "visible_references", no_refs)
-
-    specs = await refsvc.resolve_reference_specs(
-        "user-1", "team-1", "skill",
-        [{"reference_id": "new-ref-1", "entries": ["pdf"]}],
-    )
-    assert specs == [{"name": "o/r/pdf", "source": "github",
-                      "url": "https://github.com/o/r.git", "path": "skills/pdf", "ref": "main"}]
-
-
-@pytest.mark.asyncio
-async def test_resolve_merges_explicit_config_with_ids(monkeypatch):
-    async def fake_resolve(user_id, team_id, resource_type, bindings, *, request_base_url=""):
-        # Mirror the real resolver: resource_id refs become resolved specs,
-        # plain dicts (no resource_id) pass through verbatim.
-        out = []
-        for b in bindings:
-            rid = b.get("resource_id")
-            out.append({"name": rid, "source": "archive"} if rid else dict(b))
-        return out
-
-    monkeypatch.setattr(routes_task, "resolve_reference_specs", fake_resolve)
-    monkeypatch.setattr(routes_task, "resolve_team_id", _fake_team_id)
-
-    req = {
-        "extra": {"plugin_ids": ["p-1"]},
-        "plugin_config": [{"name": "explicit", "url": "https://x"}],
-    }
-    patch = await routes_task._resolve_task_resource_configs(_user(), req, _request())
-    names = [p["name"] for p in patch["plugin_config"]]
-    assert "p-1" in names and "explicit" in names
-
-
-@pytest.mark.asyncio
-async def test_resolve_rejects_unauthorized_resource_id(monkeypatch):
-    async def fake_resolve(user_id, team_id, resource_type, bindings, *, request_base_url=""):
-        raise ValueError("resource_not_granted:nope")
-
-    monkeypatch.setattr(routes_task, "resolve_reference_specs", fake_resolve)
-    monkeypatch.setattr(routes_task, "resolve_team_id", _fake_team_id)
-
-    req = {"extra": {"skill_ids": ["nope"]}}
-    with pytest.raises(HTTPException) as exc:
-        await routes_task._resolve_task_resource_configs(_user(), req, _request())
-    assert exc.value.status_code == 403
-    assert "资源未授权" in exc.value.detail
-
-
-@pytest.mark.asyncio
 async def test_resolve_dedups_by_name(monkeypatch):
     async def fake_normalize(user_id, team_id, bindings):
         # normalize 返回服务绑定（service_id / resource_id），按绑定键去重。
@@ -279,16 +113,13 @@ async def test_resolve_dedups_by_name(monkeypatch):
 # ---- audit: only counts, never full wire specs ---------------------------
 
 def test_audit_replaces_config_lists_with_counts():
+    """skill_config/plugin_config 已退役，审计只剩 mcp_config 计数。"""
     audited = routes_task._audit_resource_counts({
         "content": "hi",
         "mcp_config": [{"name": "a"}, {"name": "b"}],
-        "skill_config": [{"name": "s"}],
-        "plugin_config": [],
         "title": "t",
     })
     assert audited["mcp_config"] == 2
-    assert audited["skill_config"] == 1
-    assert audited["plugin_config"] == 0
     assert audited["content"] == "hi"
     assert audited["title"] == "t"
 
@@ -447,26 +278,9 @@ async def test_service_id_binding_rejects_disabled_service(monkeypatch):
         await rrs.resolve_reference_specs("user-1", "team-1", "mcp", [{"service_id": 42}])
 
 
-# ---- _task_mcp_service_ids: service_id spec → 授权服务集 ----
-
-
-@pytest.mark.asyncio
-async def test_task_mcp_service_ids_reads_service_id_specs(monkeypatch):
-    """任务 principal 授权直接认 spec 里的 service_id，不再只靠 name 回查。"""
-    import mcp_plugin_store
-
-    async def get_service_by_name(name):
-        return {"id": 7} if name == "team-mcp" else None
-
-    monkeypatch.setattr(mcp_plugin_store, "get_service_by_name", get_service_by_name)
-
-    service = TaskService()
-    task = SimpleNamespace(mcp_config=[
-        {"name": "cdp-bridge", "type": "remote", "service_id": 42},
-        {"name": "team-mcp", "command": "npx"},
-        {"name": "overlay-local", "url": "ws://session-local"},  # 非 catalog 服务
-        {"service_id": 42},  # 与上面重复 → 去重
-        "junk",
-    ])
-    ids = await service._task_mcp_service_ids(task)
-    assert ids == [42, 7]
+# ---- _task_mcp_service_ids: retired (Phase 4) ----
+# The legacy ``_task_mcp_service_ids`` / ``_mcp_service_ids_from_specs`` helpers
+# read the retired ``mcp_config`` column to derive authorized service ids. With
+# the column gone and the service-grant truth now projected from the environment
+# (``_sync_task_mcp_service_grants_from_env``), this entry point and its test
+# are removed together.

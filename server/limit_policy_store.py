@@ -163,7 +163,7 @@ def seconds_until_month_end() -> int:
 
 
 # 冻结条件类型
-FREEZE_CONDITION_TYPES = ("status_code", "headers", "exception", "error_type", "body")
+FREEZE_CONDITION_TYPES = ("status_code", "headers", "exception", "error_type", "error_kind", "body")
 # 比较运算符
 #   in       "包括"：value 为逗号分隔的多值列表，actual 命中其中任意一个即为真（默认运算符，状态码可填 501,502 等）
 #   contains "包含"：actual 字符串包含 expected 子串（用于 error.message 文本匹配）
@@ -310,7 +310,7 @@ def normalize_freeze_rule(rule: dict | None) -> dict | None:
     # headers / body 条件必须有 key（headers 是响应头名，body 是响应体点分路径如 error.code）。
     if condition in ("headers", "body") and not key:
         return None
-    if condition in ("status_code", "exception", "error_type"):
+    if condition in ("status_code", "exception", "error_type", "error_kind"):
         key = ""
 
     operator = str(rule.get("operator") or "").strip()
@@ -409,7 +409,7 @@ def validate_freeze_policy(policy: dict | None) -> dict:
             raise ValueError(f"第 {idx + 1} 条冻结规则必须是 JSON 对象")
         condition = str(rule.get("condition") or "").strip().lower()
         if condition not in FREEZE_CONDITION_TYPES:
-            raise ValueError(f"第 {idx + 1} 条冻结规则 condition 非法（只能是 status_code/headers/exception/error_type）")
+            raise ValueError(f"第 {idx + 1} 条冻结规则 condition 非法（只能是 status_code/headers/exception/error_type/error_kind）")
         if condition == "exception":
             pass
         else:
@@ -516,6 +516,7 @@ def match_freeze_rules(
     headers: dict | None = None,
     exception: bool = False,
     error_code: str | None = None,
+    error_kind: str | None = None,
     body=None,
 ) -> dict | None:
     """根据响应上下文匹配冻结规则，返回第一条命中的冻结动作。
@@ -563,6 +564,12 @@ def match_freeze_rules(
             if not error_code:
                 continue
             actual = error_code
+        elif condition == "error_kind":
+            # 渠道语义异常的 kind（providers/base.py ChannelError 家族：
+            # credential_invalid / quota_exhausted / temporary_freeze / …）
+            if not error_kind:
+                continue
+            actual = error_kind
         else:  # exception
             if not exception:
                 continue
@@ -705,6 +712,19 @@ def get_effective_provider_policy_sync(provider_name: str) -> dict:
         "freeze_policy": default_freeze_policy(),
         "extra": {},
     }
+
+
+def peek_cached_provider_policy(provider_name: str) -> dict | None:
+    """只在缓存**确实命中**时返回策略，冷缓存返回 None（而非全零模板）。
+
+    与 :func:`get_effective_provider_policy_sync` 的区别：后者冷缓存兜底一份全零，
+    适合「必须有 dict 才能继续」的调用方；但热加载/60s 对账据此装配运行对象限额时，
+    会把这份并不存在的零策略当权威，反向抹掉渠道 ``rate_limit`` 里的限额（并发归 0 =
+    「设了不生效」的另一半根因）。这类调用方要的是「有权威策略就用、没有就走渠道档」，
+    故用本函数：None 表示「尚无权威策略」，交由兜底链落到渠道 ``*_per_account``。
+    """
+    cached = _policy_cache.get(provider_name)
+    return dict(cached[1]) if cached else None
 
 
 def clear_policy_cache(provider_name: str | None = None):

@@ -13,8 +13,8 @@ GenericAgent can persist recurring tasks to PostgreSQL; a background scheduler p
 └─────────────────┘     └──────────────────────────────┘     └─────────────────┘
 ```
 
-- **AgentScheduler** (`agent/scheduler.py`) — wraps APScheduler: cron parsing, due detection, scheduling. PostgreSQL table `agent_scheduled_tasks` stores task metadata and last result.
-- **AgentTaskRunner** (`agent/runner.py`) — background asyncio loop polling due tasks and executing them via GenericAgent.
+- **AgentScheduler** (`agent/scheduler.py`) — wraps APScheduler: cron parsing, due detection, scheduling. PostgreSQL table `agent_scheduled_tasks` stores task metadata and last result. One shared instance per process (`get_agent_scheduler()`).
+- **AgentTaskRunner** (`agent/runner.py`) — starts/stops that scheduler with the app lifespan (gate: any enabled Agent's switch OR any enabled task row), and reloads enabled tasks from the DB at startup.
 
 ## capability_call scheduler actions
 
@@ -138,17 +138,24 @@ next_action: what should happen before the next run
 
 ## Configuration
 
-In the main config's `agent` field:
+There is no global master switch — the former `agent.scheduler_enabled` main-config
+field was removed (it had no UI, defaulted off, and only caused tasks to silently
+never run). The scheduler starts when either is true (`agent.runner.scheduler_wanted`):
 
-```json
-{
-  "agent": {
-    "scheduler_enabled": true
-  }
-}
-```
+- any enabled Agent has its own `scheduler_enabled` switch on (the Agent management
+  page writes that column), or
+- `agent_scheduled_tasks` contains any enabled row.
 
-`scheduler_enabled` defaults to `false` and must be enabled manually.
+Creating/enabling a task or flipping an Agent's switch at runtime starts the
+scheduler immediately (`agent.runner.ensure_scheduler_running`) — no restart needed.
+Legacy main-config dicts still carrying `agent.scheduler_enabled` are ignored by
+`AgentConfig.from_dict` (unknown key), so no migration is needed.
+
+All callers share one in-process `AgentScheduler` singleton
+(`agent.scheduler.get_agent_scheduler()`): the lifespan starter, the REST
+management endpoints and `capability_call`. Registering a job on a throwaway
+instance silently parks it in that instance's pending list (APScheduler does not
+raise on a non-started scheduler), so the task would be saved but never run.
 
 ## Limitations
 

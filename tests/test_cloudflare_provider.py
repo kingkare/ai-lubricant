@@ -2,6 +2,51 @@ from providers.cloudflare import CloudflareProvider
 from rate_limiter import ModelClientPool
 
 
+def test_cloudflare_channel_does_not_require_channel_base_url():
+    """Cloudflare 的地址由账号 account_id 现拼，渠道级 base_url 留空才是正常形态。
+
+    回归锚点：CustomProvider.REQUIRES_BASE_URL=True 被继承下来时，后端建/改渠道会
+    一律 400「渠道地址（base_url）不能为空」；而前端对内置类型不开放协议 Tab，
+    用户根本没有可填的地方 → 该渠道完全改不动（见 admin._validate_provider_requires_base_url）。
+
+    cfg 必须带 builtin_type：_get_provider_class 靠它匹配 CloudflareProvider
+    （创建路径 _create_provider_from_config 在校验前写入，与这里一致）。
+    """
+    import admin
+
+    cfg = dict(admin._builtin_provider_default_config("cloudflare"))
+    cfg["builtin_type"] = "cloudflare"
+    cfg["accounts"] = []
+    assert not (cfg.get("base_url") or "").strip()
+    assert admin._get_provider_class("cloudflare-workers", cfg) is CloudflareProvider
+
+    admin._validate_provider_requires_base_url("cloudflare-workers", cfg)
+
+
+def test_edgeone_channel_does_not_require_channel_base_url():
+    """EdgeOne 同理：地址由账号二级域名拼接，渠道地址可留空。"""
+    import admin
+
+    cfg = dict(admin._builtin_provider_default_config("edgeone-ai"))
+    cfg["builtin_type"] = "edgeone-ai"
+    cfg["accounts"] = []
+    assert not (cfg.get("base_url") or "").strip()
+
+    admin._validate_provider_requires_base_url("edgeone-demo", cfg)
+
+
+def test_builtin_catalog_entry_declares_requires_base_url():
+    """加渠道目录必须把 Provider 的 REQUIRES_BASE_URL 透出给前端。
+
+    前端向导据此决定「供应商地址」是否必填——不透出就会把地址自拼型的内置渠道
+    （cloudflare）堵在第 2 步「供应商地址不能为空」。
+    """
+    import admin
+
+    entries = {entry["id"]: entry for entry in admin._channel_catalog_builtin_entries()}
+    assert entries["cloudflare"]["preset"]["requires_base_url"] is False
+
+
 def test_cloudflare_builds_account_scoped_urls_from_account_id():
     provider = CloudflareProvider(
         "user@example.com",

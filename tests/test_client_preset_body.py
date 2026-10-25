@@ -10,14 +10,15 @@ CODEX_PROMPT = "You are Codex, a coding agent based on GPT-5. You and the user s
 OPENCODE_PROMPT = ""
 
 
-def _provider(protocol="openai", preset="none"):
-    return CustomProvider(
-        "u",
-        "sk-test",
+def _provider(protocol="openai", preset="none", rows=None):
+    kwargs = dict(
         protocol=protocol,
         base_url="https://example.invalid",
         client_preset=preset,
     )
+    if rows is not None:
+        kwargs["chat_protocols"] = rows
+    return CustomProvider("u", "sk-test", **kwargs)
 
 
 def test_chat_protocol_default_preserves_messages_without_opencode_system_marker():
@@ -83,7 +84,12 @@ def test_chat_protocol_preserves_client_system_message():
     ]
 
 
-def test_anthropic_protocol_default_adds_claude_code_marker():
+def test_anthropic_protocol_default_does_not_add_claude_code_marker():
+    """非客户端模拟（client_preset=none）不追加身份首句。
+
+    协议默认 preset 只用于取伪装 body 默认值；未显式配 client_preset 时
+    不把 Claude Code 身份句塞进 system——需要伪装就显式设 client_preset。
+    """
     provider = _provider("anthropic")
 
     payload = provider._openai_request_to_anthropic({
@@ -92,15 +98,18 @@ def test_anthropic_protocol_default_adds_claude_code_marker():
         "max_tokens": 1,
     })
 
-    assert payload["system"].startswith(CLAUDE_CODE_PROMPT)
+    assert "You are Claude Code" not in (payload.get("system") or "")
+    assert payload.get("system") in (None, "")
 
 
-def test_responses_protocol_default_adds_codex_marker():
+def test_responses_protocol_default_does_not_add_codex_marker():
+    """同上：responses 协议默认兜底（codex-cli）也不追加 Codex 身份 instructions。"""
     provider = _provider("responses")
 
     payload = provider._apply_client_preset_body({"model": "m", "input": "hi"}, "responses")
 
-    assert payload["instructions"].startswith(CODEX_PROMPT)
+    assert not (payload.get("instructions") or "").startswith(CODEX_PROMPT)
+    assert payload.get("instructions") in (None, "")
 
 
 def test_codex_preset_on_openai_channel_builds_responses_payload():
@@ -238,6 +247,57 @@ def test_explicit_client_preset_overrides_protocol_default():
     payload = provider._apply_client_preset_body({"model": "m", "input": "hi"}, "responses")
 
     assert payload["instructions"].startswith(CLAUDE_CODE_PROMPT)
+
+
+def test_explicit_simulated_anthropic_preset_adds_claude_code_marker(monkeypatch):
+    """显式模拟（client_preset=claude-code）才注入身份首句——与非模拟路径互为对照。"""
+    monkeypatch.setattr("providers.custom.Config.get_simulated_client_defaults", lambda: {})
+    provider = _provider("anthropic", "claude-code")
+
+    payload = provider._apply_client_preset_body(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+        "anthropic",
+    )
+
+    assert payload["system"].startswith(CLAUDE_CODE_PROMPT)
+
+
+def test_explicit_simulated_responses_preset_adds_codex_marker(monkeypatch):
+    monkeypatch.setattr("providers.custom.Config.get_simulated_client_defaults", lambda: {})
+    provider = _provider("responses", "codex-cli")
+
+    payload = provider._apply_client_preset_body({"model": "m", "input": "hi"}, "responses")
+
+    assert payload["instructions"].startswith(CODEX_PROMPT)
+
+
+def test_multi_protocol_row_none_row_does_not_inherit_first_row_marker():
+    """多协议行渠道：选中行 client_preset=none 时不注入首行（claude-code）的身份句。
+
+    仅验证 marker 注入门控按「本次生效协议行」取数；endpoint 解析仍按渠道派生
+    preset（那是另一处口径，不在本次范围内）。
+    """
+    rows = [
+        {"id": "anthropic-chat-0", "protocol": "anthropic", "path": "/v1/messages",
+         "client_preset": "claude-code", "enabled": True},
+        {"id": "openai-chat-1", "protocol": "chat", "path": "/v1/chat/completions",
+         "client_preset": "none", "enabled": True},
+    ]
+    provider = _provider(rows=rows)
+
+    # 直接喂 chat 形态 payload + 生效行=chat/none，绕开 endpoint 解析与 body defaults。
+    payload = provider._apply_client_preset_body(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        "chat",
+        client_type="openai",
+        apply_defaults=False,
+        request_kwargs={"_endpoint_config": rows[1]},
+    )
+
+    assert not any(
+        "You are Claude Code" in (m.get("content") or "")
+        for m in payload["messages"] if isinstance(m, dict)
+    )
 
 
 def test_client_preset_skips_when_client_already_matches():
@@ -1071,8 +1131,14 @@ def test_openai_default_headers_match_opencode_client():
 
     headers = provider._headers()
 
-    assert headers["User-Agent"] == "opencode/1.16.2 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
-    assert headers["x-session-affinity"] == "ses_15d3045e0ffeMENYCSJKGFbI37"
+    assert headers["User-Agent"] == "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+    # 会话头每请求现场生成（真实客户端 ses_<12hex><14base62>），且 affinity 与
+    # x-session-id 恒为同一会话 ID（线上两个头都是小写）。
+    session_id = headers["x-session-affinity"]
+    assert session_id.startswith("ses_")
+    assert len(session_id) == len("ses_") + 12 + 14
+    assert headers["x-session-id"] == session_id
+    assert session_id != "ses_15d3045e0ffeMENYCSJKGFbI37"
 
 
 def test_context_management_body_does_not_add_beta_flag():

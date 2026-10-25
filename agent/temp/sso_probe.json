@@ -1,0 +1,13 @@
+{
+ "status": 200,
+ "len": 1304,
+ "scripts": [
+  "//g.alicdn.com/frontend-lib/frontend-lib/2.3.74/antidom.js",
+  "//o.alicdn.com/frontend-lib/common-lib/jquery.min.js",
+  "//res.wx.qq.com/connect/zh_CN/htmledition/js/wxLogin.js",
+  "/static/js/runtime~main.7c82513a.js",
+  "/static/js/2.4eb54cd4.chunk.js",
+  "/static/js/main.59963db7.chunk.js"
+ ],
+ "text": " 上海人工智能实验室-用户认证体系 "
+}

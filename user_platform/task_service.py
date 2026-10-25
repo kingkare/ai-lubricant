@@ -27,10 +27,7 @@ from .models_task import (
     ProjectTask,
     Task,
     TaskEvent,
-    TaskNodeBinding,
     TaskStatusHistory,
-    TaskUsageStat,
-    TaskVirtualMachine,
 )
 from .node_client import NodeServerUnavailable, get_local_node_client
 from .node_client.errors import Code, RPCError
@@ -86,15 +83,44 @@ def _is_claude_reserved_model_alias(name: str) -> bool:
     return bool(_CLAUDE_RESERVED_RE.match(n))
 
 
-def _reject_claude_reserved_models(provider: str, models: list[str] | None) -> None:
+# 新映射形状（{main, slots}）里 claude 的 main 是档名别名（opus/sonnet/haiku/fable），
+# 由任务自己带 ANTHROPIC_DEFAULT_*_MODEL 翻译，选它就是本意——不再是"撞名副作用"。
+_CLAUDE_TIER_ALIASES = frozenset({"opus", "sonnet", "haiku", "fable"})
+
+
+def _defaults_scope(project_id: str | None, provider: str | None) -> tuple[uuid.UUID, str]:
+    """把缓存键归一成 (project_uuid, provider)。
+
+    无项目用零 UUID 占位——Postgres 的 UNIQUE 不把 NULL 视为相等，NULL 会让
+    「无项目」这份缓存每次都插新行、永不命中。非法 project_id 同样落零 UUID，
+    读写会落到同一行（读得到就等于脏 id 没打散缓存）。provider 空 = claude。
+    """
+    raw = str(project_id or "").strip()
+    try:
+        pid = uuid.UUID(raw) if raw else uuid.UUID(int=0)
+    except ValueError:
+        pid = uuid.UUID(int=0)
+    return pid, (str(provider or "").strip().lower() or "claude")
+
+
+def _reject_claude_reserved_models(
+    provider: str, models: list[str] | None, *, has_mapping: bool = False
+) -> None:
     """Raise ValueError if a claude-provider task uses a reserved alias.
 
     Non-claude providers are not affected — the alias substitution only
     happens inside the Claude Code CLI.
+
+    ``has_mapping=True``（任务配了模型映射）时放行四个档名别名（opus/sonnet/
+    haiku/fable）：新映射形状里 claude 的 ``main`` 就是档名，由任务自带的
+    ``ANTHROPIC_DEFAULT_*_MODEL`` 翻译，选它是有意为之，不再是"撞名副作用"。
     """
     if (provider or "").strip().lower() != "claude":
         return
     for name in models or []:
+        n = (name or "").strip().lower()
+        if has_mapping and n in _CLAUDE_TIER_ALIASES:
+            continue
         if _is_claude_reserved_model_alias(name):
             raise ValueError(
                 f"claude_reserved_model_alias:{name}"
@@ -122,6 +148,34 @@ _GIT_PROXY_SCOPE_MAIN = "main"
 _GIT_PROXY_MODE_RO = "ro"
 _GIT_PROXY_MODE_RW = "rw"
 
+# 私有仓库 clone 只能经服务端 git proxy 鉴权。缺前置配置时这两条会从
+# ``_rewrite_repo_for_git_proxy`` 抛上来，经 dispatch 失败路径落进 dispatch_error。
+# 文案直说缺哪个环境变量：这是运维能改的部署配置，不该变成一句「派发异常」。
+_GIT_PROXY_CONFIG_HINT = {
+    "git_proxy_origin_missing": "私有仓库需要服务端 git 代理，但未配置控制面公网地址（AGENT_COMPOSE_NODE_SERVER_PUBLIC_URL）",
+    "git_proxy_token_missing": "私有仓库需要服务端 git 代理，但未配置控制面共享令牌（NODE_CONTROL_TOKEN）",
+    "environment_disabled": "环境已禁用，无法在其上运行任务",
+    "environment_provisioning": "环境代码目录正在准备中（首次 clone），稍后重试",
+    "environment_provision_failed": "环境代码目录准备失败，请到环境页重试",
+    "environment_has_no_project": "环境设为工作区模式但未绑定项目，无法建立共享检出",
+    "environment_project_has_no_repo": "环境绑定的项目没有仓库地址，无法建立共享检出",
+    "environment_external_path_missing": "环境指向的外部目录在节点上不存在",
+}
+
+
+def _dispatch_failure_text(exc: Exception) -> str:
+    """把派发路径上的异常翻成一句能读的原因。
+
+    默认 ``str(exc)`` 对 ``ValueError("git_proxy_origin_missing")`` 这种机器码
+    只会显示成裸的标识符，用户看不懂。已知的机器码在这里翻成人话；其余原样透出
+    （多数是运行时/节点的原文，本身已可读）。
+    """
+    raw = str(exc) or ""
+    hint = _GIT_PROXY_CONFIG_HINT.get(raw.strip())
+    if hint:
+        return f"{hint}，请联系管理员"
+    return raw or "派发异常"
+
 
 def _git_proxy_origin() -> str:
     from . import config
@@ -136,15 +190,20 @@ def _git_proxy_control_token() -> str:
     return (config.settings.node_control_token or "").strip()
 
 
-def _git_proxy_token(task_id: str, scope: str = _GIT_PROXY_SCOPE_MAIN, mode: str = _GIT_PROXY_MODE_RO) -> str:
+def _git_proxy_token(principal_id: str, scope: str = _GIT_PROXY_SCOPE_MAIN, mode: str = _GIT_PROXY_MODE_RO) -> str:
     """Stateless signed token the node embeds as the clone URL's userinfo.
 
-    Format: ``<task_id>.<scope>.<mode>.<sig>`` where ``sig`` is the first 32 hex
-    chars of ``HMAC-SHA256(node_control_token, "git-proxy:<task_id>:<scope>:<mode>")``.
+    Format: ``<id>.<scope>.<mode>.<sig>`` where ``sig`` is the first 32 hex
+    chars of ``HMAC-SHA256(node_control_token, "git-proxy:<id>:<scope>:<mode>")``.
     The proxy verifies ``sig`` against the same formula (see
     ``node_server.git_proxy._sign``). The 4-segment shape supersedes the old
-    2-segment ``<task_id>.<sig>``; old tokens fail validation after deploy, which
+    2-segment ``<id>.<sig>``; old tokens fail validation after deploy, which
     is fine — a re-dispatch re-mints with the new shape.
+
+    ``principal_id`` is a Task id (per-task credential) or an Environment id
+    (per-environment credential, for a checkout that outlives any single task).
+    Both are UUIDs, so nothing here distinguishes them; the proxy picks the
+    resolution path by which table holds the id.
     """
     import hashlib
     import hmac
@@ -154,14 +213,14 @@ def _git_proxy_token(task_id: str, scope: str = _GIT_PROXY_SCOPE_MAIN, mode: str
     mode = mode if mode in (_GIT_PROXY_MODE_RO, _GIT_PROXY_MODE_RW) else _GIT_PROXY_MODE_RO
     digest = hmac.new(
         key,
-        f"{_GIT_PROXY_DOMAIN}:{task_id}:{scope}:{mode}".encode("utf-8"),
+        f"{_GIT_PROXY_DOMAIN}:{principal_id}:{scope}:{mode}".encode("utf-8"),
         hashlib.sha256,
     )
-    return f"{task_id}.{scope}.{mode}.{digest.hexdigest()[:32]}"
+    return f"{principal_id}.{scope}.{mode}.{digest.hexdigest()[:32]}"
 
 
 def _git_proxy_url(
-    task_id: str,
+    principal_id: str,
     scope: str = _GIT_PROXY_SCOPE_MAIN,
     mode: str = _GIT_PROXY_MODE_RO,
     *,
@@ -183,7 +242,7 @@ def _git_proxy_url(
     (see :func:`project_service.parse_gitmodules` + the proxy's ``r/`` route).
     """
     origin = _git_proxy_origin()
-    token = _git_proxy_token(task_id, scope, mode)
+    token = _git_proxy_token(principal_id, scope, mode)
     suffix = _GIT_PROXY_PATH
     if repo_path:
         suffix = f"{suffix}/r/{repo_path}"
@@ -200,6 +259,28 @@ def _host_relative_path(repo_url: str) -> str:
     parsed = urlparse(repo_url.strip())
     path = (parsed.path or "").strip("/")
     return path
+
+
+def environment_git_proxy_url(env_id: str, repo_url: str) -> str:
+    """Clone URL an environment's long-lived checkout uses.
+
+    Same proxy, same token shape as a task's — only the id differs (an
+    environment id instead of a task id), which is what lets ONE checkout serve
+    every task that runs on the environment. ``rw`` because an environment's
+    working tree is where work is committed and pushed from.
+
+    Raises when the proxy is not configured: a private repo has no other way to
+    authenticate, and shipping a credential-less URL would fail at the node with
+    an opaque git error instead of naming the missing deployment setting.
+    """
+    if not _git_proxy_origin():
+        raise ValueError("git_proxy_origin_missing")
+    if not _git_proxy_control_token():
+        raise ValueError("git_proxy_token_missing")
+    return _git_proxy_url(
+        str(env_id), _GIT_PROXY_SCOPE_MAIN, _GIT_PROXY_MODE_RW,
+        repo_path=_host_relative_path(repo_url),
+    )
 
 
 @dataclass
@@ -349,6 +430,195 @@ async def _validate_models_for_key(
     return legal, resolved_active
 
 
+# 各 provider 的模型映射形状（各按编辑器原生结构，不做统一抽象）：
+#   main  = 当前模型（claude 是档名别名如 "opus"，下发成 ANTHROPIC_MODEL；其余=平台模型）
+#   slots = 编辑器原生用途槽，每槽 {model, fallback_models[]}；键随 provider：
+#     claude   : 档名 opus/sonnet/haiku/fable → ANTHROPIC_DEFAULT_{档}_MODEL
+#     codex    : 目录条目名 → CODEX_MODEL_CATALOG（我们的扩展，映射进 model_catalog_json）
+#     opencode : OMO agents 表（agent 名 → 平台模型）→ oh-my-openagent.json 的 agents 段
+#     dsh      : provider 的 models 目录条目 → settings.yaml models
+#     gemini / cursor：无槽，只有 main
+#   categories（仅 opencode）: OMO 的第二张表 categories，与 slots(=agents) 并列，
+#     合并进 oh-my-openagent.json 的 categories 段——OMO 自己就是两张独立表。
+# 兼容旧形状（roles/fallback/catalog/models/model）：读取时经 _migrate_model_mapping 归一。
+_MAPPING_CLAUDE_ROLES = ("sonnet", "opus", "fable", "haiku")
+# claude 无 main 时的默认档（用户口径：claude 主模型就是 opus 档）。
+_CLAUDE_DEFAULT_TIER = "opus"
+
+
+def _migrate_model_mapping(provider: str, raw: dict) -> dict:
+    """把旧映射形状归一成 {main, slots, categories}，保留已有新形状不动。
+
+    opencode 的 OMO 有两张独立表（agents/categories），归一后 slots=agents、
+    categories=categories——两者不合并。
+    """
+    if "main" in raw or "slots" in raw or "categories" in raw:
+        return raw
+    provider = (provider or "").strip().lower()
+    if provider == "claude":
+        roles = raw.get("roles") if isinstance(raw.get("roles"), dict) else {}
+        slots = {
+            k: {"model": str(v or "").strip()}
+            for k, v in roles.items()
+            if str(v or "").strip()
+        }
+        # claude 的 main 是档名别名（主模型），不是旧 ``fallback``（那是"哪档都没
+        # 命中时的兜底"，如 opus-callback，曾被误当主模型）。旧形状没显式档位时
+        # 按用户口径默认 opus 档；旧 fallback 仅在它本身就是档名时才沿用。
+        fallback = str(raw.get("fallback") or "").strip()
+        if fallback and fallback.lower() in _CLAUDE_TIER_ALIASES:
+            main = fallback
+        else:
+            main = _CLAUDE_DEFAULT_TIER
+        return {"main": main, "slots": slots}
+    if provider in ("codex", "opencode", "dsh"):
+        rows = raw.get("catalog") if provider == "codex" else raw.get("models")
+        slots = {}
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("name") or row.get("model") or "").strip()
+                model = str(row.get("model") or "").strip()
+                if name and model:
+                    slots[name] = {"model": model}
+        main = str(raw.get("fallback") or "").strip()
+        return {"main": main, "slots": slots}
+    # gemini / cursor：单 model 即 main
+    return {"main": str(raw.get("model") or "").strip(), "slots": {}}
+
+
+def _clean_slot_entry(slot: dict, legal_set: set[str]) -> dict | None:
+    """把一个槽条目归一成 {model, fallback_models?}，非法值剔除。"""
+    if not isinstance(slot, dict):
+        return None
+    model = str(slot.get("model") or "").strip()
+    if not model or model not in legal_set:
+        return None
+    entry: dict = {"model": model}
+    chain = slot.get("fallback_models")
+    if isinstance(chain, list):
+        cleaned = [str(x or "").strip() for x in chain if str(x or "").strip() in legal_set]
+        if cleaned:
+            entry["fallback_models"] = cleaned
+    return entry
+
+
+def _mapping_model_values(provider: str, raw: dict | None) -> list[str]:
+    """从映射里抽出所有平台模型值（main + agents/categories 各槽 model + 降级链），供父 Key 校验。"""
+    if not isinstance(raw, dict) or not raw:
+        return []
+    norm = _migrate_model_mapping(provider, raw)
+    out: list[str] = []
+
+    def _add(v):
+        s = str(v or "").strip()
+        if s:
+            out.append(s)
+
+    def _add_slot(slot):
+        if not isinstance(slot, dict):
+            return
+        _add(slot.get("model"))
+        chain = slot.get("fallback_models")
+        if isinstance(chain, list):
+            for item in chain:
+                _add(item)
+
+    # claude 的 main 是档名别名（opus/sonnet/…，= ANTHROPIC_MODEL），不是平台模型，
+    # 不参与父 Key 校验——其余 provider 的 main 是平台模型，要校验。
+    if (provider or "").strip().lower() != "claude":
+        _add(norm.get("main"))
+    slots = norm.get("slots") if isinstance(norm.get("slots"), dict) else {}
+    for slot in slots.values():
+        _add_slot(slot)
+    # opencode 的第二张表（OMO categories），与 slots(=agents) 并列。
+    categories = norm.get("categories") if isinstance(norm.get("categories"), dict) else {}
+    for slot in categories.values():
+        _add_slot(slot)
+    return out
+
+
+async def _normalize_model_mapping(
+    provider: str, raw: dict | None, parent_api_key_id: int | None
+) -> dict | None:
+    """收口模型映射：校验形状 + 每个平台模型值落在父 Key 可执行集合内。
+
+    不合法的模型值（不可供给/不在白名单/越父 Key）直接抛错，而不是静默丢——
+    映射里的模型名会原样写进编辑器配置（codex catalog / opencode models / dsh
+    settings.yaml），静默丢会让编辑器指向一个网关拒认的模型名，派发时才失败。
+
+    main 的校验按 provider 分别处理（见 _migrate_model_mapping 注释）：
+    - claude：main 是档名别名（opus/…，CLI 自己认）时不校验；是平台模型 id 时校验。
+    - 其余：main 是平台模型，必填且校验。
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+
+    provider = (provider or "").strip().lower()
+    norm = _migrate_model_mapping(provider, raw)
+    main_raw = str(norm.get("main") or "").strip()
+
+    # 先装好待校验的平台模型值：_mapping_model_values 已排除 claude 的 main（档名
+    # 不是平台模型），这里补回「claude main 是平台模型 id」的场景——它需要过校验。
+    # 空值判断放它之后：claude main=档名 且无槽时 values 为空，但仍是一份合法映射。
+    values = _mapping_model_values(provider, raw)
+    if provider == "claude" and main_raw and main_raw.lower() not in _CLAUDE_TIER_ALIASES:
+        values.append(main_raw)
+
+    if not values:
+        # 没有任何平台模型要校验：claude 只给档名 main（无槽）→ 合法；其它情况视为没配。
+        if provider == "claude" and main_raw:
+            return {"main": main_raw, "slots": {}}
+        return None
+
+    legal, _ = await _validate_models_for_key(parent_api_key_id, values, active_model=values[0])
+    legal_set = set(legal)
+    # _validate_models_for_key 会过滤掉非法值并返回 legal 子集；这里要求全部合法，
+    # 否则抛错（映射必须显式正确，见 docstring）。
+    if len(legal) != len(dict.fromkeys(values)):
+        raise ValueError("model_not_available_for_key")
+
+    # main 必填（claude 例外：main 是档名别名，缺省落 opus 档，见
+    # _migrate_model_mapping；其余 provider 的 main 是平台模型，必选——空着会让
+    # 任务运行时用编辑器自己的默认模型（往往不是网关可路由的），首轮就 404。
+    # 用户口径：主模型必选，不给留空的口子。
+    if provider != "claude" and (not main_raw or main_raw not in legal_set):
+        raise ValueError("model_mapping_fallback_required")
+    if provider == "claude":
+        if not main_raw:
+            main_raw = _CLAUDE_DEFAULT_TIER
+        # claude 的 main 下发成 ANTHROPIC_MODEL：要么是内置档名别名（opus/…，
+        # CLI 自己认），要么是父 Key 里的平台模型 id（网关解析）。两头都不沾的
+        # 值会让 CLI 拿着一个没人认的名字发请求，直接拒。
+        if main_raw.lower() not in _CLAUDE_TIER_ALIASES and main_raw not in legal_set:
+            raise ValueError("model_not_available_for_key")
+
+    slots_in = norm.get("slots") if isinstance(norm.get("slots"), dict) else {}
+    slots_out: dict[str, dict] = {}
+    for key, slot in slots_in.items():
+        name = str(key or "").strip()
+        if not name:
+            continue
+        entry = _clean_slot_entry(slot, legal_set)
+        if entry:
+            slots_out[name] = entry
+    out: dict = {"main": main_raw, "slots": slots_out}
+    # opencode 的第二张表（OMO categories）：与 slots(=agents) 并列保留。
+    categories_in = norm.get("categories") if isinstance(norm.get("categories"), dict) else {}
+    if categories_in:
+        categories_out: dict[str, dict] = {}
+        for key, slot in categories_in.items():
+            name = str(key or "").strip()
+            if not name:
+                continue
+            entry = _clean_slot_entry(slot, legal_set)
+            if entry:
+                categories_out[name] = entry
+        out["categories"] = categories_out
+    return out
+
+
 def _merge_mcp_config(base: list[dict] | None, overlay: list[dict] | None) -> list[dict]:
     """Merge task base MCP config with its per-task overlay by name.
 
@@ -406,6 +676,25 @@ def _task_reasoning_effort(task: Task) -> str:
     return str(snapshot["reasoning_effort"] or "") if "reasoning_effort" in snapshot else "medium"
 
 
+def _attach_resume_tag(req: dict, task: Task) -> None:
+    """给派发请求补上「续接原编辑器会话」的提示。
+
+    采用外部会话（环境会话「同步为任务」）的任务，原会话的 uuid 落在
+    ``Task.source_editor_session_id``。这个提示**不进 config_snapshot**——它只在建任务
+    当场的派发里有效（见 adopt 的免派发语义），所以任何时候**重新派发**（懒派发 /
+    恢复派发 / 运行时重启）都必须在这里从 Task 行重建，否则节点会开一个全新会话，
+    原上下文就丢了。没采用过的任务（该字段为空）原样不加。
+    """
+    thread = str(getattr(task, "source_editor_session_id", None) or "").strip()
+    if not thread:
+        return
+    tags = req.get("_session_tags")
+    if not isinstance(tags, dict):
+        tags = {}
+    tags["resume_thread_id"] = thread
+    req["_session_tags"] = tags
+
+
 # Bring-up steps in execution order, with the words the UI shows. Keyed by the
 # short form stored in ``mc_tasks.runtime_stage`` (see node_server.task_stage
 # ``stage_key``). ``index``/``total`` let the page render "2/4" without the
@@ -432,6 +721,23 @@ _RUNTIME_STAGE_TOTAL = len(_RUNTIME_STAGES) - 1
 
 # The task is done preparing once the node reports this stage.
 RUNTIME_STAGE_READY = "running"
+
+
+def _status_frame(task: Task, status: str) -> dict:
+    """Build the SSE frame announcing a task status change.
+
+    Carries the same fields the detail DTO does for the state machines the badge
+    renders, so the page can update the badge in place instead of re-fetching the
+    whole detail. Emitted alongside the runtime event that caused the transition
+    (never persisted — the durable record is ``mc_task_status_history``).
+    """
+    return {
+        "kind": "status",
+        "status": status,
+        "task_id": str(task.id),
+        "workspace_state": getattr(task, "workspace_state", "") or "",
+        "runtime_stage": _task_runtime_stage(task),
+    }
 
 
 def _task_runtime_stage(task: Task) -> dict | None:
@@ -498,7 +804,6 @@ def _task_summary(task: Task) -> dict:
         "env_name": str(config_snapshot.get("env_name") or "") or None,
         "workspace_key": task.workspace_key,
         "workspace_state": task.workspace_state,
-        "workspace_source_task_id": task.workspace_source_task_id,
         "dispatch_error": str(config_snapshot.get("dispatch_error") or "") or None,
         # Which bring-up step the node last reported (prepare workspace / clone /
         # runtime pre-flight / start), so the page can say where a task is — or
@@ -509,6 +814,10 @@ def _task_summary(task: Task) -> dict:
         "source_editor_id": task.source_editor_id,
         "source_editor_session_id": task.source_editor_session_id,
         "models": list(task.models_snapshot or []) if isinstance(task.models_snapshot, list) else [],
+        # 模型映射（详情页只读展示 + 编辑弹框回填）。空 = 未配映射（老任务回落
+        # models 白名单语义）。llm 配置按消息现算（send 路径每轮重建），改这里
+        # 存库即「下一轮消息生效」，不需要热下发。
+        "model_mapping": dict(task.model_mapping) if isinstance(task.model_mapping, dict) else None,
         "api_key_id": task.api_key_id,
         "parent_api_key_id": task.parent_api_key_id,
         "usage_limit": dict(task.usage_limit or {}) if isinstance(task.usage_limit, dict) else {},
@@ -567,12 +876,9 @@ async def _enrich_task_summary(
 async def _task_detail(task: Task) -> dict:
     detail = await _enrich_task_summary(task, _task_summary(task))
     detail["content"] = task.content
-    detail["log_store"] = task.log_store
     # mcp_config 改从 principal grants 派生（名字/transport 列表，无密钥）；
     # 退役的 mcp_config 列不再作为 DTO 来源。
     detail["mcp_config"] = await _task_mcp_grant_summary(task)
-    detail["skill_config"] = _redact_resource_config(task.skill_config)
-    detail["plugin_config"] = _redact_resource_config(task.plugin_config)
     detail["mcp_overlay"] = _redact_resource_config(task.mcp_overlay_json)
     detail["mcp_principal"] = await _task_principal_view(task)
     return detail
@@ -657,30 +963,6 @@ async def _task_principal_view(task: Task) -> dict | None:
         "service_ids": services,
         "params": params,
     }
-
-
-# Standard note prefixed to every human turn delivered to a runtime (Part 4.3):
-# the agent must not expect a real credential in .git/config and must not
-# hand-craft credential-bearing remotes — the workspace is provisioned with
-# clean URLs and the credential is supplied out of band, so plain `git` works.
-_GIT_CREDENTIAL_NOTE = (
-    "仓库凭据由任务范围的签名 token 与环境变量管理，git 远程地址不含凭据；"
-    "请勿尝试从 .git/config / git remote 读取或拼接带凭据的 URL，"
-    "直接使用 git 命令完成拉取/提交/推送即可。"
-)
-
-
-def _with_git_credential_note(content: str) -> str:
-    """Prepend the git-credential note to one human turn.
-
-    Prefixed per turn rather than once per session: it is stateless (no
-    "was it already sent for this handle" bookkeeping across re-dispatch and
-    runtime revival), and it survives the provider CLI compacting its context —
-    which is exactly when an agent would otherwise start guessing at credentials.
-    The note is short, so the per-turn cost is a constant handful of tokens.
-    """
-    body = (content or "").strip()
-    return f"{_GIT_CREDENTIAL_NOTE}\n\n{body}".strip() if body else _GIT_CREDENTIAL_NOTE
 
 
 class TaskService:
@@ -780,7 +1062,8 @@ class TaskService:
             return None
         return await _task_detail(task)
 
-    async def create_task(self, user_id: str, req: dict, *, defer_dispatch: bool = False) -> dict:
+    async def create_task(self, user_id: str, req: dict, *, defer_dispatch: bool = False,
+                          no_dispatch: bool = False) -> dict:
         """Persist a task; mint its child key; start the runtime when enabled.
 
         The row is created first so the task is always visible even if the
@@ -811,9 +1094,45 @@ class TaskService:
         node_id = (req.get("node_id") or "").strip()
         wants_dispatch = bool(node_id)
 
+        # 环境是任务运行形态的单一真相源。一个环境把「哪台节点、哪个编辑器、隔离还
+        # 是不隔离」三件事钉死了（见 models_environment.TaskEnvironment），任务快照
+        # 只记录它用了哪个环境。请求里另带的 node/provider 在有环境时一律让位——
+        # 三者各说各话正是之前"四不像"的根源。
+        env_ref = str(req.get("env_id") or "").strip()
+        env_mode_override: str | None = None
+        if env_ref:
+            from .models_environment import TaskEnvironment
+
+            env_uuid = _maybe_uuid(env_ref)
+            env_row = (
+                await TaskEnvironment.get_or_none(id=env_uuid, user_id=uuid.UUID(user_id))
+                if env_uuid is not None
+                else None
+            )
+            if env_row is not None:
+                # 节点跟着环境走：检出就在那台机器上，换节点等于没有代码。
+                node_id = str(env_row.node_id or "").strip() or node_id
+                wants_dispatch = bool(node_id)
+                if str(env_row.provider or "").strip():
+                    provider = str(env_row.provider).strip().lower()
+                # 隔离与否决定编辑器的 HOME 落在哪：隔离 = 环境自己的目录（旧
+                # shared 档），不隔离 = 节点操作者的真实 HOME（旧 system 档）。
+                # 隔离与否是从工作区模式推出来的（目录是谁的，配置就跟着谁），
+                # 不是环境行上那个可以各说各话的旧布尔。
+                from .models_environment import resolve_isolated
+
+                env_mode_override = (
+                    "shared" if resolve_isolated(str(env_row.workspace_mode or "")) else "system"
+                )
+
         # A runnable Task must carry a parent key so it can mint its own child
         # key. No parent key ⇒ storage/draft only; node dispatch is refused.
-        if wants_dispatch and not parent_api_key_id:
+        #
+        # 例外：``_allow_keyless_dispatch`` —— 采用外部编辑器会话时（环境会话
+        # 「同步为任务」）用户明确不选 Key，让节点上的编辑器用它自己的登录态跑
+        # （老流程）。此时不铸子 Key、不下发 llm 配置，编辑器按自己的 ~/.claude
+        # 走；平台侧只承载任务记录与续接提示。
+        if wants_dispatch and not parent_api_key_id and not req.get("_allow_keyless_dispatch"):
             raise ValueError("parent_api_key_required")
 
         # 写入边界校验：父 Key 存在时，models 与激活 model_id 必须落在该 Key
@@ -827,9 +1146,18 @@ class TaskService:
             models_list,
             active_model=(req.get("model_id") or (models_list[0] if models_list else None)),
         )
-        _reject_claude_reserved_models(provider, validated_models)
+        # 模型映射：映射里的每个平台模型都必须落在父 Key 可执行集合内（与上面
+        # models 同一口径），拒掉非法值否则派发时网关阶段才失败。形状按 provider
+        # 收口在 _normalize_model_mapping。
+        model_mapping = await _normalize_model_mapping(
+            provider, req.get("model_mapping"), parent_api_key_id
+        )
+        # claude 保留别名校验放在映射收口之后：配了映射的任务，其 main 本就是
+        # 档名别名（opus/sonnet/…），要放行（has_mapping=True）。
+        _reject_claude_reserved_models(provider, validated_models, has_mapping=bool(model_mapping))
         if validated_model is not None and _is_claude_reserved_model_alias(validated_model):
-            raise ValueError(f"claude_reserved_model_alias:{validated_model}")
+            if not (model_mapping and validated_model.strip().lower() in _CLAUDE_TIER_ALIASES):
+                raise ValueError(f"claude_reserved_model_alias:{validated_model}")
         req = dict(req)
         req["models"] = validated_models or None
         if validated_model is not None:
@@ -855,14 +1183,9 @@ class TaskService:
         # while mapping the public fields into the same node-session shape.
         # ``mcp_config`` 不再映射进 _session_mcps：派发层改从 task principal 的
         # grants 推导（见 _principal_mcp_specs），请求负载翻译成 grants 写入。
+        # skill_config/plugin_config 也不再映射：资源归环境（环境页装、节点同步），
+        # 任务不携带技能/插件配置；内部调用方（评审/issue）直接传 _session_* 键。
         req = dict(req)
-        for public_key, internal_key in (
-            ("skill_config", "_session_skills"),
-            ("plugin_config", "_session_plugins"),
-        ):
-            items = req.get(public_key)
-            if internal_key not in req and isinstance(items, list):
-                req[internal_key] = [dict(item) for item in items if isinstance(item, dict)]
 
         task = await Task.create(
             id=uuid.uuid4(),
@@ -871,7 +1194,6 @@ class TaskService:
             sub_type=req.get("sub_type") or None,
             mode=(req.get("mode") or None),
             mode_label=(req.get("mode_label") or None),
-            mode_capability_snapshot=req.get("mode_capability_snapshot") or None,
             # 创建时没让用户起名：content 非空即首条对话，直接由它补齐任务名；
             # content 为空则留给详情页首条消息补齐（send_task_message）。
             title=(_derive_task_title(content) or None),
@@ -882,28 +1204,29 @@ class TaskService:
             workspace_key=f"task_{uuid.uuid4().hex}",
             workspace_state="pending",
             models_snapshot=req.get("models") or None,
+            model_mapping=model_mapping,
             config_snapshot={
                 "system_prompt": req.get("system_prompt"),
                 "resource": req.get("resource"),
                 "reasoning_effort": str(req.get("reasoning_effort") or "medium"),
-                "env_mode": (req.get("env_mode") or "").strip().lower() or None,
+                "env_mode": env_mode_override or (req.get("env_mode") or "").strip().lower() or None,
                 "env_id": (req.get("env_id") or "").strip() or None,
                 "env_name": (req.get("env_name") or "").strip() or None,
                 # 环境自带资源的激活子集（名字列表）。空/缺失 = 全激活；非空 =
                 # 只激活这些。写入边界见 _build_session 的 shared/system 分支。
                 "active_skills": _normalize_active_names(req.get("active_skills")),
                 "active_plugins": _normalize_active_names(req.get("active_plugins")),
+                # 创建 worktree（用户口径：默认是；同步任务不受影响）。False =
+                # 不给这个任务建独立工作树（环境有现成目录就直接在目录里跑）。
+                "create_worktree": req.get("create_worktree") is not False,
             },
             # mcp_config 列退役（Phase 3）：不再持久化 wire specs，任务 MCP 的
-            # 真相源是 task principal 的 mcp_grants。ORM 字段留到 Phase 4 清理。
-            skill_config=list(req.get("skill_config") or []) if isinstance(req.get("skill_config"), list) else [],
-            plugin_config=list(req.get("plugin_config") or []) if isinstance(req.get("plugin_config"), list) else [],
-            environment_snapshot=req.get("environment") or None,
+            # 真相源是 task principal 的 mcp_grants。skill_config/plugin_config 列
+            # 也已退役：资源归环境，任务不携带技能/插件配置。
             source_editor_id=(req.get("extra") or {}).get("editor_id"),
             source_editor_session_id=req.get("editor_session_id"),
             expected_client_id=expected_client_id,
             bootstrap_content_hash=bootstrap_content_hash,
-            log_store=req.get("log_store") or None,
         )
         # Seed the replay trail with the task's birth state, so a later
         # ``pending → …`` transition has something to hang off and a trail read
@@ -953,9 +1276,11 @@ class TaskService:
                     expires_at=req.get("expires_at"),
                     provider=provider,
                     rate_limit=req.get("rate_limit"),
-                    # 可用模型同源既写 models_snapshot(下面 Task.create)又收窄子 Key
-                    # 的 model_whitelist；可用编辑器(前端单选映射)收窄 editor 白名单；
-                    # selection_strategy 覆盖选择策略。省略=继承父级。
+                    # 「可用模型」白名单已从弹框删除，改用模型映射（task.model_mapping）：
+                    # 映射定的是编辑器侧模型菜单/角色，不是子 Key 白名单，所以这里
+                    # 传 None = 子 Key 继承父 Key 全量，映射外的角色请求才不会被挡。
+                    # 可用编辑器（前端单选映射）收窄 editor 白名单；selection_strategy
+                    # 覆盖选择策略。省略=继承父级。
                     model_whitelist=validated_models or None,
                     editor_provider_whitelist=req.get("editor_provider_whitelist"),
                     selection_strategy=req.get("selection_strategy"),
@@ -1028,6 +1353,21 @@ class TaskService:
         binding_link = await nodes_service.user_can_use_node(user_id, node_id)
         if binding_link is None:
             raise ValueError("node_forbidden")
+
+        if no_dispatch:
+            # 采用外部会话（环境会话「同步为任务」）的形态：任务行 + 子 Key +
+            # principal/grants 全部落库，但**不碰节点**——同步时什么动作都不做
+            # （用户口径），会话/工作区/运行时全部推迟到首条消息的懒派发
+            # （``_dispatch_persisted_task_runtime``），那时才带着 resume 标签去
+            # 续接原会话。这让「同步为任务」变成秒级操作，不等 clone/装资源。
+            # 节点授权校验（user_can_use_node，纯 DB）已经过了；节点在线的
+            # system-env 校验推迟到真正派发时（那边同款守卫），采用本身不要求节点在线。
+            logger.info("[user-platform] task {} created (no dispatch; adopted)", task.id)
+            result = await _task_detail(task)
+            if api_key_copy:
+                result["api_key"] = self._api_key_response(api_key_copy)
+            return result
+
         await self._require_system_env_allowed(node_id, req.get("env_mode"))
 
         if defer_dispatch:
@@ -1147,11 +1487,22 @@ class TaskService:
 
         try:
             await self._rewrite_repo_for_git_proxy(req, task)
-            # 派发前确保 principal「存在 + 启用」；创建时建失败的话在此补建，并
-            # 重放一次 grants（否则 _principal_mcp_specs 读到空，会话静默丢工具）。
+            # Environment-backed workspace: when the task's environment is set to
+            # the worktree mode, the node gets a shared checkout to cut from
+            # instead of cloning per task. Must run AFTER the proxy rewrite — it
+            # replaces the per-task credential with the environment's.
+            await self._apply_environment_workspace(req, task)
+            # 会话同步：环境上配了但还没下发到节点的资源（插件/skill），在派发前补
+            # 一次真装。没有这一步，用户在环境页加了资源却忘了点「同步」，会话就
+            # 静默地在缺能力的环境里跑——那是「我明明加了插件，任务里没有」的根因。
+            # 放在 workspace 之后：两者都读同一个环境行，先确定环境可用再谈资源。
+            await self._sync_environment_for_dispatch(task)
+            # 派发前确保 principal「存在 + 启用」；创建时建失败的话在此补建。
             await self._ensure_task_mcp_principal(task)
-            if req.get("mcp_config"):
-                await self._sync_task_mcp_service_grants(task, req.get("mcp_config"))
+            # 策略归环境：把环境的 MCP 行投影成 principal 的 service grants（保留
+            # param 行=实例绑定）。环境改 MCP → 下次派发自动跟上。无环境（评审/隔离
+            # /历史）跳过，保留 create 时写入的 grants。
+            await self._sync_task_mcp_service_grants_from_env(task)
             # session mcps 改从 principal grants 推导（kind-aware 网关 spec / stdio
             # command 行），不再抄 task.mcp_config 的全量 wire specs（含上游密钥）。
             # req 里已有的 _session_mcps（内部调用方，如 webhook review）作为 base，
@@ -1269,7 +1620,9 @@ class TaskService:
         except Exception as exc:
             logger.exception("[user-platform] task {} orchestration failed", task.id)
             await self._disable_task_mcp_principal(task)
-            await self._mark_dispatch_failed(task, str(exc) or "派发异常", terminal=True)
+            await self._mark_dispatch_failed(
+                task, _dispatch_failure_text(exc), terminal=True
+            )
         if (getattr(task, "workspace_state", "") or "") == "dispatch_failed" and (
             getattr(task, "status", "") or "") == "error":
             # Terminal dispatch failure: the pre-persisted first turn (deferred
@@ -1381,13 +1734,186 @@ class TaskService:
         active_model = await self._resolve_task_active_model(task, req)
         effort = _task_reasoning_effort(task)
         extra = {"REASONING_EFFORT": effort} if effort else {}
+        # 模型映射（弹框配的 per-provider 表）优先于快照：它描述的是编辑器侧
+        # 的模型菜单/档位（claude 档名、codex 目录、opencode/dsh 模型表），contextWindow
+        # 由网关模型元数据补齐（弹框不收，见 create_task）。
+        raw_mapping = getattr(task, "model_mapping", None)
+        mapping = raw_mapping if isinstance(raw_mapping, dict) else None
+        model = active_model
+        if mapping:
+            model = await self._apply_model_mapping(task, mapping, plaintext_key, extra, active_model)
         return {
             "endpoint": endpoint,
             "apiKey": plaintext_key,
-            "model": active_model,
+            "model": model,
             "protocol": "responses" if task.provider == "codex" else "chat",
             "extra": extra,
         }
+
+    async def _apply_model_mapping(
+        self,
+        task: Task,
+        mapping: dict,
+        plaintext_key: str,
+        extra: dict,
+        active_model: str,
+    ) -> str:
+        """把 task.model_mapping 翻译成节点 llm.extra 的键，返回主模型名。
+
+        映射形状统一为 {main, slots}（见 _migrate_model_mapping）。extra 键与
+        节点 runner 的读取点一一对应：
+          - claude:  ``ANTHROPIC_MODEL``（主模型=档名）+ ``ANTHROPIC_DEFAULT_{档}_MODEL``（每档翻译）
+          - codex:   ``CODEX_MODEL_CATALOG``（Go 写 model_catalog_json 文件）
+          - opencode:``OPENCODE_MODELS``（JS 合并进 opencode.json models 段）
+          - dsh:     ``DSH_MODELS``（JS 写 settings.yaml models 列表）
+          - gemini/cursor: 只定主模型，无结构化映射。
+        返回值 = main（即任务主模型），与 llm.model 同源，二者必须一致。
+        """
+        def _clean(v) -> str:
+            return str(v or "").strip()
+
+        norm = _migrate_model_mapping(task.provider or "", mapping)
+        main = _clean(norm.get("main"))
+        slots = norm.get("slots") if isinstance(norm.get("slots"), dict) else {}
+
+        # 模型元数据（contextWindow）按需取一次：只有 codex/opencode/dsh 的
+        # 目录条目需要，claude 的角色变量与单模型 provider 用不到。
+        def _needs_context() -> bool:
+            if task.provider in ("codex", "opencode", "dsh"):
+                return True
+            return False
+
+        ctx_by_id: dict[str, int] = {}
+        if _needs_context():
+            try:
+                from rate_limiter import ModelClientPool
+
+                resp = await ModelClientPool.get_models_response(api_key=plaintext_key or None)
+                for m in (resp.get("data") or []):
+                    if not isinstance(m, dict) or not m.get("id"):
+                        continue
+                    try:
+                        ctx_by_id[str(m["id"])] = int(m.get("max_context_tokens") or 0)
+                    except (TypeError, ValueError):
+                        continue
+            except Exception as exc:  # noqa: BLE001 — 元数据缺失不该挡映射下发
+                logger.warning(
+                    "[user-platform] task {} model metadata fetch failed: {}", task.id, exc
+                )
+
+        provider = (task.provider or "").strip().lower()
+        if provider == "claude":
+            # 主模型 = 档名别名（opus/sonnet/haiku/fable），下发成 ANTHROPIC_MODEL。
+            # 四个档翻译表（slots.tier.model）下发成 ANTHROPIC_DEFAULT_{档}_MODEL。
+            if main:
+                extra["ANTHROPIC_MODEL"] = main
+            env_key_by_role = {
+                "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            }
+            for role, env_key in env_key_by_role.items():
+                slot = slots.get(role) if isinstance(slots.get(role), dict) else {}
+                value = _clean(slot.get("model"))
+                if value:
+                    extra[env_key] = value
+            return main or active_model
+        if provider == "codex":
+            catalog = []
+            for key, slot in slots.items():
+                if not isinstance(slot, dict):
+                    continue
+                model = _clean(slot.get("model"))
+                if not model:
+                    continue
+                name = _clean(key) or model
+                catalog.append({
+                    "name": name,
+                    "model": model,
+                    "context_window": ctx_by_id.get(model, 0),
+                })
+            if catalog:
+                extra["CODEX_MODEL_CATALOG"] = json.dumps(catalog, ensure_ascii=False)
+            return main or active_model
+        if provider == "opencode":
+            # OPENCODE_MODELS = /model 菜单里的可选模型（{平台模型id: {name, limit}}）。
+            # OPENCODE_AGENT_CONFIG = OMO（oh-my-openagent）的槽表：OMO 自己是两张
+            # 独立表——slots=agents、categories=categories，各槽 {model,
+            # fallback_models[]}，值是带 ``agent-compose/`` provider 前缀的模型串
+            # （与节点侧写 opencode.json 用的 provider id 一致，见
+            # editorconfig.writeOpenCodeRuntimeConfig）。OMO 配置文件是 opencode 目录
+            # 下独立的 oh-my-openagent.json，由 JS runner 落到会话临时配置目录。
+            models = {}
+            agent_slots: dict[str, dict] = {}
+            for key, slot in slots.items():
+                if not isinstance(slot, dict):
+                    continue
+                model = _clean(slot.get("model"))
+                if not model:
+                    continue
+                name = _clean(key) or model
+                models[model] = {
+                    "name": name,
+                    "limit": {"context": ctx_by_id.get(model, 0)},
+                }
+                entry: dict = {"model": f"agent-compose/{model}"}
+                chain = slot.get("fallback_models")
+                if isinstance(chain, list):
+                    cleaned_chain = [f"agent-compose/{_clean(x)}" for x in chain if _clean(x)]
+                    if cleaned_chain:
+                        entry["fallback_models"] = cleaned_chain
+                agent_slots[name] = entry
+            category_slots: dict[str, dict] = {}
+            raw_categories = mapping.get("categories")
+            if isinstance(raw_categories, dict):
+                for key, slot in raw_categories.items():
+                    if not isinstance(slot, dict):
+                        continue
+                    model = _clean(slot.get("model"))
+                    if not model:
+                        continue
+                    name = _clean(key) or model
+                    models[model] = {
+                        "name": name,
+                        "limit": {"context": ctx_by_id.get(model, 0)},
+                    }
+                    entry: dict = {"model": f"agent-compose/{model}"}
+                    chain = slot.get("fallback_models")
+                    if isinstance(chain, list):
+                        cleaned_chain = [f"agent-compose/{_clean(x)}" for x in chain if _clean(x)]
+                        if cleaned_chain:
+                            entry["fallback_models"] = cleaned_chain
+                    category_slots[name] = entry
+            if models:
+                extra["OPENCODE_MODELS"] = json.dumps(models, ensure_ascii=False)
+            if agent_slots or category_slots:
+                omo: dict = {}
+                if agent_slots:
+                    omo["agents"] = agent_slots
+                if category_slots:
+                    omo["categories"] = category_slots
+                extra["OPENCODE_AGENT_CONFIG"] = json.dumps(omo, ensure_ascii=False)
+            return main or active_model
+        if provider == "dsh":
+            models = []
+            for key, slot in slots.items():
+                if not isinstance(slot, dict):
+                    continue
+                model = _clean(slot.get("model"))
+                if not model:
+                    continue
+                name = _clean(key) or model
+                models.append({
+                    "id": model,
+                    "name": name,
+                    "contextWindow": ctx_by_id.get(model, 0),
+                })
+            if models:
+                extra["DSH_MODELS"] = json.dumps(models, ensure_ascii=False)
+            return main or active_model
+        # gemini / cursor：单模型 = main
+        return main or active_model
 
 
     async def _record_review_session_id(self, review_lease_id: str, session_id: str) -> None:
@@ -1418,6 +1944,60 @@ class TaskService:
                 return project.git_identity_id
         return None
 
+    async def _sync_environment_for_dispatch(self, task: Task) -> None:
+        """派发前，把环境上改过但还没下发的资源真装到节点（会话同步）。
+
+        环境的资源是「期望状态」，装到节点是另一回事，两者靠 revision 对账：
+        ``revision > synced_revision`` 就是待同步。只有环境页上的「同步」按钮会
+        补装，所以只在环境页加了插件却没点同步就直接开会话——会话跑在缺那份
+        能力的环境里，而页面上明明写着「已添加」。这一步让会话自己兜底：派发时
+        发现待同步就先装一次，装完 ``synced_revision`` 跟上，待同步标记自然消失。
+
+        只在待同步时才做：revision 机制存在的意义就是跳过这一轮网络往返，不该
+        每次开任务都重装一遍。失败不阻断派发——缺一个 skill 远比一个能跑的任务
+        好接受，且 ``sync_environment`` 已把错误落到 ``last_sync_error``，页面照
+        样看得到，下次派发还会再试（因为 revision 依旧领先）。
+        """
+        cfg = task.config_snapshot if isinstance(task.config_snapshot, dict) else {}
+        env_id = str(cfg.get("env_id") or "").strip()
+        if not env_id:
+            return
+        env_uuid = _maybe_uuid(env_id)
+        if env_uuid is None:
+            return
+
+        from .environment_service import EnvironmentError, sync_environment
+        from .models_environment import TaskEnvironment
+
+        env = await TaskEnvironment.get_or_none(id=env_uuid, user_id=task.user_id)
+        if env is None or not env.enabled:
+            return
+        if int(env.revision or 0) <= int(env.synced_revision or 0):
+            return
+
+        try:
+            from .config import gateway_base_url_for_nodes, settings
+            from .deps import resolve_team_id
+
+            team_id = await resolve_team_id(str(task.user_id))
+            await sync_environment(
+                str(task.user_id),
+                str(env.id),
+                team_id=team_id,
+                request_base_url=gateway_base_url_for_nodes(settings),
+            )
+        except EnvironmentError as exc:
+            # 环境页的 sync 路径同款处理：错误已落在 last_sync_error，可见可重试。
+            logger.warning(
+                "[user-platform] env sync on dispatch task={} env={} failed: {}",
+                task.id, env.id, exc.message,
+            )
+        except Exception as exc:  # noqa: BLE001 - 同步失败不该让会话起不来
+            logger.exception(
+                "[user-platform] env sync on dispatch task={} env={} error: {}",
+                task.id, env.id, exc,
+            )
+
     async def _rewrite_repo_for_git_proxy(self, req: dict, task: Task) -> None:
         """Rewrite a private-repo task's clone URL to the server-side git proxy.
 
@@ -1447,15 +2027,24 @@ class TaskService:
         # authenticates with keys, not a URL credential, so leave it untouched.
         if not repo_url.startswith(("https://", "http://")):
             return
-        if not _git_proxy_origin():
-            return
-        # No shared control token ⇒ the proxy keys its HMAC on an empty secret
-        # and refuses (503). Keep the existing direct-clone behavior instead of
-        # shipping a URL the node can't use.
-        if not _git_proxy_control_token():
-            return
+        # An identity-less repo is a PUBLIC repo: a direct clone is the correct
+        # behavior (there is no credential to inject), not a degradation.
         if await self._effective_git_identity_id(task.id) is None:
             return
+        # From here on the repo is PRIVATE and we have a credential for it, so the
+        # proxy is the only path that can authenticate the clone. The three
+        # preconditions below used to `return` silently — which left a private
+        # clone to run with no credential, and git then either failed opaquely or
+        # (on a host with a credential helper) prompted for an account/password.
+        # Raise instead, naming the exact missing piece: this is a deployment
+        # misconfiguration an operator can fix, and the message is what reaches
+        # dispatch_error / the task page.
+        if not _git_proxy_origin():
+            raise ValueError("git_proxy_origin_missing")
+        if not _git_proxy_control_token():
+            # No shared control token ⇒ the proxy keys its HMAC on an empty secret
+            # and refuses (503). Shipping the URL anyway would fail at the node.
+            raise ValueError("git_proxy_token_missing")
         rewritten = dict(repo)
         rewritten["repo_url"] = _git_proxy_url(
             str(task.id), _GIT_PROXY_SCOPE_MAIN, _GIT_PROXY_MODE_RW,
@@ -1470,6 +2059,115 @@ class TaskService:
             await self._persist_submodule_allowlist(task, repo_url, (repo.get("branch") or "").strip())
         except Exception:  # noqa: BLE001
             logger.exception("[user-platform] task {} submodule allowlist build failed", task.id)
+
+    async def _apply_environment_workspace(self, req: dict, task: Task) -> None:
+        """任务只有两个来源，派发判断只看这一个字段（``source_editor_session_id``）：
+
+        * **同步会话**（非空）——平台把节点上已有的编辑器会话接进来管理。工作
+          目录原地不动：不切 worktree、不给凭据。唯一的节点侧动作是懒派发重建
+          会话时告诉它「跑在这个目录里」（环境的 ``external_path``，若有）——
+          provider 的会话状态按目录索引，目录错了就续接不上原对话。
+        * **新建任务**（空）——节点在环境的代码目录上 ``git worktree add`` 一个
+          任务专属工作树，对话在里面跑。代码目录是建环境时定死的一个事实：
+          导入环境 = 操作者已有的目录；新建环境 = 平台 clone 出来的那份。两种
+          情况节点收到的是同一条指令，派发层不再区分模式。任务级「创建 worktree」
+          开关可关（见下）；同步会话不受开关影响。
+
+        环境不存在/禁用照旧报错（禁用就该停，静默降级是「环境明明配了却被无视」
+        那一类 bug 的源头）。既没有代码目录也没有项目的历史行 → 什么都不做，
+        任务走历史行为（自己 clone）。本函数只在派发这一次被调用；会话跑起来
+        之后节点按 session_id 找目录，不再看任何来源。
+        """
+        cfg = task.config_snapshot if isinstance(task.config_snapshot, dict) else {}
+        env_id = str(cfg.get("env_id") or "").strip()
+        if not env_id or not isinstance(req.get("repo"), dict):
+            return
+        env_uuid = _maybe_uuid(env_id)
+        if env_uuid is None:
+            return
+
+        from .environment_service import node_native_path
+        from .models_environment import WORKSPACE_MODE_EXTERNAL, WORKSPACE_MODE_WORKTREE, TaskEnvironment
+        from .models_project import Project
+
+        env = await TaskEnvironment.get_or_none(id=env_uuid, user_id=task.user_id)
+        if env is None or not env.enabled:
+            # A disabled environment must not silently fall back to a per-task
+            # clone: that would look like the environment "worked" while quietly
+            # ignoring the setting the operator just turned off.
+            if env is not None:
+                raise ValueError("environment_disabled")
+            return
+
+        # 代码目录准备闸门：clone 属于环境这一侧（建环境时异步跑、页面可见、可
+        # 重试）。节点派发只切 worktree 不 clone，所以环境没备好就是环境的问题——
+        # 报在环境页让任务等，而不是让任务转几分钟圈或替环境兜底。
+        # （external/shared 建好即 ready，天然不落在下面两个分支。）
+        provision_state = str(getattr(env, "provision_state", "") or "").strip()
+        if provision_state == "provisioning":
+            raise ValueError("environment_provisioning")
+        if provision_state == "failed":
+            raise ValueError("environment_provision_failed")
+
+        # 环境的代码目录（建环境时定死的一个事实；虚拟形式转原生，节点用
+        # filepath.IsAbs 判目录，"/D:/x" 在 Windows 上会被判成相对路径而静默退化）。
+        checkout = ""
+        if str(env.external_path or "").strip():
+            checkout = node_native_path(str(env.external_path))
+
+        tags = req.get("_session_tags")
+        if not isinstance(tags, dict):
+            tags = {}
+
+        # 来源一：同步会话。不切 worktree；目录原地不动（有代码目录才打标签，
+        # 没有就维持历史行为——节点按 task_id 自己 clone，谈不上「原地」）。
+        if str(getattr(task, "source_editor_session_id", None) or "").strip():
+            if checkout:
+                tags["workspace_mode"] = WORKSPACE_MODE_EXTERNAL
+                tags["env_id"] = str(env.id)
+                tags["external_workdir"] = checkout
+                req["_session_tags"] = tags
+            return
+
+        # 来源二：新建任务。默认切 worktree，从环境的代码目录切。代码目录两种形态：
+        #   external_path 存在 = 导入环境的操作者目录 / fresh 环境建环境时 clone 进
+        #   用户目录的那份 → 节点从它切，不 clone、不给凭据；
+        #   两者都没有但 mode=worktree = 平台托管 clone（节点 envs/<id>/repo）→
+        #   provisioning 已备好，派发不补 clone，凭据是环境级的（活过单个任务）。
+        # 其余（历史 shared 行）没有可切的检出 → 维持历史行为，任务自己 clone。
+        #
+        # 「创建 worktree」任务级开关（默认开）。关掉 = 不给这个任务建独立工作树：
+        #   有现成目录（导入/fresh）→ 直接在环境目录里跑（external 标签）；
+        #   没有现成目录（托管 clone 环境）→ 不碰共享检出，任务自己 clone 一份
+        #   （历史行为）。同步会话不受这个开关影响（它本来就不切）。
+        if cfg.get("create_worktree") is False:
+            if checkout:
+                tags["workspace_mode"] = WORKSPACE_MODE_EXTERNAL
+                tags["env_id"] = str(env.id)
+                tags["external_workdir"] = checkout
+                req["_session_tags"] = tags
+            return
+        if not checkout and str(env.workspace_mode or "") != WORKSPACE_MODE_WORKTREE:
+            return
+        if not checkout:
+            if env.project_id is None:
+                raise ValueError("environment_has_no_project")
+            project = await Project.get_or_none(id=env.project_id)
+            repo_url = str((project.repo_url if project else "") or "").strip()
+            if not repo_url:
+                raise ValueError("environment_project_has_no_repo")
+            if repo_url.startswith(("https://", "http://")) and (
+                await self._effective_git_identity_id(task.id)
+            ) is not None:
+                req["repo"]["repo_url"] = environment_git_proxy_url(str(env.id), repo_url)
+                for credential_field in ("username", "password", "token"):
+                    req["repo"].pop(credential_field, None)
+
+        tags["workspace_mode"] = WORKSPACE_MODE_WORKTREE
+        tags["env_id"] = str(env.id)
+        if checkout:
+            tags["external_workdir"] = checkout
+        req["_session_tags"] = tags
 
     async def _persist_submodule_allowlist(self, task: Task, repo_url: str, branch: str) -> None:
         """Derive the ``.gitmodules`` submodule allowlist and store it for the proxy.
@@ -1643,9 +2341,8 @@ class TaskService:
             "projectId": str((req.get("extra") or {}).get("project_id") or ""),
             "provider": provider,
             "interactive": True,
-            "tags": {},
-        }
-        # Execution-environment isolation tier. Stored on the task's
+            "tags": dict(req.get("_session_tags") or {}),
+        }        # Execution-environment isolation tier. Stored on the task's
         # config_snapshot at create time. The node refuses env_mode=system
         # unless it opted in; shared requires env_id and the node resolves it to
         # a local dir. Empty/isolated is the historic default (per-session home).
@@ -1951,23 +2648,31 @@ class TaskService:
             client = get_local_node_client()
             if not client.enabled:
                 raise ValueError("node_server_unavailable")
-            # Resume before the availability check below rejects a parked key:
-            # finished/error disabled it, and a retried error task reaches here
-            # through start / first-message / the recovery worker.
-            await self._resume_task_api_key(current)
-            if not current.api_key_id:
-                raise ValueError("task_api_key_unavailable")
-
             from db import PostgresClient
 
-            key_row = await PostgresClient.get_api_key_by_id(int(current.api_key_id))
-            if not key_row or key_row.get("disabled") or not key_row.get("key"):
-                raise ValueError("task_api_key_unavailable")
+            # 无 Key 的采用任务（外部会话用它自己的登录态跑，见 create_task 的
+            # _allow_keyless_dispatch）也要能懒派发：只在「本来有 Key」时才强制它
+            # 仍可用——有 Key 却失效是真错误；从来没有 Key 是采用形态，不构建 llm，
+            # 节点用编辑器自己的登录态。
+            key_row = None
+            if current.api_key_id:
+                # Resume before the availability check rejects a parked key:
+                # finished/error disabled it, and a retried error task reaches here
+                # through start / first-message / the recovery worker.
+                await self._resume_task_api_key(current)
+                key_row = await PostgresClient.get_api_key_by_id(int(current.api_key_id))
+                if not key_row or key_row.get("disabled") or not key_row.get("key"):
+                    raise ValueError("task_api_key_unavailable")
 
             binding = await ProjectTask.filter(task_id=current.id).order_by("created_at").first()
             model_id = ""
             if binding and binding.model_id and binding.model_id.int:
                 model_id = str(binding.model_id)
+            # 策略归环境：重派发前把环境的 MCP 行重新投影成 service grants（保留
+            # param 行）。必须早于下面的 _principal_mcp_specs 读取，否则恢复的任务
+            # 会带旧快照。无环境（评审/隔离/历史）跳过，保留 create 时写入的 grants。
+            await self._ensure_task_mcp_principal(current)
+            await self._sync_task_mcp_service_grants_from_env(current)
             req: dict[str, Any] = {
                 "provider": current.provider,
                 "cli_name": (binding.cli_name if binding else "") or current.provider,
@@ -1983,15 +2688,22 @@ class TaskService:
                     "branch_mode": "existing" if binding and binding.branch else "default",
                     "branch": binding.branch if binding else "",
                 },
-                "_session_skills": list(current.skill_config or []),
-                # mcp_config 列已退役：恢复派发的 mcps 一并从 principal grants
-                # 推导（与首次派发同一真相源），legacy 行的 grants 在创建时已同步。
+                # 资源归环境：恢复派发不再从任务列带技能/插件（skill_config 列已
+                # 退役）——环境安装的资源由 _sync_environment_for_dispatch 补装到
+                # 节点，session 只带 active_* 子集与 MCP grants 投影。评审的 OCR
+                # 技能走 _session_skills 内部键（create 时直传），列里从来没有。
                 "_session_mcps": await self._principal_mcp_specs(current),
-                "_session_plugins": list(current.plugin_config or []),
             }
-            req["_session_llm"] = await self._task_llm_config(
-                req, current, str(key_row["key"])
-            )
+            if key_row is not None:
+                req["_session_llm"] = await self._task_llm_config(
+                    req, current, str(key_row["key"])
+                )
+            # 采用任务（外部会话「同步为任务」）的重派发：把「续接原编辑器会话」的
+            # 提示补回来。这个 tag 不落 config_snapshot（只在建任务当场的派发里有效），
+            # 所以采用免派发后，首条消息的懒派发必须从这里重建——否则节点会开一个
+            # 全新会话，原上下文丢失。workspace_mode 由下面的
+            # _apply_environment_workspace 从环境行补，无需在此重复。
+            _attach_resume_tag(req, current)
             # 诊断日志：恢复派发的模型值全貌（快照/激活/session.model/llm.model）。
             # 线上"任务跑错模型"或"停止后重发 403"先看这条：DB 里的值此刻是什么。
             _llm = req["_session_llm"] if isinstance(req["_session_llm"], dict) else {}
@@ -2008,14 +2720,21 @@ class TaskService:
 
             try:
                 await self._rewrite_repo_for_git_proxy(req, current)
+                # Re-dispatch must apply the same environment-workspace rewrite as the
+                # first dispatch — without it, a re-dispatched worktree task falls
+                # back to a per-task clone, defeating the shared-checkout point.
+                await self._apply_environment_workspace(req, current)
+                # 与首次派发同款：重派发也要先把环境上待同步的资源补装，否则恢复
+                # 的任务会在缺能力的环境里继续跑。
+                await self._sync_environment_for_dispatch(current)
                 session = self._build_session(req, current)
                 assoc_env = await self._build_association_env(req, current)
                 if assoc_env:
                     session["env"] = assoc_env
                 await self._attach_issue_workflow_mcp(current, req, session)
-                await self._ensure_task_mcp_principal(current)
                 # 恢复派发会重启 runtime：finalize/stop 曾禁用过 principal，这里
-                # 重新启用，否则恢复后的任务 MCP 授权全部失效。
+                # 重新启用，否则恢复后的任务 MCP 授权全部失效。grants 的环境投影在
+                # req 构造前已完成（见上方 _sync_task_mcp_service_grants_from_env）。
                 await self._enable_task_mcp_principal(current)
                 response = await client.dispatch_session(node_id, session)
                 if response.get("accepted") is not True:
@@ -2388,60 +3107,88 @@ class TaskService:
                 "[user-platform] task {} mcp payload translation failed", task.id
             )
 
-    async def _task_mcp_service_ids(self, task: Task) -> list[int]:
-        """Legacy: derive authorized service ids from the retired mcp_config column.
+    async def _sync_task_mcp_service_grants_from_env(self, task: Task) -> None:
+        """Re-project the environment's MCP rows onto the task principal's grants.
 
-        mcp_config 列已退役（Phase 3 不再写，Phase 4 删除）；保留本入口仅为
-        迁移期诊断与既有契约测试。新代码一律走
-        ``_mcp_service_ids_from_specs``（请求负载）或 grants（已落库授权）。
+        策略归环境（用户口径：资源跟环境关联，任务不管资源）：环境的
+        ``TaskEnvironmentResource(kind='mcp')`` 行是任务能用哪些 MCP 服务的唯一
+        真相源。本函数在**每次派发前**把它重算成 principal 的 service 行——
+        grants 是派发（``_principal_mcp_specs``）与网关判权
+        （``_granted_via_service``）共用的鉴权底座，不绕过它，只把数据源换成
+        环境。环境加了/减了 MCP，任务下次派发自动跟上，不再有「创建时快照」。
+
+        service 行全量替换（环境的期望态就是全集）；**param 行（cdp_client_id/
+        mail_account_id/device_id 实例绑定）原样保留**——实例收窄绑定在会话
+        身份上，不属于环境，用户已定版「mcp 用户本身就管理这些」。
+
+        评审任务经 create_task 写的 mcp_config grants 同样被环境投影覆盖：评审
+        所用 MCP 应配在评审环境上，任务级快照不再是授权来源（阶段 2 口径）。
+
+        **无环境（env_id 缺失）则整体跳过、不动 grants**——评审任务没有环境，
+        它的 grants 来自 create 的 mcp_config（待板项，暂按原样保留）；普通无
+        环境任务（隔离/历史）本就没有 grants，跳过也无副作用。有环境但环境无
+        MCP 行 = 环境的真值就是「不用 MCP」，清空 service 行。
+
+        Best-effort：失败记日志不阻断派发——grants 保持上一次的投影。
         """
-        return await self._mcp_service_ids_from_specs(
-            getattr(task, "mcp_config", None) or []
-        )
+        principal_id = getattr(task, "mcp_user_id", None)
+        if not principal_id:
+            return
+        cfg = task.config_snapshot if isinstance(task.config_snapshot, dict) else {}
+        env_uuid = _maybe_uuid(str(cfg.get("env_id") or "").strip())
+        if env_uuid is None:
+            # 无环境：不投影、不清空。评审/隔离/历史任务保持原 grants。
+            return
+        try:
+            import mcp_plugin_store
+            from .models_environment import ENV_RESOURCE_MCP, TaskEnvironmentResource
 
-    @staticmethod
-    async def _mcp_service_ids_from_specs(specs: object) -> list[int]:
-        """Resolve MCP config entries (specs or raw bindings) into service ids.
+            service_ids: list[int] = []
+            rows = await TaskEnvironmentResource.filter(
+                env_id=env_uuid, kind=ENV_RESOURCE_MCP
+            )
+            if rows:
+                from .resource_reference_service import visible_references
 
-        Entries carrying an explicit ``service_id`` (the direct mcp_services
-        binding the create-task dialog sends for builtin/admin/personal MCPs)
-        map straight through; resolved specs map by the spec ``name``. Names
-        that are not catalog services (issue-workflow and other per-task
-        overlays, local session servers) are skipped — they ride the session
-        directly, no authorization needed.
-        """
-        import mcp_plugin_store
-
-        service_ids: list[int] = []
-        seen: set[int] = set()
-
-        def _collect(service_id_raw: object) -> None:
-            try:
-                service_id = int(service_id_raw)
-            except (TypeError, ValueError):
-                return
-            if service_id and service_id not in seen:
-                seen.add(service_id)
-                service_ids.append(service_id)
-
-        for spec in list(specs or []):
-            if not isinstance(spec, dict):
-                continue
-            direct_id = spec.get("service_id")
-            if direct_id is not None and str(direct_id).strip():
-                _collect(direct_id)
-                continue
-            name = str(spec.get("name") or "").strip()
-            if not name:
-                continue
-            service = await mcp_plugin_store.get_service_by_name(name)
-            if not service:
-                # issue-workflow and other per-task overlays are not catalog
-                # services; they ride the session directly, no authorization
-                # needed.
-                continue
-            _collect(service["id"])
-        return service_ids
+                team_id = await resolve_team_id(str(task.user_id))
+                visible = {
+                    str(row.get("id")): row
+                    for row in await visible_references(str(task.user_id), team_id, "mcp")
+                }
+                for entry in rows:
+                    reference = visible.get(str(entry.resource_id))
+                    owned_id = str((reference or {}).get("owned_entity_id") or "").strip()
+                    if not owned_id:
+                        logger.warning(
+                            "[user-platform] task {} env MCP reference {} has no owned service",
+                            task.id, entry.resource_id,
+                        )
+                        continue
+                    try:
+                        sid = int(owned_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if sid not in service_ids:
+                        service_ids.append(sid)
+            grants = [
+                {"grant_key": mcp_plugin_store.GRANT_SERVICE_KEY, "grant_value": str(sid)}
+                for sid in service_ids
+            ]
+            # 保留 param 行：只替换 service 行。先读现值拼出完整全集再全量写——
+            # set_principal_grants 是全量替换语义，param 行必须一起回填。
+            existing = await mcp_plugin_store.list_principal_grants(int(principal_id))
+            param_rows = [
+                {"grant_key": g["grant_key"], "grant_value": g["grant_value"]}
+                for g in existing
+                if g.get("grant_key") != mcp_plugin_store.GRANT_SERVICE_KEY
+            ]
+            await mcp_plugin_store.set_principal_grants(
+                int(principal_id), grants + param_rows, owner_user_id=str(task.user_id),
+            )
+        except Exception:
+            logger.exception(
+                "[user-platform] task {} env mcp grant projection failed", task.id
+            )
 
     async def _disable_task_mcp_principal(self, task: Task) -> None:
         """Close the security loop on task pause/finish/error: disable principal.
@@ -2572,44 +3319,35 @@ class TaskService:
             snapshot["reasoning_effort"] = str(fields["reasoning_effort"] or "")
             task.config_snapshot = snapshot
             changed.append("config_snapshot")
-        # Resource configs are persisted as the authoritative base before any
-        # resync attempt, so a runtime that is offline, stopping, or restarting
-        # still picks up the new config on its next dispatch/restart. A live
-        # runtime receives the new config through ``apply_node_session_*``
-        # without a restart. mcp_config 不在此列：该列退役，任务 MCP 的真相源
-        # 是 principal grants，由下方 grant 写入段处理。
-        resource_keys = ("mcp_config", "skill_config", "plugin_config")
-        for key in ("skill_config", "plugin_config"):
-            if key in fields:
-                value = fields[key]
-                setattr(
-                    task, key,
-                    [dict(item) for item in value if isinstance(item, dict)]
-                    if isinstance(value, list) else [],
+        # 模型映射：详情页齿轮弹框改其余角色/目录条目时整体替换。校验收口在
+        # _normalize_model_mapping（形状 + 每个模型值落在父 Key 可执行集合内 +
+        # 兜底必填），与创建同一条路径。空 dict / None = 清除映射（回落 models
+        # 白名单语义）。落库即生效：llm 配置按消息现算（send 每轮重建），不需要
+        # 热下发或重启运行时。
+        if "model_mapping" in fields:
+            raw_mapping = fields["model_mapping"]
+            if raw_mapping is None or (isinstance(raw_mapping, dict) and not raw_mapping):
+                task.model_mapping = None
+            else:
+                task.model_mapping = await _normalize_model_mapping(
+                    task.provider, raw_mapping, task.parent_api_key_id or task.api_key_id
                 )
-                changed.append(key)
-        # 编辑技能/插件勾选 → 同步 config_snapshot.active_skills/active_plugins。
-        # 创建时（见 create_task）写了一次 active_skills/active_plugins，之后编辑
-        # 只改 skill_config/plugin_config 列、不更新 config_snapshot，导致重启重派
-        # 拿到的是旧名单。这里从新落库的 skill_config/plugin_config 提取名字写回
-        # （spec 的 "name" 即节点侧 activeSkills 的稳定标识，见 resolve_reference_specs）。
-        # 空列表 = 不收窄 = 全量（与 _build_session shared/system 分支语义一致）；
-        # isolated 任务也写，只是该档不读 active_*。仅在对应字段传入时更新，否则不
-        # 动 config_snapshot，避免覆盖 reasoning_effort 等其他键的并发改动。
-        if "skill_config" in fields or "plugin_config" in fields:
+            changed.append("model_mapping")
+        # Resource configs are retired: skills/plugins are installed by the
+        # ENVIRONMENT (mc_task_environment_resources + node sync), not carried by
+        # the task — the skill_config/plugin_config columns and their
+        # active_* backfill are gone. mcp_config 不在此列：该列退役，任务 MCP 的
+        # 真相源是 principal grants 的环境投影。
+        resource_keys = ("mcp_config",)
+        # 激活子集（active_skills/active_plugins）改由前端直传：这是「本次任务用
+        # 环境的哪几个」的名字级收窄（不安装不卸载），创建时写 config_snapshot
+        # （见 create_task），编辑时同样只写这两个键，不碰其他键的并发改动。
+        if "active_skills" in fields or "active_plugins" in fields:
             snapshot = dict(task.config_snapshot or {}) if isinstance(task.config_snapshot, dict) else {}
-            if "skill_config" in fields:
-                snapshot["active_skills"] = [
-                    str(s.get("name"))
-                    for s in (task.skill_config or [])
-                    if isinstance(s, dict) and str(s.get("name") or "").strip()
-                ]
-            if "plugin_config" in fields:
-                snapshot["active_plugins"] = [
-                    str(s.get("name"))
-                    for s in (task.plugin_config or [])
-                    if isinstance(s, dict) and str(s.get("name") or "").strip()
-                ]
+            if "active_skills" in fields:
+                snapshot["active_skills"] = _normalize_active_names(fields.get("active_skills"))
+            if "active_plugins" in fields:
+                snapshot["active_plugins"] = _normalize_active_names(fields.get("active_plugins"))
             task.config_snapshot = snapshot
             changed.append("config_snapshot")
         resync: dict[str, list[str]] = {"applied": [], "failed": [], "skipped": []}
@@ -2651,14 +3389,6 @@ class TaskService:
                             _merge_mcp_config(
                                 await self._principal_mcp_specs(task), overlay,
                             ),
-                        )
-                    if "skill_config" in config_changed:
-                        await client.apply_node_session_skills(
-                            node_session_id, list(task.skill_config or [])
-                        )
-                    if "plugin_config" in config_changed:
-                        await client.apply_node_session_plugins(
-                            node_session_id, list(task.plugin_config or [])
                         )
                     resync["applied"].append(node_session_id)
                 except Exception as exc:  # noqa: BLE001 - 下发失败如实上报
@@ -2767,12 +3497,62 @@ class TaskService:
         # outlive the task they were minted for.
         await self._delete_task_mcp_principal(task)
         await ProjectTask.filter(task_id=task.id).delete()
-        await TaskVirtualMachine.filter(task_id=task.id).delete()        # Legacy cleanup: older builds pinned an exclusive TaskNodeBinding per
-        # task. The occupation model is gone, but drop any leftover row so a
-        # migrated DB does not keep stale rows around.
-        await TaskNodeBinding.filter(task_id=task.id).delete()
+        # 采用链路的跳转缓存：环境会话账本里 task_id 指着这条任务的行要清掉，
+        # 否则环境页那行永远显示「已同步」、点「打开任务」404，再点同步还按
+        # Task.source_editor_session_id 反查（Task 行已删，反查落空——但账本上
+        # 的死 id 还在，缓存永远是坏的）。清掉 = 回到「未同步」，可以重新同步。
+        # 这只清**引用**：会话行本身和它的历史副本（transcript）都留着——会话
+        # 是编辑器在节点上跑出来的事实，删任务不删会话。
+        try:
+            from db import PostgresClient
+
+            if PostgresClient.pool:
+                async with PostgresClient.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE mc_ac_node_sessions SET task_id='' "
+                        "WHERE task_id=$1",
+                        str(task.id),
+                    )
+        except Exception:
+            # 账本不可用（池没起/控制面表还没建）不该挡任务删除——那行缓存下次
+            # adopt 时也会按反查兜底。
+            logger.info("[user-platform] task {} ledger cleanup skipped", task.id)
         await task.delete()
         return True
+
+    async def get_create_defaults(self, user_id: str, project_id: str | None, provider: str) -> dict:
+        """读「创建任务」的上次配置缓存 → 表单态 dict；没有则空 dict。
+
+        键 = (user, project, provider)。无项目用零 UUID 占位（见模型注释，NULL 不能
+        当唯一键）。provider 空 = claude（弹框默认），与创建逻辑同口径。
+        """
+        from .models_task import TaskCreateDefaults
+
+        scope = _defaults_scope(project_id, provider)
+        row = await TaskCreateDefaults.get_or_none(
+            user_id=uuid.UUID(user_id), project_id=scope[0], provider=scope[1]
+        )
+        if row is None or not isinstance(row.payload, dict):
+            return {}
+        return dict(row.payload)
+
+    async def save_create_defaults(
+        self, user_id: str, project_id: str | None, provider: str, payload: dict
+    ) -> dict:
+        """写「创建任务」的配置缓存（upsert）。payload 非 dict 视为清空。"""
+        from .models_task import TaskCreateDefaults
+
+        scope = _defaults_scope(project_id, provider)
+        body = payload if isinstance(payload, dict) else {}
+        row, _created = await TaskCreateDefaults.get_or_create(
+            user_id=uuid.UUID(user_id), project_id=scope[0], provider=scope[1],
+            defaults={"payload": body},
+        )
+        # get_or_create 命中已存在行时不会更新 defaults，这里补一次写。
+        if not _created and row.payload != body:
+            row.payload = body
+            await row.save(update_fields=["payload", "updated_at"])
+        return dict(row.payload or {})
 
     async def _owned_task_or_raise(self, user_id: str, task_id: str, role: str | None) -> Task:
         """Resolve an owned task or raise ValueError the route maps to 404/403."""
@@ -2874,9 +3654,18 @@ class TaskService:
                     delivery_attempt=attempt, failure_reason="runtime_unavailable",
                 )
                 raise
-            await self._deliver_turn(
-                task, node_session_id, content, client_message_id, attempt, title_candidate,
-            )
+            try:
+                await self._deliver_turn(
+                    task, node_session_id, content, client_message_id, attempt, title_candidate,
+                )
+            except ValueError:
+                # 投递前的前置校验失败（如子 Key 解析不到）。与恢复失败同款：消息行
+                # 标 failed 保留原因，同 ID 可再试，别留下一条永远 pending 的行。
+                await self._transition_message_status(
+                    task.id, client_message_id, "failed",
+                    delivery_attempt=attempt, failure_reason="deliver_precondition_failed",
+                )
+                raise
         return self._message_ack(task, client_message_id, "dispatching", attempt)
 
     def _message_ack(
@@ -3025,29 +3814,54 @@ class TaskService:
     ) -> dict:
         """Push one human turn to the node with the current model/mode/llm snapshot."""
         client = get_local_node_client()
-        # Prepend the git-credential policy note. Done here (not at persistence)
-        # so the stored conversation stays the user's own text while every turn
-        # the runtime sees carries the note.
-        wire_content = _with_git_credential_note(content)
+        wire_content = content
         active_model = await self._resolve_task_active_model(task, {})
         llm = None
         if task.api_key_id:
             from db import PostgresClient
 
             key_row = await PostgresClient.get_api_key_by_id(int(task.api_key_id))
+            if not (key_row and key_row.get("key")):
+                # The row is read from the gateway's in-memory snapshot, which a
+                # write in another process may not have refreshed yet. Retry once
+                # through an explicit reload before concluding the key is gone.
+                await self._refresh_api_key_snapshot()
+                key_row = await PostgresClient.get_api_key_by_id(int(task.api_key_id))
             if key_row and key_row.get("key"):
                 # 把已解析的默认模型传下去，保证本帧 model 与 llm.model 完全一致。
                 llm = await self._task_llm_config(
                     {"model_id": active_model}, task, str(key_row["key"])
                 )
+            else:
+                # A task with an api_key_id MUST deliver its own child key. Sending
+                # `llm=None` used to look harmless — the node falls back to its own
+                # session mirror — but that mirror is whatever the LAST successful
+                # configure planted, so a turn delivered after a snapshot miss
+                # authenticated as the previous key (observed as "the request log
+                # shows the parent key"). Fail loudly instead: the send route maps
+                # this to a retryable 503 and the message row records the reason.
+                raise ValueError("task_api_key_unavailable")
+        # 诊断日志：本轮投递**用哪把 Key**。这是「请求日志里显示的是父 Key」的
+        # 唯一直接证据——上面所有分支都读 task.api_key_id，但只有打出来才能确认
+        # 它此刻到底指向哪一行（父 Key 的 id 会与 parent_api_key_id 相同）。
+        # 与下面那条 model 日志分开打：Key 的排查不该被模型值混淆。
+        logger.info(
+            "[user-platform] task-key dispatch task={} task.api_key_id={} "
+            "task.parent_api_key_id={} resolved_key_id={} resolved_scope='{}' "
+            "resolved_parent_id={} llm.apiKey_set={}",
+            task.id, getattr(task, "api_key_id", None), getattr(task, "parent_api_key_id", None),
+            (key_row or {}).get("id"), (key_row or {}).get("scope"),
+            (key_row or {}).get("parent_id"), bool(llm and llm.get("apiKey")),
+        )
         # 诊断日志：本轮投递的模型值与来源。线上任何"任务实际跑的不是所选模型"
         # 的报告，先用这条日志核对投递帧里的 model 与任务快照头部是否一致。
         _llm_model = str((llm or {}).get("model") or "") if isinstance(llm, dict) else ""
+        _snap = getattr(task, "models_snapshot", None)
         logger.info(
             "[user-platform] task-model dispatch task={} provider={} snapshot={} "
             "active_model='{}' llm.model='{}' client_message_id={} attempt={}",
-            task.id, task.provider,
-            list(task.models_snapshot or []) if isinstance(task.models_snapshot, list) else [],
+            task.id, getattr(task, "provider", None),
+            list(_snap or []) if isinstance(_snap, list) else [],
             active_model, _llm_model, client_message_id, delivery_attempt,
         )
         try:
@@ -3221,6 +4035,19 @@ class TaskService:
                 raise
             await self._clear_stale_node_session(task, node_session_id, "not_found on restart")
             raise ValueError("runtime_not_bound") from exc
+        # A "clear context" restart (load_session=False) makes the node run
+        # restartRuntime(fresh=true) → resetRuntimeState, wiping the provider
+        # state dir. The runtime therefore starts a BRAND-NEW provider thread,
+        # so the Task's stored binding is now stale: the next gateway request
+        # carries the new thread and 403s ("Task API Key 与 provider 会话不匹配")
+        # against the old one. Forget the binding here so the next request
+        # re-binds (the runtime reports its current thread on each turn, and the
+        # node_server self-heal also re-binds on a mismatch — this just closes
+        # the gap at the source, without waiting for a failing turn).
+        if not load_session:
+            from db import PostgresClient
+
+            await PostgresClient.clear_task_provider_thread(str(task.id))
         return {
             "restarted": True,
             "load_session": load_session,
@@ -3256,12 +4083,37 @@ class TaskService:
         )
         if resolved != model_id:
             raise ValueError("model_not_available_for_key")
-        _reject_claude_reserved_models(task.provider, [model_id])
+        _reject_claude_reserved_models(
+            task.provider, [model_id], has_mapping=isinstance(task.model_mapping, dict)
+        )
+        # 配了映射的任务：claude 的「当前模型」= 主循环实际跑的那一档（opus）的
+        # 平台模型（slots.opus.model），其余 provider = main。切换即改这里——同时
+        # 把新模型写进快照头部，保证 _resolve_task_active_model 与展示一致。映射
+        # 任务不收窄子 Key 白名单（槽里的角色模型不在快照里），只动快照、不动白名单。
+        if isinstance(task.model_mapping, dict):
+            mapping = _migrate_model_mapping(task.provider or "", dict(task.model_mapping))
+            if (task.provider or "").strip().lower() == "claude":
+                slots = mapping.get("slots") if isinstance(mapping.get("slots"), dict) else {}
+                opus = slots.get("opus") if isinstance(slots.get("opus"), dict) else {}
+                slots["opus"] = {**opus, "model": model_id}
+                mapping["slots"] = slots
+            else:
+                mapping["main"] = model_id
+            task.model_mapping = mapping
+            # 快照头部同步成新模型：派发帧的 ``model`` 与 llm.model 都取自它，
+            # 两者必须一致，否则「界面上切了、实际投递的 model 字段还是旧的」。
+            task.models_snapshot = [model_id] + [m for m in snapshot if m != model_id]
+            await task.save(update_fields=["model_mapping", "models_snapshot", "updated_at"])
+            return {"task_id": str(task.id), "model_id": model_id,
+                    "models": list(task.models_snapshot), "model_mapping": mapping}
         # 目标进头部（活跃），旧成员保序跟在后面：白名单是并集，活跃模型取头部。
         models = [model_id] + [m for m in snapshot if m != model_id]
         task.models_snapshot = models
         await task.save(update_fields=["models_snapshot", "updated_at"])
-        if task.api_key_id:
+        # 配了模型映射的任务不收窄子 Key 白名单：映射里的角色模型（claude 的
+        # ANTHROPIC_DEFAULT_*、codex catalog 条目等）不在快照里，按快照收窄会把
+        # 这些角色的请求当场挡掉。映射任务的 Key 继承父 Key 全量。
+        if task.api_key_id and not task.model_mapping:
             from db import PostgresClient
 
             await PostgresClient.update_task_key_model_whitelist(int(task.api_key_id), models)
@@ -3287,7 +4139,9 @@ class TaskService:
             raise ValueError("model_required")
         validate_key = task.parent_api_key_id or task.api_key_id
         legal, _ = await _validate_models_for_key(validate_key, candidates, active_model=None)
-        _reject_claude_reserved_models(task.provider, legal)
+        _reject_claude_reserved_models(
+            task.provider, legal, has_mapping=isinstance(task.model_mapping, dict)
+        )
         snapshot = list(task.models_snapshot or []) if isinstance(task.models_snapshot, list) else []
         merged = list(snapshot)
         for model in legal:
@@ -3295,7 +4149,8 @@ class TaskService:
                 merged.append(model)
         task.models_snapshot = merged
         await task.save(update_fields=["models_snapshot", "updated_at"])
-        if task.api_key_id:
+        # 同 switch_task_model：配了模型映射的任务不收窄子 Key 白名单。
+        if task.api_key_id and not task.model_mapping:
             from db import PostgresClient
 
             await PostgresClient.update_task_key_model_whitelist(int(task.api_key_id), merged)
@@ -3305,13 +4160,35 @@ class TaskService:
     async def _resolve_task_active_model(self, task: Task, req: dict) -> str:
         """Resolve the model for the next turn; empty snapshot means unrestricted.
 
-        快照为空且调用方未指定模型时，从「该任务 Key 允许 ∩ 当前可供给」取第
-        一个稳定候选，避免 provider CLI 默认模型不可路由时首轮 404。
+        优先级：req.model_id → 映射 main（claude=档名，其余=平台模型）→
+        ``models_snapshot`` 头部 → 最后兜底「Key 允许 ∩ 可供给」取确定性首个
+        （按 ``sorted`` 取，跳过 #scheme: 派生节点；不再像旧版随机抓 set 第一个）。
         """
-        models = task.models_snapshot if isinstance(task.models_snapshot, list) else []
-        active = models[0] if models else str(req.get("model_id") or "").strip()
+        explicit = str(req.get("model_id") or "").strip()
+        if explicit:
+            return explicit
+        # 配了映射：主模型即映射的 main（claude 是档名别名，其余是平台模型）。
+        # 这条永远在快照/兜底扫描之前命中——映射任务的快照本就为空（见
+        # docs/model-mapping.md「不再收窄子 Key 白名单」），随机兜底扫到 embedding
+        # 模型的 bug 由这条短路堵掉。
+        raw_mapping = getattr(task, "model_mapping", None)
+        mapping = raw_mapping if isinstance(raw_mapping, dict) else None
+        if mapping:
+            norm = _migrate_model_mapping(getattr(task, "provider", None) or "", mapping)
+            main = str(norm.get("main") or "").strip()
+            if main:
+                return main
+        snap = getattr(task, "models_snapshot", None)
+        models = snap if isinstance(snap, list) else []
+        active = models[0] if models else ""
+        if isinstance(active, str):
+            active = active.strip()
         if active:
             return active
+        # 没映射、快照空：旧版从 ``available_model_ids()``（无序 set）随机抓一个，
+        # 抓到过 embedding 模型（gemini-embedding-001）。改成 sorted 确定性 + 跳过
+        # 内部派生节点；不在这里再做模态过滤——能配到这里的只剩「无映射且无快照」
+        # 的极旧任务，确定性本身已够。
         try:
             from rate_limiter import ModelClientPool
             from model_catalog import is_internal_model_id
@@ -3325,9 +4202,11 @@ class TaskService:
             if not key_row or key_row.get("disabled") or not str(key_row.get("key") or "").strip():
                 return ""
             api_key = str(key_row["key"])
-            for candidate in ModelClientPool.available_model_ids():
-                if is_internal_model_id(candidate):
-                    continue
+            candidates = sorted(
+                c for c in ModelClientPool.available_model_ids()
+                if c and not is_internal_model_id(c)
+            )
+            for candidate in candidates:
                 if await gateway_config.Config.api_key_allows_model(api_key, candidate):
                     return candidate
         except Exception:
@@ -3391,6 +4270,12 @@ class TaskService:
                         # finished/error parks the task child key too: the LLM
                         # gateway must refuse it until the task resumes.
                         await self._park_task_api_key(task)
+                        # Push the new status to the follower immediately. Without
+                        # this the badge only advanced when the page re-fetched the
+                        # detail on the result frame — a visible lag on a task that
+                        # just ended, and no signal at all for the states in
+                        # between.
+                        yield _status_frame(task, terminal_status)
                 elif kind == "error" and task.status != "error":
                     prev_status = task.status
                     updated = await Task.filter(
@@ -3404,6 +4289,21 @@ class TaskService:
                         )
                         await self._disable_task_mcp_principal(task)
                         await self._park_task_api_key(task)
+                        yield _status_frame(task, "error")
+                # A turn starting/ending is what "运行中" means. The runtime
+                # reports it as a structured frame with this event_type; forward
+                # it as a status update so the badge tracks the real turn
+                # boundary instead of waiting for the terminal result.
+                elif kind == "structured" and str(event.get("event_type") or "") == "agent_turn_started":
+                    if task.status != "processing":
+                        prev_status = task.status
+                        task.status = "processing"
+                        await Task.filter(id=task.id).update(status="processing")
+                        await self._record_status_transition(
+                            task.id, "status", "processing", frm=prev_status,
+                            reason="turn started",
+                        )
+                    yield _status_frame(task, "processing")
                 yield event
                 if kind == "result":
                     return
@@ -3414,9 +4314,16 @@ class TaskService:
             # than retrying forever with no visible reason. Not persisted to
             # ``mc_task_events`` — it is a transport condition, not a runtime
             # event; the generator yields it straight to the SSE serializer.
+            #
+            # ``transport: True`` marks it as an infrastructure condition rather
+            # than a conversation turn failing. The page uses it to disable the
+            # composer and show the reason in its own banner, instead of dropping
+            # a red error card into the transcript — a card there reads as "this
+            # turn failed", which is both wrong and impossible to reply to.
             yield {
                 "kind": "error",
                 "message": "节点控制面暂不可用，请确认节点服务已启动后重试",
+                "transport": True,
             }
             return
         except RPCError as exc:
@@ -3491,6 +4398,72 @@ class TaskService:
                 "[user-platform] status history {} {}→{} for task {} not recorded",
                 field, frm or "?", to_val, task_id,
             )
+
+    async def seed_history_from_items(
+        self, task_id: uuid.UUID, items: list[dict]
+    ) -> int:
+        """把一份**已导入的外部会话历史**灌进任务的对话轨迹。
+
+        采用外部编辑器会话（环境会话「同步为任务」）时调用。那条会话的对话早就
+        发生了，平台只是刚给它一个任务身份；不灌的话任务详情页是空的——用户点了
+        「同步为任务」却看到一片空白，会以为历史丢了。
+
+        与 :meth:`_persist_user_input_item` 同款落库形状，但有三点不同：
+
+        * 内容是**内联**的（``kind='item'`` + payload），不进 ClickHouse——这是
+          历史回放，不是运行时事件，没有"内容与索引分家"的必要；
+        * 条目原样来自环境 transcript 的显示副本，已经是 NormalizedItem，id 也已
+          是稳定 id（工具 ``call_id`` / 消息 ``env:指纹``），前端 ``reduceItems``
+          直接吃，不需要再归一；
+        * ``seq`` 走 ``mc_task_events_seq``，与运行时同源——用户之后发的第一条消息、
+          agent 的新回复都会排在它后面，顺序天然正确。
+
+        best-effort：单条失败只记日志，不阻断采用（历史显示不全好过采用失败）。
+        返回写入条数。
+        """
+        from .models_task import TaskEvent
+
+        written = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                seq = await self._next_event_seq(task_id)
+                logical = str(item.get("id") or f"seed:{seq}")[:128]
+                envelope: dict[str, Any] = {
+                    "item": item,
+                    "agent_id": "",
+                    "runtime_seq": seq,
+                    "logical_event_id": logical,
+                }
+                # 透传 canonical 字段：读路径与前端都按它们路由（工具名、阶段、
+                # 状态），缺了工具卡会退化成无标题。
+                for key in ("event_kind", "tool_name", "phase", "status"):
+                    value = item.get(key)
+                    if value:
+                        envelope[key] = value
+                # 用条目自身的时间戳，让"多久前"对得上——否则整段历史都显示"刚刚"。
+                # Tortoise 的 auto_now_add 只在值为 None 时才填，显式给值会保留。
+                epoch = item.get("created_at")
+                created_at = (
+                    datetime.fromtimestamp(int(epoch), tz=UTC).replace(tzinfo=None)
+                    if isinstance(epoch, (int, float)) and epoch else None
+                )
+                await TaskEvent.create(
+                    id=uuid.uuid4(),
+                    task_id=task_id,
+                    seq=seq,
+                    kind="item",
+                    event_type=str(item.get("type") or "agent_message")[:64],
+                    logical_event_id=logical,
+                    payload=envelope,
+                    delivery_attempt=1,
+                    **({"created_at": created_at} if created_at else {}),
+                )
+                written += 1
+            except Exception as exc:  # noqa: BLE001 — 历史显示不全好过采用失败
+                logger.info("[task] seed history item skipped for {}: {}", task_id, exc)
+        return written
 
     async def _persist_user_input_item(
         self,
@@ -3835,48 +4808,44 @@ class TaskService:
         return projected
 
     async def task_stats(self, user_id: str, task_id: str, *, role: str | None = None) -> dict:
+        """最新一条消息的 token 用量（不是任务累计）。
+
+        用户看这个数想知道「这轮上下文用了多少」，累计值回答不了（跑得越久越大，
+        与当前这轮无关）。与对话区进度圈同口径——从事件行倒序找到第一条带 usage
+        的 assistant 帧即止，主 agent 与子 agent 各自独立。
+        """
         task = await self._owned_task(user_id, task_id, role)
         if task is None:
             return {}
-        # Read from request_logs (the gateway's billing ledger) rather than
-        # mc_task_usage_stats: that aggregate table is never written, so the
-        # detail header showed 0 tokens forever. Same source the 请求日志 panel
-        # already reads; also returns a per-model breakdown for the header.
-        from db import PostgresClient
+        return await self._latest_message_usage(task.id)
 
-        return await PostgresClient.task_request_token_stats(str(task.id))
-
-    async def list_task_request_logs(
-        self,
-        user_id: str,
-        task_id: str,
-        *,
-        limit: int = 100,
-        offset: int = 0,
-        role: str | None = None,
-    ) -> dict:
-        """List request logs attributed to a Task the caller owns.
-
-        Ownership is resolved through the Task ledger (user_platform
-        connection); the request_logs rows themselves are read from the main
-        PostgresClient pool by the immutable ``task_id`` snapshot written at
-        request time. Legacy editor-attributed rows are surfaced through the
-        editor routes during the compatibility window.
-        """
-        task = await self._owned_task_or_raise(user_id, task_id, role)
-        from db import PostgresClient
-
-        return await PostgresClient.query_task_request_logs(
-            str(task.id), limit=limit, offset=offset
-        )
-
-    async def get_task_request_log_detail(
-        self, user_id: str, task_id: str, log_id: int, *, role: str | None = None
-    ) -> dict | None:
-        task = await self._owned_task_or_raise(user_id, task_id, role)
-        from db import PostgresClient
-
-        return await PostgresClient.get_task_request_log_detail(log_id, str(task.id))
+    async def _latest_message_usage(self, task_id: uuid.UUID) -> dict:
+        """倒序扫事件行，取最新一条带 usage 的帧（主 agent）。找不到返回空 dict。"""
+        rows = await TaskEvent.filter(task_id=task_id).order_by("-seq", "-id").limit(40)
+        contents: dict = {}
+        # 内联 payload 的行直接读；item_ref 行（内容在 ClickHouse）批量取一次。
+        logicals = [str(r.logical_event_id) for r in rows if r.payload is None and r.logical_event_id]
+        if logicals:
+            contents = await self._load_frame_contents(task_id, rows)
+        for r in rows:
+            payload = r.payload if r.payload is not None else contents.get(str(r.logical_event_id or ""))
+            if not isinstance(payload, dict):
+                continue
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                continue
+            usage = item.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            return {
+                "input_tokens": int(usage.get("input") or 0),
+                "output_tokens": int(usage.get("output") or 0),
+                "total_tokens": int(usage.get("total") or 0),
+                "cache_read_tokens": int(usage.get("cache_read") or 0),
+                "cache_creation_tokens": int(usage.get("cache_creation") or 0),
+                "model": str(item.get("model") or ""),
+            }
+        return {}
 
     async def task_workspace_node_session_id(
         self, user_id: str, task_id: str, *, role: str | None = None
@@ -3999,6 +4968,66 @@ def _maybe_uuid(value: Any) -> uuid.UUID | None:
         return uuid.UUID(str(value))
     except (ValueError, TypeError):
         return None
+
+
+# ── 任务频道的共享 follower ──────────────────────────────────────────────
+# 一个任务同时只能有一个 ``task_events`` 驱动者：多端订阅（SSE / 统一 WS）都要
+# 能看到事件，但同一个任务若被驱动两次，同一条事件会在统一 hub 上重复扇出、
+# transport 行也会重复落库。引用计数：首个订阅者拉起，最后一个退订收线。
+_task_followers: dict[str, dict[str, Any]] = {}
+
+
+async def acquire_task_follower(task_id: str, user_id: str, role: str | None) -> None:
+    """为 ``task_id`` 争取一个共享驱动者；已有活着的就只加引用。"""
+    entry = _task_followers.get(task_id)
+    if entry is None:
+        entry = {"refs": 0, "task": None}
+        _task_followers[task_id] = entry
+    entry["refs"] += 1
+    if entry["task"] is None or entry["task"].done():
+        entry["task"] = asyncio.create_task(_drive_task_follower(task_id, user_id, role))
+
+
+def release_task_follower(task_id: str) -> None:
+    """退订一个任务频道；引用归零即收线（不留无人看的 node 流）。"""
+    entry = _task_followers.get(task_id)
+    if entry is None:
+        return
+    entry["refs"] -= 1
+    if entry["refs"] <= 0:
+        task = entry.get("task")
+        _task_followers.pop(task_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+
+async def _drive_task_follower(task_id: str, user_id: str, role: str | None) -> None:
+    """驱动 task_events 并把每个事件扇到统一 hub（channel="task"）。"""
+    try:
+        async for event in task_service.task_events(user_id, task_id, role=role):
+            try:
+                from agent import realtime
+
+                await realtime.publish("task", task_id, event)
+            except Exception:  # noqa: BLE001 — 扇出失败不影响事件本身
+                pass
+    except asyncio.CancelledError:
+        raise
+    except ValueError as exc:
+        # runtime_not_bound / task_not_found：live 流起不来。订阅方已经拿到
+        # 历史快照，这里补一条可见的错误帧而不是静默收线（§3.3 错误必达）。
+        try:
+            from agent import realtime
+
+            await realtime.publish("task", task_id, {"kind": "error", "payload": {"message": str(exc)}})
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:
+        logger.exception("[task-follower] {} 驱动失败", task_id)
+    finally:
+        entry = _task_followers.get(task_id)
+        if entry is not None and entry.get("task") is asyncio.current_task():
+            entry["task"] = None
 
 
 task_service = TaskService()

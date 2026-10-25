@@ -5,7 +5,7 @@ GenericAgent's L3 operating procedures. SOP bodies are real files under the Agen
 ## Core files
 
 - `memory_management_sop.md` — L1/L2/L3/L4 memory layers and `start_long_term_update`.
-- `browser_sop.md` — unified `web` tool (scan/execute/tabs/screenshot).
+- `browser_sop.md` — unified `web` tool (read_page/execute/tabs/screenshot/traffic).
 - `scheduled_task_sop.md` — scheduler via `capability_call(name="scheduler.*")`.
 - `mcp_usage_sop.md` — dynamic MCP services through `capability_call`.
 
@@ -37,5 +37,7 @@ Dynamic MCP SOPs are created at `memory/sop/mcp/<service>_sop.md` on first use.
 
 ## Tool routing reminder
 
-The fixed first-class tool set is `file_read`, `file_write`, `file_patch`, `code_run`, `web`, `update_working_checkpoint`, `start_long_term_update`, `ask_user`, and `capability_call`. Read this index with `file_read("memory/sop/README.md")` when navigating the SOP set.
+The fixed first-class tool set is `file_read`, `file_write`, `file_patch`, `code_run`, `web`, `update_working_checkpoint`, `start_long_term_update`, `ask_user`, `capability_call`, and `spawn_subagent`. Read this index with `file_read("memory/sop/README.md")` when navigating the SOP set.
+
+A sub-agent (spawned via `spawn_subagent`) gets only 8 tools — it does **not** get `spawn_subagent` (children cannot delegate further) or `start_long_term_update` (children report findings to the parent, which distils memory). Its `code_run` and out-of-bounds `file_write`/`file_patch` route through the parent's approval flow; `capability_call` inherits the parent's bound MCP services. See `memory/sop/subagent_sop.md`.
 

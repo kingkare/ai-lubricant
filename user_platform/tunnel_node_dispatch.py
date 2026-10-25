@@ -65,10 +65,17 @@ _CLIENT_SOURCES = {
 
 
 def _binary_for_kind(kind: str) -> str:
-    """The client binary name for a scheme kind (resolved on the node PATH)."""
-    return {"frpc": "frpc", "cloudflared": "cloudflared", "npc": "npc"}.get(
-        (kind or "").strip(), ""
-    )
+    """The client binary name for a scheme kind (resolved on the node PATH).
+
+    chmlfrp is frp-family: the panel hands back an frpc ini, so it runs the
+    same frpc binary as frpc.
+    """
+    return {
+        "frpc": "frpc",
+        "chmlfrp": "frpc",
+        "cloudflared": "cloudflared",
+        "npc": "npc",
+    }.get((kind or "").strip(), "")
 
 
 def _frpc_group_toml(bindings: list[TunnelBinding], scheme: TunnelScheme) -> str:
@@ -101,6 +108,85 @@ def _frpc_group_toml(bindings: list[TunnelBinding], scheme: TunnelScheme) -> str
 def _frpc_ini(binding: TunnelBinding, scheme: TunnelScheme) -> str:
     """Compatibility wrapper for a one-binding frpc config."""
     return _frpc_group_toml([binding], scheme)
+
+
+def _parse_frpc_ini_public_addr(ini: str) -> str | None:
+    """Derive ``server_addr:remote_port`` from a panel-issued frpc ini.
+
+    The ChmlFrp panel returns a complete ini; the public address is the frps
+    relay host from ``[common] server_addr`` plus the proxy's ``remote_port``.
+    Returns None if either is missing so the caller keeps "地址生成中…".
+    """
+    server_addr = ""
+    remote_port = ""
+    for raw in (ini or "").splitlines():
+        line = raw.strip()
+        if line.lower().startswith("server_addr") and "=" in line:
+            server_addr = line.split("=", 1)[1].strip().strip('"')
+        elif line.lower().startswith("remote_port") and "=" in line:
+            remote_port = line.split("=", 1)[1].strip().strip('"')
+    if server_addr and remote_port:
+        return f"{server_addr}:{remote_port}"
+    return None
+
+
+async def _chmlfrp_frpc_ini(
+    runtime: TunnelRuntime, scheme: TunnelScheme, bindings: list[TunnelBinding]
+) -> str:
+    """Resolve the frpc ini for a chmlfrp runtime, creating the panel tunnel once.
+
+    ChmlFrp hosts the frps relay, so the frps address is unknown until the
+    platform creates a tunnel through the panel. This creates the tunnel on the
+    binding's chosen relay node (``panel_node``), pulls the generated frpc ini,
+    and caches it in ``runtime.provider_ref`` so a restart reuses the same
+    tunnel instead of creating a duplicate. Also back-fills ``public_addr`` from
+    the ini. Raises on a panel failure so the reconciler records a real error.
+    """
+    binding = bindings[0]
+    refs = dict(runtime.provider_ref or {})
+    cached = str(refs.get("frpc_ini") or "")
+    if cached:
+        return cached
+
+    from .tunnel_panel_service import create_tunnel
+
+    # 面板对隧道名只允许字母/数字/下划线（实测报「隧道名不符合规范」），而
+    # binding.id 是 UUID（带连字符），所以默认名绝不能直接用它。这里生成一个
+    # 严格符合面板规则的名字：mc_<uuid 去连字符>。用户填了 proxy_name 时优先用它。
+    tunnel_name = (binding.proxy_name or "").strip() or f"mc_{str(binding.id).replace('-', '')}"
+    # 兜底:历史绑定可能存了带 `-`/`.` 的名字(当时的校验更宽松),直接传会被面板拒。
+    # 这里规范化成面板合法字符,让存量绑定能自愈,而不是永久失败。
+    tunnel_name = "".join(c if (c.isalnum() and c.isascii()) or c == "_" else "_" for c in tunnel_name) or "mc_tunnel"
+    panel_node = (binding.panel_node or "").strip()
+    if not panel_node:
+        raise RuntimeError("chmlfrp binding requires a panel node (服务节点)")
+    result = await create_tunnel(
+        scheme.config or {},
+        node=panel_node,
+        tunnel_name=tunnel_name,
+        local_ip=binding.local_host,
+        local_port=int(binding.local_port),
+        port_type="tcp",
+        remote_port=int(binding.remote_port) if binding.remote_port else None,
+    )
+    ini = str(result.get("frpc_ini") or "")
+    refs.update({
+        "frpc_ini": ini,
+        "tunnel_name": tunnel_name,
+        "panel_node": panel_node,
+    })
+    runtime.provider_ref = refs
+    await runtime.save(update_fields=["provider_ref", "updated_at"])
+
+    public_addr = _parse_frpc_ini_public_addr(ini)
+    if public_addr and binding.public_addr != public_addr:
+        binding.public_addr = public_addr
+        await binding.save(update_fields=["public_addr", "updated_at"])
+    logger.info(
+        "[tunnel] chmlfrp tunnel created: runtime={} node={} name={} public={}",
+        runtime.id, panel_node, tunnel_name, public_addr,
+    )
+    return ini
 
 
 def _npc_conf(binding: TunnelBinding, scheme: TunnelScheme) -> str:
@@ -214,7 +300,19 @@ async def dispatch_runtime_to_node(
 ) -> None:
     """Start one aggregated runtime process on an execution node."""
     kind = (scheme.kind or "").strip()
-    if kind == "frpc":
+    if kind == "chmlfrp":
+        # ChmlFrp: create the panel tunnel (once) and run frpc with the
+        # panel-issued ini verbatim — the frps address/credentials live inside
+        # it, so the platform never fabricates a config for this kind.
+        conf = await _chmlfrp_frpc_ini(runtime, scheme, bindings)
+        conf_name = f"runtime-{runtime.id}.ini"
+        script = (
+            _ensure_binary_script("frpc", scheme.config or {})
+            + f'\nprintf %s "$_TUNNEL_CONF" > "$conf_dir/{conf_name}"'
+            + f'\nexec "$target" -c "$conf_dir/{conf_name}"'
+        )
+        env = {"_TUNNEL_CONF": conf}
+    elif kind == "frpc":
         conf = _frpc_group_toml(bindings, scheme)
         conf_name = f"runtime-{runtime.id}.toml"
         script = (

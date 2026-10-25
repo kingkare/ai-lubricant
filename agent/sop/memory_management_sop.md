@@ -130,3 +130,22 @@ you to perform the minimal update yourself. Read this SOP before writing any mem
 next_steps / key_info / related_files). It is never auto-promoted to long-term memory.
 When one SOP governs the task, set `related_files` to that SOP's `file_read` path so the
 anchor reminds you to re-read it after context compression.
+
+---
+
+## Limitations
+
+- `file_write` / `file_patch` must not touch `memory/` — the only path that writes
+  long-term memory is `start_long_term_update`, which asks you to perform the minimal
+  edit yourself. An agent may not write its own L1/L2/L3 directly.
+- L1 (`global_mem_insight.txt`) has a <= 30-line budget and is read capped at 32 000
+  characters, L2 (`global_mem.txt`) at 256 000 characters, each L3 SOP at 512 KiB.
+  Overflow is cut, not stored — compress before writing rather than relying on a tail.
+- `update_working_checkpoint` is never auto-promoted to long-term memory; a verified,
+  reusable insight needs an explicit `start_long_term_update`.
+- L4 (ClickHouse conversations/messages) is an archive — read-only to the agent, for
+  tracing and audit; do not treat it as addressable working memory.
+- Volatile state (session ids, PIDs, current tab/device ids, one-off absolute paths)
+  is never stored — it goes stale within a session and misleads future runs.
+- Without a DB pool the persistence layer degrades to safe sentinels (writes return a
+  sentinel, reads return empty); a missing entry does not prove a fact is unknown.

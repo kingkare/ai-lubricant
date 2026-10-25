@@ -78,19 +78,37 @@ _XML_PARAM_RE = re.compile(
     r"<parameter=\s*([\w.\-]+)\s*>\s*([\s\S]*?)\s*</parameter\s*>", re.IGNORECASE
 )
 
+# GLM-4 chat-template 形态：``<tool_calls><invoke name="X"><parameter name="k">v</parameter></invoke></tool_calls>``。
+# 同为训练惯性协议词形态（mimo 等经 OpenCode Zen 的免费模型实测吐这种，opencode 现网 2026-09-28）：
+# ``tool_calls>`` / ``<invoke`` 在正常正文里几乎不出现，模型写出即明确表达调用意图。
+# 判据仍是协议词而非结构：``<assistant_tool_calls>`` 历史回填文本虽含 "tool_calls>" 子串，
+# 但块正则要求 ``<`` 紧贴 ``tool_calls``，不会误抓。
+_GLM_TC_OPEN = "<" + "tool_calls"
+_GLM_TC_CLOSE = "</" + "tool_calls>"
+_GLM_TC_BLOCK_RE = re.compile(
+    r"<tool_calls\s*>[\s\S]*?</tool_calls\s*>", re.IGNORECASE
+)
+_GLM_INVOKE_RE = re.compile(
+    r"<invoke\s+name\s*=\s*[\"']?([\w.\-]+)[\"']?\s*>([\s\S]*?)</invoke\s*>", re.IGNORECASE
+)
+_GLM_PARAM_RE = re.compile(
+    r"<parameter\s+name\s*=\s*[\"']?([\w.\-]+)[\"']?\s*>([\s\S]*?)</parameter\s*>", re.IGNORECASE
+)
+
 # 所有边界的开标记全集：流式切块 / 短路判定 / holdback 都按这个集合走，
 # 加新形态只改这里 + 对应的 close 映射。
 _TOOL_OPEN_MARKERS = (
-    _TOOL_FENCE_OPEN, _TOOL_XML_OPEN, _HERMES_OPEN, _XML_FUNC_OPEN,
+    _TOOL_FENCE_OPEN, _TOOL_XML_OPEN, _HERMES_OPEN, _XML_FUNC_OPEN, _GLM_TC_OPEN,
 )
 _TOOL_CLOSE_BY_OPEN = {
     _TOOL_FENCE_OPEN: _TOOL_FENCE_CLOSE,
     _TOOL_XML_OPEN: _TOOL_XML_CLOSE,
     _HERMES_OPEN: _HERMES_CLOSE,
     _XML_FUNC_OPEN: _XML_FUNC_CLOSE,
+    _GLM_TC_OPEN: _GLM_TC_CLOSE,
 }
 # 快速短路用的协议词全集：正文里一个都没有 -> 一定没有工具调用，整条解析跳过。
-_TOOL_PROTOCOL_WORDS = ("tool_function", "tool_call>", "arg_key>", "<function=")
+_TOOL_PROTOCOL_WORDS = ("tool_function", "tool_call>", "tool_calls>", "arg_key>", "<function=", "<invoke")
 
 # 提示词里「反面教材」用的错误形态字面量。集中一处，日后加新反例只改这里。
 _HERMES_OPEN_LITERAL = _HERMES_OPEN
@@ -400,16 +418,31 @@ def _parse_xml_function_blocks(content: str, tool_calls: list, seen: set) -> Non
         _add_tool_call(tool_calls, seen, _tool_call_from_name_args(name, args))
 
 
+def _parse_glm_toolcalls_blocks(content: str, tool_calls: list, seen: set) -> None:
+    """解析 GLM-4 chat-template 形态：``<tool_calls><invoke name="X">...`` 块。
+
+    一个 ``<tool_calls>`` 块内可含多个 ``<invoke>``（并行调用）；参数值走
+    ``_infer_param_value`` 推断类型，与 ``<function=>`` 形态同口径。
+    """
+    for m in _GLM_TC_BLOCK_RE.finditer(content):
+        for inv in _GLM_INVOKE_RE.finditer(m.group(0)):
+            name = (inv.group(1) or "").strip()
+            args = {k.strip(): _infer_param_value(v)
+                    for k, v in _GLM_PARAM_RE.findall(inv.group(2))}
+            _add_tool_call(tool_calls, seen, _tool_call_from_name_args(name, args))
+
+
 def _parse_json_tool_calls(content: str, tool_calls: list) -> None:
     """从 content 里抽出所有协议词边界内的工具调用，追加进 tool_calls。
 
-    认四种边界（都以专属**协议词**为判据，不是"结构长得像"）：
+    认五种边界（都以专属**协议词**为判据，不是"结构长得像"）：
     1. ``  tool_function ... ``` `` 围栏（推荐形态，提示词只教这个）
     2. ``<tool_function>...</tool_function>`` 尖括号变体
     3. ``<tool_call>...</tool_call>`` Hermes 块（内含 JSON 或 arg_key 参数对）
     4. ``<function=名称><parameter=键>值</parameter></function>`` XML 形态
+    5. ``<tool_calls><invoke name="X"><parameter name="k">v</parameter></invoke></tool_calls>`` GLM-4 形态
 
-    后三种是弱模型（glm5.2 等）的训练惯性形态，提示词压不住；不解析的代价是模型
+    后四种是弱模型（glm5.2 / GLM-4 系等）的训练惯性形态，提示词压不住；不解析的代价是模型
     明明在调工具却被当正文漏给客户端、工具不执行、任务卡死。
 
     **裸 JSON 与泛 ```json 围栏仍然不解析**——正文里贴 JSON 配置/代码示例极常见，
@@ -422,12 +455,14 @@ def _parse_json_tool_calls(content: str, tool_calls: list) -> None:
                 _add_tool_call(tool_calls, seen, _try_json_tool_call(obj_text))
     _parse_hermes_blocks(content, tool_calls, seen)
     _parse_xml_function_blocks(content, tool_calls, seen)
+    _parse_glm_toolcalls_blocks(content, tool_calls, seen)
 
 
 def _content_can_contain_tool_calls(content: str) -> bool:
     """快速判定 content 是否可能含工具调用形态，不可能则整条解析直接短路。
 
-    判据是**协议词**：``tool_function`` / ``tool_call>`` / ``arg_key>`` / ``<function=``。
+    判据是**协议词**：``tool_function`` / ``tool_call>`` / ``tool_calls>`` /
+    ``arg_key>`` / ``<function=`` / ``<invoke``。
     正文里一个都没有就一定没有工具调用，整条解析短路、原文返回。普通对话正文在此
     几次子串扫描即可返回，不再跑 JSON 平衡抽取与多形态正则。
     """
@@ -437,8 +472,9 @@ def _content_can_contain_tool_calls(content: str) -> bool:
 def parse_tool_calls_from_content(content: str) -> tuple[str, list[dict]]:
     """从模型输出中解析工具调用（意图驱动：认协议词边界，不认「长得像」）。
 
-    认四种协议词边界（见 _parse_json_tool_calls）：``  tool_function`` 围栏（推荐）、
-    ``<tool_function>`` 尖括号变体、``<tool_call>`` Hermes 块、``<function=>`` XML 形态。
+    认五种协议词边界（见 _parse_json_tool_calls）：``  tool_function`` 围栏（推荐）、
+    ``<tool_function>`` 尖括号变体、``<tool_call>`` Hermes 块、``<function=>`` XML 形态、
+`` GLM-4 ``<tool_calls><invoke>`` 形态。
     裸 JSON / ```json 代码块**不当工具调用**——正文里贴这些就是正文，不执行。
 
     返回:
@@ -461,7 +497,7 @@ def parse_tool_calls_from_content(content: str) -> tuple[str, list[dict]]:
             logger.debug(f"[parse_tool_calls.detail] name={tc['function']['name']}, "
                          f"arguments={tc['function']['arguments'][:200]}")
 
-    # 清理：剥掉四种协议词边界段，边界外的正文（含裸 JSON / ```json 等）原样保留
+    # 清理：剥掉五种协议词边界段，边界外的正文（含裸 JSON / ```json 等）原样保留
     # ——那些是给用户看的正文，不是工具调用残留。这一步保证客户端拿不到任何
     # 工具调用形态的残留文本（用户报的「调用还是被发给客户端」就是漏了这步的清理）。
     cleaned = re.sub(
@@ -472,6 +508,7 @@ def parse_tool_calls_from_content(content: str) -> tuple[str, list[dict]]:
     cleaned = _TOOL_XML_RE.sub('', cleaned)
     cleaned = _HERMES_BLOCK_RE.sub('', cleaned)
     cleaned = _XML_FUNC_BLOCK_RE.sub('', cleaned)
+    cleaned = _GLM_TC_BLOCK_RE.sub('', cleaned)
     return cleaned.strip(), tool_calls
 
 
@@ -592,7 +629,7 @@ def check_tool_call_start(content: str) -> bool:
 # 绝不能当正文下发，否则客户端会看到半截标记垃圾、且后续补全的边界再也切不出来。
 # 两种开标记的前缀链都要 hold。顺序无关，取最靠前的命中点。代价：正文末尾恰好是
 # `` ` `` 或 `` < `` 时会被多 hold 一两字符，等下个 delta 到就放出——只是延迟，不丢字符。
-_PARTIAL_TOOL_MARKERS = (_TOOL_FENCE_OPEN, _TOOL_XML_OPEN)
+_PARTIAL_TOOL_MARKERS = (_TOOL_FENCE_OPEN, _TOOL_XML_OPEN, _GLM_TC_OPEN)
 
 
 def hold_partial_tool_marker_index(text: str) -> int:

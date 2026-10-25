@@ -127,6 +127,11 @@ async def update_runtime_settings(payload: MCPRuntimeSettingsRequest, authorizat
 
 @router.get("/market-settings")
 async def get_market_settings(authorization: str | None = Header(None)) -> dict:
+    """读取市场授权矩阵：平台用户（含各自 service_ids）+ 服务的 enabled/auth_enabled。
+
+    只列 usage_type 为 external 的平台级 principal 与非保留服务；每服务的 auth 状态
+    与每用户的服务授权并发批量拉取，避免逐条往返。仅管理端。
+    """
     await _require_admin(authorization)
     # 管理端口径一致：只列平台级 external principal（agent/task 是会话级身份，
     # 由系统自动管理服务授权，不在管理端授权矩阵里手动配）。
@@ -162,6 +167,11 @@ async def set_market_user_services(
     payload: UpdateMCPUserServicesRequest,
     authorization: str | None = Header(None),
 ) -> dict:
+    """全量替换某用户被授权访问的 MCP 服务集合。
+
+    落库后对变更前后并集触发热下发（保证授权方立即生效、撤销方立即停服），
+    reserved 服务名（marketplace-status）禁止手工授权。仅管理端。
+    """
     await _require_admin(authorization)
     if not await mcp_plugin_store.get_mcp_user(user_id):
         raise HTTPException(404, f"MCP user {user_id} not found")
@@ -181,6 +191,10 @@ async def set_market_user_services(
 
 @router.get("/users")
 async def list_users(authorization: str | None = Header(None)) -> list[dict]:
+    """列出平台级 MCP 用户（owner_user_id IS NULL，token 脱敏）。
+
+    agent/task 类型是会话级身份，归用户侧可见，不在管理端混显。仅管理端。
+    """
     await _require_admin(authorization)
     # 管理端只列平台级 principal（owner IS NULL）。agent/task 类型是会话级身份，
     # 归用户侧可见（list_owned_mcp_principals），不在管理端混显。
@@ -257,6 +271,7 @@ async def create_user(payload: MCPUserRequest, authorization: str | None = Heade
 
 @router.patch("/users/{user_id}")
 async def update_user(user_id: int, payload: UpdateMCPUserRequest, authorization: str | None = Header(None)) -> dict:
+    """更新平台级 MCP 用户的名称/描述/enabled/chat_enabled 等字段。仅管理端。"""
     await _require_admin(authorization)
     result = await mcp_plugin_store.update_mcp_user(
         user_id,
@@ -272,6 +287,7 @@ async def update_user(user_id: int, payload: UpdateMCPUserRequest, authorization
 
 @router.delete("/users/{user_id}")
 async def delete_user(user_id: int, authorization: str | None = Header(None)) -> dict:
+    """删除平台级 MCP 用户（并从各资源实例的 user_ids 中剔除该用户）。仅管理端。"""
     await _require_admin(authorization)
     if not await mcp_plugin_store.delete_mcp_user(user_id):
         raise HTTPException(404, f"MCP user {user_id} not found")
@@ -337,6 +353,7 @@ async def replace_user_params(
 
 @router.get("/services/{service_id}/users")
 async def list_service_users(service_id: int, authorization: str | None = Header(None)) -> dict:
+    """读取服务当前的授权用户 id 列表与 auth_enabled 开关。仅管理端。"""
     await _require_admin(authorization)
     if not await mcp_plugin_store.get_service(service_id):
         raise HTTPException(404, f"MCP service {service_id} not found")

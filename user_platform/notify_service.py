@@ -75,6 +75,10 @@ NOTIFY_EVENT_TYPES = (
     {"type": "task.paused", "name": "任务暂停", "category": "task", "owner_scope": "user"},
     {"type": "task.idle", "name": "任务停留", "category": "task", "owner_scope": "user"},
     {"type": "task.deleted", "name": "任务已删除", "category": "task", "owner_scope": "user"},
+    {"type": "task.scheduled_failed", "name": "定时任务异常", "category": "task", "owner_scope": "user"},
+    # DDNS（动态域名解析）
+    {"type": "ddns.changed", "name": "DDNS 解析变更", "category": "ddns", "owner_scope": "user"},
+    {"type": "ddns.failed", "name": "DDNS 同步失败", "category": "ddns", "owner_scope": "user"},
     # 旧事件保留（历史订阅/记录不失效）
     {"type": "vm.expiring_soon", "name": "虚拟机即将到期", "category": "task", "owner_scope": "user"},
     {"type": "quota.refreshed", "name": "配额刷新", "category": "task", "owner_scope": "user"},

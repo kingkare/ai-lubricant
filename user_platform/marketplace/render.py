@@ -29,6 +29,7 @@ from .validator import (
     validate_device_control_release,
     validate_mobile_release,
     validate_node_release,
+    validate_server_release,
 )
 
 MARKET_MARKER_SCHEMA = "ai-lubricant.market.v1"
@@ -169,19 +170,19 @@ def render_mobile_release(manifests: list[dict]) -> tuple[dict, list[str]]:
 
 
 def render_server_release(manifests: list[dict]) -> tuple[dict, list[str]]:
-    """服务端已登记版本的投影：返回 ``(payload, errors)``。
+    """server-releases/version.json：返回 ``(payload, errors)``。
 
-    与另三条线的差异：**不写市场仓库文件**。服务端没有二进制资产要托管（一版 =
-    一个 git tag），升级链路读的是部署实例自己的内存快照（``server_release_catalog``），
-    而不是 GitHub raw。这个投影只供 publisher 在同进程内 ``apply_release`` 用。
+    与移动端/设备控制同构：取版本号最大的 published manifest，投影升级包信息
+    （download_url + digest + size）。部署实例轮询这份文件比对版本，确认后下载
+    该包升级。
 
-    取版本号最大的 published 条目——日期串 ``vYYMMDD`` 字典序即时间序，所以这里
-    用字符串比较（不能用 ``_version_sort_key``，那是 semver 口径，会把日期串压成
-    最小值）。草稿不参与：登记为 draft 即「发了但不推给用户」。
+    日期串 ``vYYMMDD`` 字典序即时间序，用字符串比较（不能用 ``_version_sort_key``，
+    那是 semver 口径，会把日期串压成最小值）。草稿不参与：draft 即「发了但不推给用户」。
     """
     payload: dict = {
+        "schema": "ai-lubricant.server-release/v1",
         "version": "", "version_notes": "", "release_tag": "",
-        "repo_url": "", "updated_at": _now(),
+        "download_url": "", "digest": "", "size_bytes": 0, "updated_at": _now(),
     }
     best_manifest: dict | None = None
     for manifest in manifests:
@@ -196,13 +197,32 @@ def render_server_release(manifests: list[dict]) -> tuple[dict, list[str]]:
             best_manifest = manifest
 
     if best_manifest is not None:
+        version = str(best_manifest.get("version") or "")
+        # 顶层 download_url 优先用 manifest 顶层字段（上传时已挑好主包）；缺了
+        # 就从 assets 里找 .tar.gz，保证消费侧总能拿到一个可下载地址。
+        download_url = str(best_manifest.get("download_url") or "")
+        digest = str(best_manifest.get("digest") or "")
+        size = int(best_manifest.get("size_bytes") or 0)
+        if not download_url:
+            for asset in (best_manifest.get("assets") or []):
+                if not isinstance(asset, dict):
+                    continue
+                name = str(asset.get("filename") or "").lower()
+                if name.endswith((".tar.gz", ".tgz")):
+                    download_url = str(asset.get("download_url") or "")
+                    digest = digest or str(asset.get("digest") or "")
+                    size = size or int(asset.get("size_bytes") or 0)
+                    break
         payload.update({
-            "version": str(best_manifest.get("version") or ""),
+            "version": version,
             "version_notes": str(best_manifest.get("version_notes") or ""),
             "release_tag": str(best_manifest.get("release_tag") or ""),
-            "repo_url": str(best_manifest.get("repo_url") or ""),
+            "download_url": download_url,
+            "digest": digest,
+            "size_bytes": size,
         })
-    return payload, []
+    errors = validate_server_release(payload) if best_manifest is not None else []
+    return payload, errors
 
 
 def render_device_control_release(manifests: list[dict]) -> tuple[dict, list[str]]:

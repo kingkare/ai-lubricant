@@ -76,7 +76,7 @@ def test_canonicalize_context_overflow_by_generic_message():
     assert result.type == "invalid_request_error"
     assert result.code == "context_length_exceeded"
     assert result.status_code == 400
-    assert result.message == "The context length exceeds the model's maximum limit"
+    assert "maximum context window" in result.message.lower()
 
 
 def test_canonicalize_context_overflow_by_code():
@@ -84,7 +84,7 @@ def test_canonicalize_context_overflow_by_code():
     result = rp.canonicalize_upstream_error(413, detail)
     assert result is not None
     assert result.code == "context_length_exceeded"
-    assert result.message == "The context length exceeds the model's maximum limit"
+    assert "maximum context window" in result.message.lower()
 
 
 def test_canonicalize_context_overflow_from_plain_string():
@@ -105,7 +105,7 @@ def test_canonicalize_input_token_limit_as_input_too_long():
     assert result is not None
     assert result.category == "input_too_long"
     assert result.code == "input_too_long"
-    assert result.message == "Input tokens exceed the maximum allowed limit"
+    assert "too long" in result.message.lower()
 
 
 def test_canonicalize_chinese_input_message_when_status_downgraded():
@@ -123,7 +123,7 @@ def test_canonicalize_max_tokens_exceeded():
     assert result is not None
     assert result.category == "max_tokens_exceeded"
     assert result.code == "max_tokens_exceeded"
-    assert result.message == "max_tokens exceeds remaining context window"
+    assert "context window" in result.message.lower()
 
 
 def test_canonicalize_prompt_too_long():
@@ -151,6 +151,129 @@ def test_canonicalize_specific_category_wins_over_413_fallback():
     assert result.category == "prompt_too_long"
     assert result.code == "prompt_too_long"
     assert result.status_code == 400
+
+
+# ── 超限 message 必须携带客户端压缩触发锚点 ─────────────────────────────────
+# Claude Code 对 error message 做大小写不敏感的子串匹配，认 "prompt is too long" /
+# "input is too long for requested model" / "context window" 才自动压缩后重发；
+# OpenAI 系客户端靠 "context window"/"maximum context length"。归一化把 message 换成
+# 固定文案，一旦丢锚点 = code 归一了、客户端却只把它当普通错误显示，不压缩——
+# 于是卡在原地。这张表是那个不变量的守卫。
+_CLIENT_OVERFLOW_ANCHORS = (
+    "prompt is too long",
+    "input is too long for requested model",
+    "context window",
+    "input length and `max_tokens` exceed context limit",
+)
+
+
+def test_every_overflow_message_carries_client_trigger_anchor():
+    for rule in rp._ERROR_CANONICAL_RULES:
+        canonical = rule.result()
+        if not canonical.is_overflow:
+            continue
+        message = canonical.message.lower()
+        assert any(anchor in message for anchor in _CLIENT_OVERFLOW_ANCHORS), (
+            f"{canonical.code} 的固定文案缺客户端压缩触发锚点: {canonical.message!r}"
+        )
+
+
+def test_overflow_categories_exclude_thinking_budget_invalid():
+    # thinking_budget 参数冲突走归一（400 + 不可重试），但与超限无关：不能被
+    # canonical_overflow_error 当超限上报给客户端压缩，也不该归入超限类目。
+    assert rp.canonicalize_upstream_error(400, "thinking.budget_tokens must be less than max_tokens") is not None
+    assert rp.canonical_overflow_error(400, "thinking.budget_tokens must be less than max_tokens") is None
+    assert rp.canonical_overflow_error(400, "prompt is too long") is not None
+
+
+def test_overflow_code_of_accepts_all_client_facing_overflow_codes():
+    for code in (
+        "context_too_large", "context_length_exceeded", "prompt_too_long",
+        "input_too_long", "model_context_limit", "max_tokens_exceeded",
+        "CONTEXT_LENGTH_EXCEEDED",
+    ):
+        assert rp.overflow_code_of(code) is not None, code
+    for code in ("retry_exhausted", "rate_limit_exceeded", "no_available_account", "", None, "invalid_request_error"):
+        assert rp.overflow_code_of(code) is None, code
+
+
+# ── 上下文窗口大小的抽取与呈现 ─────────────────────────────────────────────
+
+def test_extract_context_window_from_common_dialects():
+    assert rp.extract_context_window("This model's maximum context length is 202752 tokens.") == 202752
+    assert rp.extract_context_window("maximum context length of 200000 tokens") == 200000
+    assert rp.extract_context_window("input exceeds the context window of 128000 tokens") == 128000
+    assert rp.extract_context_window("请求超过模型的最大上下文长度 200000 tokens") == 200000
+
+
+def test_extract_context_window_from_structured_detail():
+    detail = {"error": {"message": "context length of 131072 tokens exceeded", "code": 400}}
+    assert rp.extract_context_window(detail) == 131072
+
+
+def test_extract_context_window_ignores_small_numbers_and_absent():
+    # HTTP 状态码 500 / 重试秒数 30 这类小数字不能被当成窗口。
+    assert rp.extract_context_window("internal error, status 500, retry in 30 seconds") is None
+    assert rp.extract_context_window("prompt is too long") is None
+    assert rp.extract_context_window("") is None
+    assert rp.extract_context_window(None) is None
+
+
+def test_with_context_window_appends_and_preserves_anchor():
+    message = "Your input exceeds this model's maximum context window. Please reduce the length of the conversation."
+    out = rp.with_context_window(message, 200000)
+    # 锚点必须原样保留（客户端靠它触发压缩），窗口大小只能追加。
+    assert "maximum context window" in out.lower()
+    assert "200000 tokens" in out
+    assert out.startswith(message)
+
+
+def test_with_context_window_noop_when_unknown():
+    message = "Prompt is too long"
+    assert rp.with_context_window(message, None) == message
+    assert rp.with_context_window(message, 0) == message
+
+
+def test_canonical_error_display_message_includes_window():
+    canonical = rp.canonicalize_upstream_error(
+        502, "This model's maximum context length is 202752 tokens. Please reduce the length."
+    )
+    assert canonical is not None
+    # 原始 message 固定不变（不掺窗口），display_message 才带窗口。
+    assert "202752" not in canonical.message
+    assert canonical.window == 202752
+    assert "202752 tokens" in canonical.display_message
+    assert "context window" in canonical.display_message.lower()
+
+
+def test_canonical_error_display_message_without_window():
+    canonical = rp.canonicalize_upstream_error(400, "prompt is too long")
+    assert canonical is not None
+    assert canonical.window is None
+    assert canonical.display_message == canonical.message
+
+
+# ── 中继方言/降级回归：这些文案不归一就会一路落进 429 retry_exhausted ────────
+
+def test_relay_downgraded_overflow_message_still_classified():
+    # 中继把 400 降级成 502、丢 code，只剩文案。
+    assert rp.canonicalize_upstream_error(502, "The request exceeds the model's context window") is not None
+    assert rp.canonicalize_upstream_error(502, "对话过长，请压缩历史后重试") is not None
+    assert rp.canonicalize_upstream_error(502, "上下文超限：输入 token 过多") is not None
+
+
+def test_chinese_skip_reason_label_not_misclassified_as_overflow():
+    # 网关自己的选路 skip_reasons 中文标签（NoAvailableAccountError 的 detail）绝不能
+    # 被当成上游超限：混合原因里窗口只是少数、主因是冷却时必须照常 429 重试。
+    assert rp.canonical_overflow_error(429, "模型 'm1' 所有账号不可用：账号处于冷却期 9；预估输入超过模型上下文窗口 1") is None
+    assert rp.canonicalize_upstream_error(429, "预估输入超过模型上下文窗口") is None
+
+
+def test_unrelated_server_error_text_not_misclassified():
+    # 真 5xx 必须留在可重试通道，不能因为常见词被误判成超限。
+    assert rp.canonical_overflow_error(503, "Service Temporarily Unavailable") is None
+    assert rp.canonical_overflow_error(500, "context_window_index rebuilding failed") is None
+    assert rp.canonical_overflow_error(502, "upstream timeout while reading response") is None
 
 
 def test_canonicalize_thinking_budget_ignores_server_error_code():
@@ -315,6 +438,20 @@ def test_unconfigured_extra_4xx_still_retries_outer_candidate():
 def test_unknown_4xx_exhausted_candidates_final_429():
     d = classify_failure(_mk(status_code=404, candidates_remaining=False))
     assert d.action == FailureAction.NO_RESOURCE_429
+
+
+def test_upstream_self_made_426_never_passthrough():
+    # 上游/网关自造码（如 426 Upgrade Required）即使被显式判成不可重试，
+    # 也不得原样透传给客户端：落回重试/429 收口。
+    detail = {"error": {"message": "", "type": "upstream_error", "code": "upstream_error"}}
+    d = classify_failure(_mk(status_code=426, detail=detail, candidates_remaining=True))
+    assert d.action == FailureAction.RETRY
+    d = classify_failure(_mk(status_code=426, detail=detail, candidates_remaining=False))
+    assert d.action == FailureAction.NO_RESOURCE_429
+    d = classify_failure(_mk(
+        status_code=426, detail=detail, non_retryable_override=True,
+    ))
+    assert d.action != FailureAction.RETURN_CLIENT_ERROR
 
 
 def test_exhausted_candidates_final_429():

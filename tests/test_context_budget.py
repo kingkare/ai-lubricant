@@ -211,14 +211,17 @@ def test_api_key_thinking_all_scope_ignores_client_type(monkeypatch):
 
     detail = exc.value.detail
     assert exc.value.status_code == 400
-    assert detail == {
-        "error": {
-            "message": "Your input exceeds the context window of this model. Please adjust your input and try again.",
-            "type": "invalid_request_error",
-            "code": "context_too_large",
-            "param": "tools, messages",
-        }
-    }
+    assert detail["error"]["type"] == "invalid_request_error"
+    assert detail["error"]["code"] == "context_too_large"
+    assert detail["error"]["param"] == "tools, messages"
+    # 文案必须保留客户端压缩触发锚点，并回显具体窗口大小与本次估算输入量。
+    message = detail["error"]["message"]
+    assert "context window" in message.lower()
+    assert "context window: 20 tokens" in message
+    assert "estimated input:" in message
+    # 结构化窗口字段（无歧义）：异常处理器重新归一时靠它抽窗口，而不是撞文案正则
+    # （文案里 "estimated input: N tokens" 这类相邻数字会干扰正则）。
+    assert detail["error"]["context_window"] == 20
 
 
 def test_max_tokens_limit_rejects_text_model_over_limit(monkeypatch):
@@ -334,6 +337,69 @@ def test_final_openai_payload_context_check_counts_converted_system_message():
     assert exc.value.status_code == 400
     assert exc.value.detail["error"]["code"] == "context_too_large"
     assert "messages" in exc.value.detail["error"]["param"]
+
+
+# ── 压缩请求必须跳过本地窗口预检（上游真实窗口裁决）──────────────────────────
+# 压缩请求的 body 本身就是「即将超限的整段历史」：本地估算拦在门口 = 压缩永远发不
+# 出去 = 超限死循环（客户端拿 400 → 压缩 → 再拿 400）。压缩链路口径：关掉一切本地
+# 窗口判定，让上游裁决；上游真报超限仍归一成 400 超限码。
+
+def test_compaction_request_skips_entry_context_budget(monkeypatch):
+    """压缩请求（含显式 _purpose 标记）即使超过本地估算窗口也放行，交上游裁决。"""
+    body = {
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "user", "content": "Please summarize this conversation: " + ("x" * 500)},
+        ],
+        "_purpose": "compaction",
+        "max_tokens": 1,
+    }
+
+    # 不抛 = 放行（同 body 去掉 _purpose 会被打 400）
+    asyncio.run(main._validate_context_budget("test-model", body, "chat"))
+
+
+def test_compaction_fingerprint_request_skips_entry_context_budget():
+    """第三方客户端的压缩指纹（Claude Code 总结指令）同样豁免，不只 _purpose。"""
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Your task is to create a detailed summary of the conversation above. " + ("y" * 500)}],
+        "max_tokens": 1,
+    }
+    asyncio.run(main._validate_context_budget("test-model", body, "chat"))
+
+
+def test_non_compaction_request_still_rejected_by_entry_budget():
+    """普通请求（无压缩信号）超窗时照常被本地窗口预检拦截。"""
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "x" * 200}],
+        "max_tokens": 16,
+    }
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(main._validate_chat_request(body))
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["error"]["code"] == "context_too_large"
+
+
+def test_compaction_request_skips_upstream_payload_budget():
+    """出站载荷复检同样跳过压缩请求：_purpose 已被剥离，靠 messages 里的总结指令指纹命中。"""
+    provider = CustomProvider("user", "key", provider_name="test-provider", base_url="https://example.test")
+    payload = provider._build_openai_payload(
+        "test-model",
+        [
+            {"role": "system", "content": "You compress an agent's earlier conversation into a dense factual note."},
+            {"role": "user", "content": "x" * 500},
+        ],
+        True,
+        max_tokens=1,
+        model_info={"max_context_tokens": 20},
+    )
+    # 不抛 = 放行，交上游真实窗口裁决
+    main.validate_upstream_context_budget("test-model", payload, {"max_context_tokens": 20})
 
 
 def test_tokenizer_builtin_chars_fallback():

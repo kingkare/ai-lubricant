@@ -175,18 +175,21 @@ async def stop_service_core(service_id: int) -> dict:
 
 @router.get("/services")
 async def list_services(request: Request):
+    """列出所有 MCP 服务记录。仅管理端。"""
     await _require_admin(request)
     return await mcp_plugin_store.list_services()
 
 
 @router.get("/services/{service_id}/versions")
 async def list_versions(service_id: int, request: Request):
+    """列出某 MCP 服务的全部插件版本。仅管理端。"""
     await _require_admin(request)
     return await mcp_plugin_store.list_versions(service_id)
 
 
 @router.get("/versions/{version_id}")
 async def get_version(version_id: int, request: Request):
+    """读取单个插件版本详情（含代码与配置快照）。仅管理端。"""
     await _require_admin(request)
     v = await mcp_plugin_store.get_version(version_id)
     if not v:
@@ -203,6 +206,7 @@ class CreateVersionPayload(BaseModel):
 
 @router.post("/services/{service_id}/versions")
 async def create_version(service_id: int, payload: CreateVersionPayload, request: Request):
+    """为 MCP 服务新建一个插件版本（代码 + 配置快照，落库待审查）。仅管理端。"""
     await _require_admin(request)
     return await create_version_core(service_id, payload)
 
@@ -222,12 +226,18 @@ async def create_version_core(service_id: int, payload: CreateVersionPayload) ->
 
 @router.post("/versions/{version_id}/security-check")
 async def security_check(version_id: int, request: Request):
+    """对插件版本执行安全审查（静态扫描 verdict/risk_level），通过后才能发布。仅管理端。"""
     await _require_admin(request)
     return await run_security_check(version_id)
 
 
 @router.post("/versions/{version_id}/activate")
 async def activate(version_id: int, request: Request):
+    """把指定版本设为 active 并热加载到 runtime（替换当前运行实例）。
+
+    前置：security_status 必须是 passed 且版本带代码，否则 409/400。
+    加载成功会回写 tools_cache。仅管理端。
+    """
     await _require_admin(request)
     return await activate_core(version_id)
 
@@ -266,6 +276,11 @@ async def activate_core(version_id: int) -> dict:
 
 @router.post("/services/{service_id}/reload")
 async def reload_service(service_id: int, request: Request):
+    """热重载 MCP 服务运行配置（env/auth/manifest），不停止服务。
+
+    builtin 仅原地更新 env/auth/resources；custom 用 active version 重新激活；
+    内置 cdp-bridge 重载后还会广播一次可操作 agent 列表变更。仅管理端。
+    """
     await _require_admin(request)
     return await reload_service_core(service_id)
 
@@ -353,6 +368,13 @@ async def reload_service_core(service_id: int) -> dict:
         await mcp_plugin_store.activate_version(int(version_id), tools_cache=tools_cache)
     else:
         await mcp_plugin_store.mark_runtime_status(service_id, "loaded", tools_cache=tools_cache)
+    # 管理端资源 API（MCP 市场里改 cdp_client 的 agent_ids 等）走的是这条 reload 链，
+    # 不经 resync_builtin_service——所以通知也要在这里发一次，否则已连接的浏览器
+    # 面板不会知道可操作 agent 列表变了。
+    if is_builtin and name == "cdp-bridge":
+        from .configuration import notify_cdp_agents_changed
+
+        notify_cdp_agents_changed()
     return {"ok": True, "status": "reloaded", "tools": len(plugin.tools)}
 
 
@@ -382,6 +404,11 @@ async def _dispatch_service_capability(service_id: int, kind: str, key: str, arg
 
 @router.post("/services/{service_id}/actions/{action_key}")
 async def execute_service_action(service_id: int, action_key: str, request: Request, response: Response):
+    """执行 MCP 服务 runtime 插件声明的 action（实时直达，不经落库）。
+
+    响应带 no-store 头防缓存；调用参数取 body 的 ``value`` 字段（无该字段时整个 body 作参数）。
+    action 未在 manifest 声明返回 404，binding 无效返回 500。仅管理端。
+    """
     await _require_admin(request)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     response.headers["Pragma"] = "no-cache"
@@ -393,6 +420,7 @@ async def execute_service_action(service_id: int, action_key: str, request: Requ
 
 @router.get("/services/{service_id}/views/{view_key}")
 async def query_service_view(service_id: int, view_key: str, request: Request):
+    """查询 MCP 服务 runtime 插件声明的 view（实时只读，query 参数作过滤条件）。仅管理端。"""
     await _require_admin(request)
     data = await _dispatch_service_capability(service_id, "view", view_key, dict(request.query_params))
     return {"data": data, "meta": {"realtime": True}}

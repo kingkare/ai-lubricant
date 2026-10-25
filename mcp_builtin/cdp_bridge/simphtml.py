@@ -7,7 +7,18 @@ try: from bs4 import BeautifulSoup
 except ImportError: log("[Error] BeautifulSoup4 未安装，请叫Agent安装BeautifulSoup4，再使用web相关工具。")
 
 js_optHTML = r'''function optHTML(text_only=false) {
-function createEnhancedDOMCopy() {  
+// 密码类字段守卫：插件密码管理器会把明文填进 DOM，scan 回读必须堵死——
+// 这类字段只标记 data-secret="true"，绝不把 value 带进输出（会进 prompt 与 ClickHouse）。
+function isSecretField(node) {
+  if (!node || (node.tagName !== 'INPUT' && node.tagName !== 'TEXTAREA')) return false;
+  if (node.tagName === 'INPUT' && String(node.type || '').toLowerCase() === 'password') return true;
+  const probe = [node.getAttribute && node.getAttribute('name'), node.id,
+    node.getAttribute && node.getAttribute('autocomplete'),
+    node.getAttribute && node.getAttribute('aria-label'),
+    node.getAttribute && node.getAttribute('placeholder')].filter(Boolean).join(' ');
+  return /(pass|pwd|密码|secret|token)/i.test(probe);
+}
+function createEnhancedDOMCopy() {
   const nodeInfo = new WeakMap();  
   const ignoreTags = ['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'COLGROUP', 'COL', 'TEMPLATE', 'PARAM', 'SOURCE'];  
   const ignoreIds = ['ljq-ind'];  
@@ -21,10 +32,11 @@ function createEnhancedDOMCopy() {
     }  
     if (sourceNode.nodeType === 3) return sourceNode.cloneNode(false);  
     const clone = sourceNode.cloneNode(false);
-    if ((sourceNode.tagName === 'INPUT' || sourceNode.tagName === 'TEXTAREA') && sourceNode.value) clone.setAttribute('value', sourceNode.value);
+    if ((sourceNode.tagName === 'INPUT' || sourceNode.tagName === 'TEXTAREA') && sourceNode.value && !isSecretField(sourceNode)) clone.setAttribute('value', sourceNode.value);
+    if (isSecretField(sourceNode) && sourceNode.value) clone.setAttribute('data-secret', 'true');
     if (sourceNode.tagName === 'INPUT' && (sourceNode.type === 'radio' || sourceNode.type === 'checkbox') && sourceNode.checked) clone.setAttribute('checked', '');
-    else if (sourceNode.tagName === 'SELECT' && sourceNode.value) clone.setAttribute('data-selected', sourceNode.value);  
-    try { if (sourceNode.matches && sourceNode.matches(':-webkit-autofill')) { clone.setAttribute('data-autofilled', 'true'); if (!sourceNode.value) clone.setAttribute('value', '⚠️受保护-读tmwebdriver_sop的autofill章节提取'); } } catch(e) {}
+    else if (sourceNode.tagName === 'SELECT' && sourceNode.value) clone.setAttribute('data-selected', sourceNode.value);
+    try { if (sourceNode.matches && sourceNode.matches(':-webkit-autofill')) { clone.setAttribute('data-autofilled', 'true'); if (!sourceNode.value && !isSecretField(sourceNode)) clone.setAttribute('value', '⚠️受保护-密码字段不参与文本提取'); } } catch(e) {}
 
     const isDropdown = sourceNode.classList?.contains('dropdown-menu') ||   
              /dropdown|menu/i.test(sourceNode.className) || sourceNode.getAttribute('role') === 'menu'; 
@@ -137,7 +149,7 @@ if (text_only) {
     if (blocks.has(el.tagName)) el.insertAdjacentText('beforebegin', '\n');
   });
   domCopy.querySelectorAll('input:not([type=hidden]),textarea,select').forEach(el=>{
-    const p=[el.tagName,el.id&&'#'+el.id,el.getAttribute('name')&&'name='+el.getAttribute('name'),el.tagName==='INPUT'&&'type='+(el.getAttribute('type')||'text'),el.getAttribute('placeholder')&&'"'+el.getAttribute('placeholder')+'"',el.getAttribute('data-autofilled')&&'autofilled',el.disabled&&'disabled',el.tagName==='SELECT'&&el.getAttribute('data-selected')&&'="'+el.getAttribute('data-selected')+'"'].filter(Boolean).join(' ');
+    const p=[el.tagName,el.id&&'#'+el.id,el.getAttribute('name')&&'name='+el.getAttribute('name'),el.tagName==='INPUT'&&'type='+(el.getAttribute('type')||'text'),el.getAttribute('placeholder')&&'"'+el.getAttribute('placeholder')+'"',el.getAttribute('data-secret')&&'secret',el.getAttribute('data-autofilled')&&'autofilled',el.disabled&&'disabled',el.tagName==='SELECT'&&el.getAttribute('data-selected')&&'="'+el.getAttribute('data-selected')+'"'].filter(Boolean).join(' ');
     el.insertAdjacentText('beforebegin','\n['+p+']\n');
   });
   domCopy.querySelectorAll('button[disabled]').forEach(el=>el.insertAdjacentText('beforebegin','[DISABLED] '));

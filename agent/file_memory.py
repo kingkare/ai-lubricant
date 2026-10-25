@@ -86,7 +86,13 @@ def _atomic_write(path: Path, content: str) -> None:
 # counter-intuitive scenario hint (2-4 words) — never a mechanism, method or step, and
 # nothing at all when the SOP name already explains itself.
 _SOP_TRIGGERS: dict[str, str] = {
-    "browser_sop": "page read/click/JS; new task/site → open_tab, in-site nav → click",
+    # 触发词只写「场景」不写「动作」：per the L0 red line below, a parenthesised
+    # trigger carries only a counter-intuitive scenario hint — never a mechanism,
+    # method or step. 早先这里写的是 "new task/site → open_tab"，等于在每轮都进
+    # system 的 L1 里直接下了一条「新任务就开新标签页」的行为指令，压过了场景段
+    # 的「默认操作当前 tab」，是「让它操作当前页却老开新窗口」的根因。开页策略
+    # 归 browser_sop.md 正文（会内联进场景段），这里只留场景触发词。
+    "browser_sop": "page read/click/JS; network watch; wait for condition",
     "web_setup_sop": "first-time browser env prep",
     "mcp_usage_sop": "capability_call, external services",
     "scheduled_task_sop": "cron/recurring",
@@ -105,6 +111,8 @@ _SOP_TRIGGERS: dict[str, str] = {
     "code_review_principles": "judging code quality",
     "review_sop": "adversarial code review, false-positive gate",
     "supervisor_sop": "watch a subagent without doing its work",
+    "site_service_sop": "封装网站成 API/站点定义",
+    "workflow_sop": "manage (writes need approval) / launch a user-owned automation graph",
 }
 
 # Always-on behavioural rules. GA ships these in the L1 template's [RULES] block and

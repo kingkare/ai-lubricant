@@ -105,12 +105,6 @@
               "items": { "type": "integer" },
               "x-reference": "mcp_users"
             },
-            "agent_ids": {
-              "type": "array",
-              "title": "可操作 agent 列表",
-              "items": { "type": "integer" },
-              "x-reference": "agents"
-            },
             "enabled": {
               "type": "boolean",
               "title": "启用",

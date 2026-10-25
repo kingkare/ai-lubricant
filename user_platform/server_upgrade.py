@@ -31,9 +31,24 @@ from loguru import logger
 
 
 def _state_dir() -> Path:
-    """标记/状态目录：docker 默认 ``/app/data``（与宿主 ``./data/ai_data`` 同一份
-    bind mount）；裸跑默认 ``/var/lib/alb``。env 可覆盖。"""
-    return Path(os.environ.get("SERVER_UPGRADE_STATE_DIR", "/var/lib/alb"))
+    """标记/状态目录。
+
+    docker 形态：``/app/data``（容器内路径，与宿主 ``./data/ai_data`` 同一 bind
+    mount）——**必须是这个**，宿主 systemd timer 才看得到标记；写进容器内别的
+    路径容器一重建就没了，升级会永远卡住。
+
+    裸跑形态：``/var/lib/alb``。
+
+    默认按「是不是在容器里」自动判断（docker 下 ``/.dockerenv`` 存在），env
+    ``SERVER_UPGRADE_STATE_DIR`` 可显式覆盖。早期版本默认写死 ``/var/lib/alb``，
+    docker 部署下标记写进了容器内不可见路径，宿主永远收不到。
+    """
+    override = (os.environ.get("SERVER_UPGRADE_STATE_DIR") or "").strip()
+    if override:
+        return Path(override)
+    if Path("/.dockerenv").exists():
+        return Path("/app/data")
+    return Path("/var/lib/alb")
 
 
 def _marker_path() -> Path:
@@ -160,12 +175,16 @@ async def start_upgrade(*, target_tag: str, proxy_config_id: str = "") -> dict[s
     repo_url = str(latest.get("repo_url") or "") or os.environ.get(
         "SERVER_UPGRADE_REPO_URL", "https://github.com/wuxin-gh/ai-lubricant.git"
     )
+    # 升级包下载地址：登记时写入快照的 download_url（Release 资产直链）；没有则
+    # 留空，宿主按 GitHub Release 约定自行拼。
+    bundle_url = str(latest.get("download_url") or "")
 
     try:
         _atomic_write_marker({
             "target": target,
             "proxy_url": proxy_url,
             "repo_url": repo_url,
+            "bundle_url": bundle_url,
             "previous": _strip_v(current),
             "started_at": _now(),
         })

@@ -25,7 +25,7 @@ async def _init_database() -> None:
             "connections": {"user_platform": settings.database_url},
             "apps": {
                 "user_platform": {
-                    "models": ["user_platform.models_tunnel"],
+                    "models": ["user_platform.models_tunnel", "user_platform.models_ddns"],
                     "default_connection": "user_platform",
                 }
             },
@@ -33,6 +33,15 @@ async def _init_database() -> None:
         use_tz=False,
         _enable_global_fallback=True,
     )
+    # DDNS was reshaped from a single table into provider → record. Drop the
+    # pre-release shape BEFORE schema generation so generate_schemas recreates
+    # it fresh (and before the additive pass, which would otherwise mask the old
+    # shape by bolting on a nullable provider_id). Same call the main service
+    # makes from user_platform.database.init_database — whichever process starts
+    # first against a stale database does the reshape.
+    from user_platform.database import _migrate_ddns_two_level
+
+    await _migrate_ddns_two_level()
     await Tortoise.generate_schemas(safe=True)
     # Reconcile the new tunnel models with their declarations so additive columns
     # added since the table was first created exist (same contract as the main

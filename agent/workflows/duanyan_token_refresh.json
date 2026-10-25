@@ -1,0 +1,173 @@
+{
+  "name": "duanyan_token_refresh.json",
+  "label": "duanyan 自动登陆",
+  "description": "先查现有票：拿 Redis 里的 uaa-token 调 getUserInfo 反查账号信息 + 解 JWT exp 判过期。未过期 → 直接结束（不登录）；过期/没票/票被上游拒 → 才走 OpenXLab SSO 浏览器登录（fill_credential 填已保存凭据，值不回模型）→ 新票写 Redis（wf:duanyan:token:<uid>）供 duanyan 代码渠道 spec 读取。与 inkstone 同主机同 SSO，同一张 uaa-token 打通桌面 local-agent 与网页两端（2026-10-18 真 token 实测）。遍历用图里的 foreach 节点（下游整段按账号各跑一遍），不再靠 trigger 整图扇出。",
+  "retry_on_reboot": true,
+  "inputs": [
+    {
+      "key": "accounts",
+      "type": "account",
+      "site_url": "https://sso.openxlab.org.cn",
+      "note": "duanyan 账号列表（account_list 提供，只有账号名，绝无密码）；引擎灌的是 username 列表，遍历后每遍 $item = 单个账号名（username 字符串，即 OpenXLab 的 sso_uid，实测 == JWT 的 jti，也是 Redis 票键）。"
+    }
+  ],
+  "triggers": [
+    {
+      "id": "daily",
+      "kind": "cron",
+      "cron": "0 10 * * *",
+      "label": "每日检查并按需续期",
+      "enabled": true,
+      "params": {
+        "source": "account_list",
+        "url": "https://sso.openxlab.org.cn",
+        "multiple": false
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "id": "each",
+      "kind": "foreach",
+      "name": "遍历账号（每个账号跑一遍下游：查票→判过期→按需登录→写票）",
+      "items": "$input.accounts"
+    },
+    {
+      "id": "read",
+      "kind": "cache",
+      "name": "读现有票（键 = duanyan:token:<账号名>，与 spec 握手）",
+      "action": "get",
+      "key": "wf:duanyan:token:{$item}"
+    },
+    {
+      "id": "judge",
+      "kind": "code_run",
+      "name": "判过期：用票查账号信息 + 解 exp（未过期则直接结束）",
+      "type": "python",
+      "input_mapping": {
+        "stored": "$read.value",
+        "found": "$read.found",
+        "uid": "$item"
+      },
+      "code": "import base64, json, time, urllib.request\n\nuid = str(data.get('uid') or '').strip()\nstored = data.get('stored')\n\n# ---- 从 Redis 值里取出 token（既认裸串，也认 {access_token:...} 对象）----\ntok = ''\nif isinstance(stored, dict):\n    for k in ('access_token', 'token'):\n        v = str(stored.get(k) or '').strip()\n        if v:\n            tok = v[7:].strip() if v[:7].lower() == 'bearer ' else v\n            break\nelif isinstance(stored, str) and stored.strip():\n    s = stored.strip()\n    tok = s[7:].strip() if s[:7].lower() == 'bearer ' else s\n\nif not tok:\n    result = {'need_login': True, 'reason': 'no_token', 'uid': uid}\nelse:\n    # ---- 用票反查账号信息（getUserInfo）：既拿昵称/uid，也验证这张票上游还认 ----\n    info = {}\n    alive = None\n    try:\n        req = urllib.request.Request(\n            'https://discovery.intern-ai.org.cn/api/user-center/v1/users/getUserInfo',\n            data=json.dumps({'jwt': tok}).encode('utf-8'),\n            headers={'Content-Type': 'application/json', 'Accept-Language': 'zh-CN'},\n            method='POST')\n        with urllib.request.urlopen(req, timeout=20) as resp:\n            body = json.loads(resp.read().decode('utf-8', 'replace'))\n        alive = isinstance(body, dict) and int(body.get('code', -1)) == 0\n        if alive and isinstance(body.get('data'), dict):\n            info = body['data']\n    except Exception:\n        alive = None                       # 网络抖动：不下死结论，交 exp 判\n    # ---- 解 JWT exp ----\n    exp = 0\n    try:\n        seg = tok.split('.')[1]\n        seg += '=' * (-len(seg) % 4)\n        exp = int(json.loads(base64.urlsafe_b64decode(seg)).get('exp') or 0)\n    except Exception:\n        exp = 0\n    ttl_days = (exp - time.time()) / 86400 if exp else -1\n    # 判定：上游明确拒（alive==False）→ 登录；剩 <=3 天 → 登录；除此之外直接结束。\n    need = (alive is False) or (exp != 0 and ttl_days <= 3)\n    result = {\n        'need_login': bool(need),\n        'reason': ('token_rejected' if alive is False else\n                   ('token_expired' if need else 'token_valid')),\n        'uid': uid,\n        'sso_uid': str(info.get('sso_uid') or uid),\n        'nickname': str(info.get('nickname') or ''),\n        'ttl_days': round(ttl_days, 2),\n        'token_expires_at': exp if exp else '',\n    }\nresult = result",
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "need_login"
+        ],
+        "properties": {
+          "need_login": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "uid": {
+            "type": "string"
+          },
+          "sso_uid": {
+            "type": "string"
+          },
+          "nickname": {
+            "type": "string"
+          },
+          "ttl_days": {
+            "type": "number"
+          },
+          "token_expires_at": {}
+        }
+      }
+    },
+    {
+      "id": "login",
+      "kind": "run_session",
+      "name": "SSO 登录（fill_credential 填凭据）",
+      "agent_id": "any",
+      "sop": "Log in to OpenXLab SSO for the duanyan (书生·端砚) channel, obtaining a fresh uaa-token for account {$item}.\n\nUse only the `web` tool throughout. First call `web(operation=clients)` to pick a connected browser client_id and pass it on every subsequent `web` call. Never read, hand-type, or print any password or verification code — always use `web(operation=fill_credential)` to push an already-saved credential into the page (the value flows server→extension→DOM and never returns to you; the receipt is only `filled`/`field`).\n\nStrict steps:\n1. `web(open_tab, url=\"https://sso.openxlab.org.cn/authentication?clientId=dagw07mkg1bazlxzoy31&redirect=https%3A%2F%2Fdiscovery.intern-ai.org.cn%2Fchat\")` and record the tab. (Same SSO/clientId as the inkstone channel — verified 2026-10-18 that this uaa-token works on the duanyan desktop `/local-agent/*` endpoints too.)\n2. `web(execute)` to clear BOTH cookies and localStorage for this origin (SSO reads auth from cookie||localStorage; clearing only cookies leaves a stale uaa-token that makes the page skip the login form). Record the current `uaa-token` cookie value as `old_token` baseline.\n3. `web(navigate, <same url>)` back to the login form; wait ~2 seconds for it to render.\n4. `web(execute)` to switch to the password form (the default view is WeChat QR: click the “使用手机号/密码登录” entry, then the “密码登录” tab) and poll until `input[type=password]` is visible.\n5. Fill credentials: `web(operation=fill_credential, kind=\"password\", domain=\"sso.openxlab.org.cn\", account=\"{$item}\")` — it fills the saved username and password together. If the receipt is `filled=false`, handle by reason: `login_form_not_found` → go back to step 4 and confirm the password form is shown, then retry once; `password_unavailable` / no entry → this account has no saved password for this site, record failure and skip (do NOT fabricate a password); tell the user to save it via the extension 🔑 or the web console.\n6. `web(execute)` to tick the “阅读并同意协议” checkbox (locate `.login-agreement-checkbox-col`, NOT the already-checked “7天内免登录”), then `web(execute)` to click the login button — fill_credential does not submit, you must click it yourself.\n7. `web(wait, condition_js polling until the `uaa-token` cookie is present AND not equal to `old_token`, timeout=60)` (prevents account bleed from a stale session). If a 2FA / OTP input appears mid-flow: `web(operation=fill_credential, kind=\"otp\", domain=\"sso.openxlab.org.cn\", account=\"{$item}\")` to fill the current code (on `multiple_entries` retry carrying `account`; if no linked authenticator, 2FA isn't enabled for this site — skip).\n7b. If the Aliyun anti-bot captcha appears (阿里云「确认你不是机器人」checkbox, and possibly a slider that follows it), do NOT dismiss it with `web(execute)`/`element.click()` — those are synthetic (`isTrusted=false`) and Aliyun rejects them with `VerifyResult:false F001`. Click with TRUSTED CDP input events instead:\n  a. `web(focus_tab, ...)` first. ⚠️ focusing alone is NOT enough — after it you MUST check two things via `web(execute)` (use `no_monitor=true`): `innerWidth > 0` (a never-rendered tab has a 0×0 viewport, so every `getBoundingClientRect()` is 0 and the click lands nowhere) AND `document.visibilityState === \"visible\"` (a minimized/occluded window keeps the page hidden, and Chrome THROTTLES requestAnimationFrame in hidden pages — Aliyun's seamless check runs in rAF, so it never finishes and the server answers F001).\n  b. If `visibilityState` is still not \"visible\" after focusing, DO NOT keep retrying: the captcha cannot pass in a hidden page. Report failure with the reason 「浏览器窗口未在前台（visibilityState=hidden），rAF 被节流，阿里云风控校验无法完成」 so the operator can bring that Chrome window to the front.\n  c. Read the captcha box's center via `web(execute)` + `getBoundingClientRect()` (use `no_monitor=true`). Coordinates are CSS pixels relative to the viewport.\n  d. `web(batch, commands=[{\"cmd\":\"cdp\",\"method\":\"Input.dispatchMouseEvent\",\"params\":{\"type\":\"mouseMoved\",\"x\":<cx>,\"y\":<cy>}}, {\"cmd\":\"cdp\",\"method\":\"Input.dispatchMouseEvent\",\"params\":{\"type\":\"mousePressed\",\"x\":<cx>,\"y\":<cy>,\"button\":\"left\",\"clickCount\":1}}, {\"cmd\":\"cdp\",\"method\":\"Input.dispatchMouseEvent\",\"params\":{\"type\":\"mouseReleased\",\"x\":<cx>,\"y\":<cy>,\"button\":\"left\",\"clickCount\":1}}])`.\n     ⚠️ The exact shape matters — get it wrong and you will wrongly conclude \"the bridge blocks CDP\":\n       - every command object MUST carry `\"cmd\":\"cdp\"` (without it the bridge answers `unknown cmd: undefined`);\n       - `x`/`y`/`clickCount` MUST be NUMERIC JSON values — quoted numbers fail with `int32 value expected`;\n       - only page-level CDP domains exist on a tab-attached session (Input/Page/Runtime/DOM/Emulation). `Browser.*` (e.g. `Browser.setWindowBounds`) is NOT available — do not try to restore the window that way.\n  e. Slider variant: `mouseMoved` onto the handle, `mousePressed`, then 5–8 small `mouseMoved` steps along the track (a realistic arc), then `mouseReleased`.\n  f. `web(wait)` up to ~15s for the green ✓ / popup close; the page then proceeds automatically.\n  g. If after 3 CDP attempts the captcha still returns F001, treat this account as failed for THIS run: output the failure JSON below and STOP — do NOT `ask_user` and do NOT loop (this is an unattended cron; a hanging question blocks every other account and the whole run).\n8. `web(execute)` to read the cookie jar for `uaa-token`; if a refresh-token cookie also exists, read it too. Also call the upstream `getUserInfo` with the fresh token (POST https://discovery.intern-ai.org.cn/api/user-center/v1/users/getUserInfo, body {\"jwt\": token}) to read back `sso_uid`.\n\nFinal output: exactly one line of JSON, no other text, and never put a password or code in the output:\n{\"access_token\": \"<uaa-token>\", \"token_expires_at\": \"<ISO8601 derived from the JWT exp claim, or empty>\", \"refresh_token\": \"<only if upstream issued a refresh token; otherwise omit this field>\", \"sso_uid\": \"<ssoUid from getUserInfo>\"}\nIf login could NOT complete (no saved password for this account, WeChat-QR-only, or the captcha would not pass after the trusted-click attempts above), output instead exactly: {\"error\": \"<short reason>\"} — and nothing else. Do not wrap either JSON in prose or a <summary> tag; emit the single JSON line as the entire output.",
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "result"
+        ],
+        "properties": {
+          "result": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "id": "parse",
+      "kind": "code_run",
+      "name": "解析登录结果为凭据字段",
+      "type": "python",
+      "input_mapping": {
+        "raw": "$login.result"
+      },
+      "code": "import base64\nimport json\nimport re\n\ntxt = (data.get('raw') or '').strip()\nif not isinstance(txt, str):\n    txt = json.dumps(txt, ensure_ascii=False)\n\nout = {'ok': False, 'error': '', 'access_token': '', 'sso_uid': ''}\n\n\ndef _find_obj(s):\n    # 从任意文本里抠第一个含 access_token/error 的平衡 JSON：模型常把结果包在\n    # <summary>/散文/代码块里（run 53 就这么丢过一张真票）。\n    try:\n        o = json.loads(s)\n        if isinstance(o, dict):\n            return o\n    except Exception:\n        pass\n    depth = 0\n    start = -1\n    for i, ch in enumerate(s):\n        if ch == '{':\n            if depth == 0:\n                start = i\n            depth += 1\n        elif ch == '}':\n            depth -= 1\n            if depth == 0 and start >= 0:\n                try:\n                    o = json.loads(s[start:i + 1])\n                except Exception:\n                    continue\n                if isinstance(o, dict) and (o.get('access_token') or o.get('error')):\n                    return o\n    return {}\n\n\nobj = _find_obj(txt)\nif isinstance(obj, dict) and obj.get('error'):\n    out['error'] = '登录失败: ' + str(obj['error'])[:180]\nelif not (isinstance(obj, dict) and str(obj.get('access_token') or '').strip()):\n    out['error'] = '登录输出里没有 access_token（模型未产出预期 JSON）: ' + txt[:160]\nelse:\n    token = str(obj['access_token']).strip()\n    out['access_token'] = token\n    if obj.get('refresh_token'):\n        out['refresh_token'] = str(obj['refresh_token']).strip()\n    if obj.get('token_expires_at'):\n        out['token_expires_at'] = str(obj['token_expires_at']).strip()\n    uid = ''\n    for k in ('sso_uid', 'uid', 'user_id', 'ssoUid'):\n        v = str(obj.get(k) or '').strip()\n        if v:\n            uid = v\n            break\n    if not uid:\n        try:\n            seg = token.split('.')[1]\n            seg += '=' * (-len(seg) % 4)\n            uid = str(json.loads(base64.urlsafe_b64decode(seg)).get('jti') or '').strip()\n        except Exception:\n            uid = ''\n    if not uid:\n        out['error'] = '无法确定 sso_uid（登录输出无 uid、JWT 无 jti），Redis 键无从落'\n    else:\n        out['sso_uid'] = uid\n        out['ok'] = True\n# ⚠️ 绝不 raise：raise 让子进程非零退出，引擎会返回 stdout/stderr 字典，\n# 再过 output_schema 报「缺 access_token」——把真因（登录失败）完全掩盖了。\n# 失败写成 ok=false 的合规输出，靠边的 when 跳过 store、不写脏票。\nresult = out",
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          },
+          "access_token": {
+            "type": "string"
+          },
+          "refresh_token": {
+            "type": "string"
+          },
+          "token_expires_at": {
+            "type": "string"
+          },
+          "sso_uid": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "id": "store",
+      "kind": "cache",
+      "name": "存 Redis 供 duanyan spec 读取（键 = 账号名，与 read 同键）",
+      "action": "set",
+      "key": "wf:duanyan:token:{$item}",
+      "value": "$parse",
+      "ttl": 1209600
+    }
+  ],
+  "edges": [
+    {
+      "source": "each",
+      "target": "read"
+    },
+    {
+      "source": "read",
+      "target": "judge"
+    },
+    {
+      "source": "judge",
+      "target": "login",
+      "when": "$judge.need_login == true"
+    },
+    {
+      "source": "login",
+      "target": "parse"
+    },
+    {
+      "source": "parse",
+      "target": "store",
+      "when": "$parse.ok == true"
+    }
+  ],
+  "end": {},
+  "failure": {
+    "agent_id": null
+  }
+}

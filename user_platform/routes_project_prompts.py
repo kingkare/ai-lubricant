@@ -51,11 +51,19 @@ def _clean_providers(values: list[str]) -> list[str]:
 
 @admin_router.get("")
 async def admin_list_prompts(_: User = Depends(_require_admin)) -> list[dict]:
+    """获取系统提示词列表（管理端）。
+
+    需管理员权限；系统提示词 ``owner_user_id`` 为空，含未启用项。
+    """
     return await project_prompt_store.list_admin_prompts()
 
 
 @admin_router.post("")
 async def admin_create_prompt(body: CreatePromptReq, _: User = Depends(_require_admin)) -> dict:
+    """创建系统提示词（管理端）。
+
+    需管理员权限；名称必填，providers 会去重并校验是否在支持的编辑器类型内。
+    """
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="提示词名称不能为空")
@@ -67,6 +75,10 @@ async def admin_create_prompt(body: CreatePromptReq, _: User = Depends(_require_
 
 @admin_router.patch("/{prompt_id}")
 async def admin_update_prompt(prompt_id: str, body: UpdatePromptReq, _: User = Depends(_require_admin)) -> dict:
+    """更新系统提示词（管理端，部分字段）。
+
+    需管理员权限；仅 ``exclude_unset`` 字段生效，providers 校验同创建。
+    """
     patch = body.model_dump(exclude_unset=True)
     if "name" in patch:
         patch["name"] = str(patch["name"] or "").strip()
@@ -82,6 +94,10 @@ async def admin_update_prompt(prompt_id: str, body: UpdatePromptReq, _: User = D
 
 @admin_router.delete("/{prompt_id}")
 async def admin_delete_prompt(prompt_id: str, _: User = Depends(_require_admin)) -> dict:
+    """删除系统提示词（管理端）。
+
+    需管理员权限；目标不存在返回 404。
+    """
     if not await project_prompt_store.delete_prompt(prompt_id):
         raise HTTPException(status_code=404, detail="项目提示词不存在")
     return {"deleted": True}
@@ -91,11 +107,16 @@ async def admin_delete_prompt(prompt_id: str, _: User = Depends(_require_admin))
 
 @user_router.get("")
 async def list_available_prompts(user: User = Depends(get_current_user)) -> list[dict]:
+    """获取当前用户可用的项目提示词（系统启用项 + 自己的私有项）。"""
     return await project_prompt_store.list_prompts(owner_user_id=str(user.id))
 
 
 @user_router.post("")
 async def create_my_prompt(body: CreatePromptReq, user: User = Depends(get_current_user)) -> dict:
+    """创建当前用户的私有提示词。
+
+    名称必填，providers 走白名单校验；``owner_user_id`` 记为当前用户。
+    """
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="提示词名称不能为空")
@@ -108,6 +129,10 @@ async def create_my_prompt(body: CreatePromptReq, user: User = Depends(get_curre
 
 @user_router.patch("/{prompt_id}")
 async def update_my_prompt(prompt_id: str, body: UpdatePromptReq, user: User = Depends(get_current_user)) -> dict:
+    """更新当前用户的私有提示词（部分字段）。
+
+    仅能改自己名下的提示词，否则返回 404。
+    """
     patch = body.model_dump(exclude_unset=True)
     if "name" in patch:
         patch["name"] = str(patch["name"] or "").strip()
@@ -123,6 +148,10 @@ async def update_my_prompt(prompt_id: str, body: UpdatePromptReq, user: User = D
 
 @user_router.delete("/{prompt_id}")
 async def delete_my_prompt(prompt_id: str, user: User = Depends(get_current_user)) -> dict:
+    """删除当前用户的私有提示词。
+
+    仅能删自己名下的提示词，否则返回 404。
+    """
     if not await project_prompt_store.delete_prompt(prompt_id, owner_user_id=str(user.id)):
         raise HTTPException(status_code=404, detail="项目提示词不存在或不属于你")
     return {"deleted": True}

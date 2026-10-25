@@ -282,85 +282,93 @@ def test_has_rules_follows_template_content():
     assert ch.has_model_id_rewrite_rules() is True
 
 
-# ── 落库判定：规则搜到就改名保留，撞名不让位 ───────────────────────────────
-def _resolve(channel_cfg, upstream_id, raw_model_id, rows, monkeypatch):
-    """按渠道配置与 provider_models 现状算出目标 model_id。"""
+# ── 落库判定：已入库行两名字都=库内值，规则只作用于新行 ──────────────────
+def _row_names(channel_cfg, upstream_id, tracked_rows, monkeypatch):
+    """按渠道配置与 provider_models 现状，算出这行的 (model_id, regex_model_id)。"""
     from rate_limiter import ModelClientPool
 
     pool = type("_Pool", (), {"channel": Channel("prov", channel_cfg)})()
     monkeypatch.setattr(ModelClientPool, "get_provider_pool", classmethod(lambda cls, name: pool))
-    return ModelClientPool._resolve_target_model_id(
+    rows = ModelClientPool._build_upstream_model_rows(
         "prov",
-        upstream_id,
-        raw_model_id,
-        {r["upstream_model_id"]: r["model_id"] for r in rows},
+        [{"id": upstream_id}],
+        {r["upstream_model_id"]: r["model_id"] for r in tracked_rows},
     )
+    assert len(rows) == 1
+    return rows[0]["model_id"], rows[0]["regex_model_id"]
 
 
-def test_tracked_row_follows_rules(monkeypatch):
-    """核心诉求：改一版规则，已入库的 xxx:free 跟着变成真实名字。"""
-    target = _resolve(
+def test_tracked_row_ignores_rules(monkeypatch):
+    """已入库行不被规则追溯改名：两个名字都取库内现名。"""
+    model_id, regex_model_id = _row_names(
         {"model_id_rewrite_rules": [_rule(r":free$")]},
         "acme/glm:free",
-        "acme/glm:free",
-        [{"upstream_model_id": "acme/glm:free", "model_id": "glm:free"}],
+        [{"upstream_model_id": "acme/glm:free", "model_id": "custom-kept"}],
         monkeypatch,
     )
-    assert target == "glm"
+    assert (model_id, regex_model_id) == ("custom-kept", "custom-kept")
 
 
-def test_tracked_row_keeps_manual_rename_without_rules(monkeypatch):
-    """没配规则时不重算：切前缀是默认形态，不能把手工改名冲回去。"""
-    target = _resolve(
+def test_tracked_row_always_keeps_manual_rename(monkeypatch):
+    """已入库行无论配没配规则，两个名字都是库内名——手填名不会被覆盖。"""
+    with_rules = _row_names(
+        {"model_id_rewrite_rules": [_rule(r":free$")]},
+        "acme/glm:free",
+        [{"upstream_model_id": "acme/glm:free", "model_id": "custom-kept"}],
+        monkeypatch,
+    )
+    assert with_rules == ("custom-kept", "custom-kept")
+
+    no_rules = _row_names(
         {},
-        "acme/kept",
         "acme/kept",
         [{"upstream_model_id": "acme/kept", "model_id": "custom-kept"}],
         monkeypatch,
     )
-    assert target == "custom-kept"
+    assert no_rules == ("custom-kept", "custom-kept")
 
 
-def test_new_model_always_uses_rewritten_name(monkeypatch):
-    target = _resolve(
+def test_new_model_split_between_two_names(monkeypatch):
+    """新行 + 配了规则：model_id 只切前缀，regex_model_id 才是套规则后的名字。"""
+    model_id, regex_model_id = _row_names(
         {"model_id_rewrite_rules": [_rule(r":free$")]},
-        "acme/new:free",
         "acme/new:free",
         [],
         monkeypatch,
     )
-    assert target == "new"
+    assert model_id == "new:free"
+    assert regex_model_id == "new"
+
+
+def test_new_model_without_rules_has_identical_names(monkeypatch):
+    """新行 + 没配规则：regex_model_id 退化回 model_id 的取值（切前缀），两列同值。"""
+    model_id, regex_model_id = _row_names(
+        {},
+        "acme/new:free",
+        [],
+        monkeypatch,
+    )
+    assert model_id == "new:free"
+    assert regex_model_id == "new:free"
 
 
 def test_regex_hit_renames_even_when_target_name_collides(monkeypatch):
-    """规则搜到的行照样改名，目标名被别的上游模型占着也不让位。
+    """新模型命中规则就改名，目标名被别的上游模型占着也不让位。
 
     渠道 model_id 只有普通索引、允许多个同名；deepseek-v4-flash-free 改名成
     deepseek-v4-flash 后和原版撞名是正常的，两行 upstream_model_id 不同各管各的。
     """
-    target = _resolve(
+    model_id, regex_model_id = _row_names(
         {"model_id_rewrite_rules": [_rule(r":free$")]},
         "acme/glm:free",
-        "acme/glm:free",
         [
-            {"upstream_model_id": "acme/glm:free", "model_id": "glm:free"},
             {"upstream_model_id": "acme/glm", "model_id": "glm"},  # 已占用目标名
         ],
         monkeypatch,
     )
-    assert target == "glm"
+    assert regex_model_id == "glm"
+    assert model_id == "glm:free"
 
-
-def test_idempotent_when_target_equals_own_current(monkeypatch):
-    """目标名就是自己这行的值：照常返回。"""
-    target = _resolve(
-        {"model_id_rewrite_rules": [_rule(r":free$")]},
-        "acme/glm:free",
-        "acme/glm:free",
-        [{"upstream_model_id": "acme/glm:free", "model_id": "glm"}],
-        monkeypatch,
-    )
-    assert target == "glm"
 
 
 # ── 只搜索规则：按全量名匹配的纯过滤条件 ───────────────────────────────────

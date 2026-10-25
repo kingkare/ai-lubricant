@@ -178,6 +178,8 @@ def to_manager_config(proxy: dict) -> dict:
     raw_mode = str(proxy.get("mode") or "").strip().lower()
     if raw_mode == "node":
         mode = "node"
+    elif raw_mode == "browser":
+        mode = "browser"
     cfg: dict = {
         "id": str(proxy.get("id") or ""),
         "mode": mode,
@@ -188,6 +190,8 @@ def to_manager_config(proxy: dict) -> dict:
         cfg["url_prefix"] = canonical_url_prefix(proxy.get("url"))
     elif mode == "node":
         cfg["node_id"] = str(proxy.get("node_id") or "")
+    elif mode == "browser":
+        cfg["client_id"] = str(proxy.get("client_id") or "")
     return cfg
 
 

@@ -39,12 +39,22 @@ _GS_LOOKUP = "https://gsa.apple.com/grandslam/GsService2/lookup"
 _XCODE_APP_INFO = "com.apple.gs.xcode.auth"
 _TIMEOUT = 30
 
+# 客户端身份（X-Mme-Client-Info）必须是 **Windows**。自 2026-10-12 起 Apple 的
+# GSA 边缘节点会拒「anisette 由 Android 库生成、却报 Mac+Xcode 身份」的组合，
+# 对**所有账号、所有网络**第一个请求就回 -80045（This action cannot be completed
+# at this time），AltStore / SideStore / iloader 一起中招（iPASide CHANGELOG 记
+# 载）。改成 Windows 身份后同一个不存在的账号从 -80045 变成普通的 -20970
+# 「账号信息有误」，即身份被接受、流程正常往下走。实测工具 tools/probe_gsa_identity.py。
+# 所有对 Apple 的请求（gsService / mid / 2FA / developerservices2）用同一个身份，
+# 不能登录用 Windows、开发者服务用 Mac——同一个 session 里身份不一致同样触发风控。
+CLIENT_INFO_WINDOWS = "<Windows> <Windows;10.0;19045> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+
 # isideload GrandSlam base_headers：URL bag / gsService / mid / 2FA 端点的公共
 # 底座头。anisette 三头不进 HTTP 头——它们只随 cpd 走 body（isideload 同款）。
 _BASE_HEADERS = {
     "Content-Type": "text/x-xml-plist",
     "Accept": "text/x-xml-plist",
-    "X-Mme-Client-Info": "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+    "X-Mme-Client-Info": CLIENT_INFO_WINDOWS,
     "User-Agent": "akd/1.0 CFNetwork/808.1.4",
     "X-Xcode-Version": "27.0 (27A5218g)",
     "X-Apple-App-Info": _XCODE_APP_INFO,

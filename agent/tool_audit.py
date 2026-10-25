@@ -27,21 +27,8 @@ async def record_tool_audit(
             "result": result,
         }
         async with PostgresClient.pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS agent_tool_audit_logs (
-                    id BIGSERIAL PRIMARY KEY,
-                    agent_id INTEGER,
-                    conversation_id TEXT NOT NULL,
-                    caller_id TEXT,
-                    tool_name TEXT NOT NULL,
-                    approval_id TEXT,
-                    outcome TEXT NOT NULL,
-                    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
+            # 建表已挪到 server/db.py create_agent_tables（Phase 2.2）：热路径不再
+            # 每次写入跑 DDL。这里只 INSERT。
             await conn.execute(
                 """INSERT INTO agent_tool_audit_logs(
                     agent_id, conversation_id, caller_id, tool_name, approval_id, outcome, detail

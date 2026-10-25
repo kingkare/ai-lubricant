@@ -15,7 +15,7 @@ from functools import wraps
 from typing import Any, Literal, Optional
 from urllib.parse import parse_qs, quote, urlsplit, urlparse
 
-from fastapi import APIRouter, Body, HTTPException, Header, Request
+from fastapi import APIRouter, Body, File, HTTPException, Header, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from loguru import logger
 
@@ -33,7 +33,6 @@ from limit_policy_store import (
     clear_policy_cache,
     get_default_freeze_policy,
     get_effective_provider_policy,
-    get_effective_provider_policy_sync,
     policy_fields_from_rate_limit,
     validate_cooldown_policy,
     validate_freeze_policy,
@@ -41,6 +40,7 @@ from limit_policy_store import (
 from providers import CustomProvider, EdgeOneAIProvider
 from providers.base import BaseProvider
 from providers.cloudflare import CloudflareProvider
+from providers import credential_import
 # 账号测试模板与出站 Header 模板共用同一套变量实现（变量集只在 custom.py 维护一份）。
 from providers.custom import build_request_template_variables, render_account_template_paths
 from proxy_utils import (
@@ -213,6 +213,8 @@ def _build_scanner_instance(provider_name: str, cfg: dict, account: dict | None 
     runtime_acc = dict(account or {})
     if not runtime_acc.get("username"):
         runtime_acc["username"] = f"{provider_name}-auth"
+    # 先按原始引用解出 proxy_config_id，再覆盖 runtime_acc["proxy"]（同 _build_auth_runtime_instance）。
+    runtime_acc["proxy_config_id"] = _resolve_account_proxy_config_id(runtime_acc)
     runtime_acc["proxy"] = _resolve_account_proxy(runtime_acc)
     runtime_acc["url_prefix"] = _resolve_account_url_prefix(runtime_acc)
     extra = _provider_extra(provider_name, cfg)
@@ -323,19 +325,17 @@ async def _poll_one_auth_task(state: str, record: dict):
         return
 
     if status == "authorized":
-        # 落库在扫描器内完成（_finalize_authorized_auth），不再依赖前端继续轮询
-        # /auth/status 才写账号；authorized 之后也不再有 GET 带写副作用的路径。
-        record["status"] = "authorized"
-        record["account_data"] = result.get("account_data") or {}
+        # 统一模型：授权完成**不自动落库**——把 account_data 标记为 completed，
+        # 前端轮询 /auth/status 拿到后回填账号表单，用户核对确认再保存。
+        # （原 _finalize_authorized_auth 自动建号的行为已废弃。）
+        record["status"] = "completed"
+        record["completed"] = True
+        record["account_data"] = _normalize_auth_account_data(result.get("account_data") or {})
         await _set_account_auth_state(state, record)
         logger.info(
             f"[auth-scanner] task authorized provider={provider_name} state={state} "
-            f"account_data={_mask_auth_dict(record['account_data'])}"
+            f"account_data={_mask_auth_dict(record['account_data'])}（待前端回填确认）"
         )
-        try:
-            await _finalize_authorized_auth(provider_name, state, record)
-        except Exception as e:  # noqa: BLE001 - 落库失败不吞扫描异常链，交状态查询兜底重试
-            logger.error(f"[auth-scanner] finalize authorized failed provider={provider_name} state={state}: {e}")
     else:  # expired / error
         record["status"] = status
         record["error"] = result.get("error", "")
@@ -396,13 +396,12 @@ async def stop_auth_scanner():
     _auth_scanner_instances.clear()
 
 
-# ==================== 每日定时刷新授权 ====================
-# 每天本地 10:00 对所有「声明 SCHEDULED_REFRESH=True 且自己覆盖了 refresh_account_auth」的
-# 渠道账号调 refresh_account_auth，主动刷新 access_token 并写回配置。
-# 历史内置 OAuth 渠道（copilot/codebuddy/atomcode/eaichat）已迁移为代码渠道 spec，
-# 它们在 spec 类上声明 SCHEDULED_REFRESH=True + refresh_auth 钩子即沿用本机制；
-# 检查登录态（不刷新）由 check_auth 在健康检测/定期 check_account 中完成，与本定时刷新职责分离。
-_daily_auth_refresh_task: asyncio.Task | None = None
+# ==================== refresh_auth 能力判定 ====================
+# 历史背景：内置 OAuth 渠道（copilot/codebuddy/atomcode/eaichat）已迁移为代码渠道 spec，
+# 它们在 spec 类上声明 SCHEDULED_REFRESH=True + refresh_auth 钩子。原本由「每日 10:00 定时
+# 刷新」直接遍历，现已并入下方**账号动作调度器**（refresh_auth 是自动合成的动作之一，频率
+# 由渠道「账号动作」面板配置）。检查登录态（不刷新）由 check_auth 在健康检测/定期
+# check_account 中完成，与刷新令牌职责分离。
 
 
 def _provider_supports_scheduled_refresh(provider_class) -> bool:
@@ -415,18 +414,6 @@ def _provider_supports_scheduled_refresh(provider_class) -> bool:
     if not getattr(provider_class, "SCHEDULED_REFRESH", False):
         return False
     return provider_class.refresh_account_auth is not BaseProvider.refresh_account_auth
-
-
-def _seconds_until_next_10am() -> float:
-    """距下一个本地 10:00 的秒数。"""
-    now = datetime.now()
-    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
-    if now >= target:
-        # 今天 10:00 已过，算到明天 10:00
-        import calendar
-        from datetime import timedelta
-        target = target + timedelta(days=1)
-    return (target - now).total_seconds()
 
 
 def _merge_saved_account_for_auth(account: dict, cfg: dict) -> dict:
@@ -452,100 +439,588 @@ def _merge_saved_account_for_auth(account: dict, cfg: dict) -> dict:
     return item
 
 
-async def _refresh_one_account_auth(name: str, cfg: dict, account: dict, index: int) -> bool:
-    """刷新单个账号 token 并写回配置 + reload 池。成功返回 True。
+# 账号动作调度状态（内存态；进程重启即清）。
+_account_action_task: asyncio.Task | None = None
+_account_action_worker_task: asyncio.Task | None = None
+_account_action_queue: asyncio.Queue | None = None
+_account_action_pending: set[tuple[str, str, str]] = set()   # (渠道, 账号, 动作) 在途去重
+_action_last_run: dict[tuple[str, str], float] = {}          # (渠道, 动作) 调度器上次点火
+_action_last_result: dict[tuple[str, str, str], dict] = {}   # (渠道, 动作, 账号) 最近执行结果
+# (渠道, 动作, 账号) → 一次性补跑时刻（epoch 秒）。spec 经动作返回 ``_next_run_at``
+# （epoch 毫秒）登记：zcode 领取撞「今日名额用完」(1005) 即按上游恢复时刻补一枪，
+# 不必全天高频空打 billing。补跑到点入队后自动清。
+_action_next_run_at: dict[tuple[str, str, str], float] = {}
+# 渠道定时任务（spec 的 SCHEDULED_TASKS，原站点 register_task 的移植）在途去重：
+# (渠道, 任务id) —— 任务体是分钟级浏览器操作，同一渠道同一任务不并发跑。
+_channel_task_running: set[tuple[str, str]] = set()
+_channel_task_instances: dict[str, object] = {}   # 渠道名 → 任务专用 provider 实例（p）
 
-    泛化自原 _refresh_one_atomcode_account：凡 _provider_supports_scheduled_refresh 的渠道
-    都走这条路，调 provider.refresh_account_auth 拿要回写的字段。
+
+def _account_actions_meta(name: str, cfg: dict) -> list[dict]:
+    """渠道可执行动作清单：spec 在 ``account_schema()["account_actions"]`` 声明的动作，
+    以及声明了 ``refresh_auth`` 钩子的渠道自动合成的 ``refresh_auth`` 动作。
+
+    自动合成的 refresh_auth 与原每日 10:00 定时刷新对齐：``SCHEDULED_REFRESH=True`` 时
+    ``default.enabled=True``（纳入自动调度），否则只留手动按钮（spec 作者要手动刷新但
+    不想被调度）。
+
+    **调度真相源是渠道代码（spec 的 ``default``）**：每条动作带一个解析好的 ``config``
+    （enabled/频率/daily_time/账号范围），供应商页只读展示 + 手动触发，不做用户覆盖。
+    """
+    try:
+        schema = _provider_account_schema(name, cfg)
+    except Exception as e:  # noqa: BLE001 - schema 写挂了不能拖垮调度循环
+        logger.warning(f"[account-action] {name} account_schema 求值失败：{e}")
+        schema = {}
+    actions: list[dict] = []
+    seen: set[str] = set()
+    for raw in schema.get("account_actions") or []:
+        if not isinstance(raw, dict):
+            continue
+        action_id = str(raw.get("id") or "").strip()
+        if not action_id or action_id in seen:
+            continue
+        seen.add(action_id)
+        display = raw.get("display")
+        action = {
+            "id": action_id,
+            "label": str(raw.get("label") or action_id),
+            "manual": bool(raw.get("manual", True)),
+            "display": display if isinstance(display, dict) else {"format": "none"},
+            "default": raw.get("default") if isinstance(raw.get("default"), dict) else {},
+        }
+        action["config"] = _account_action_config(action)
+        actions.append(action)
+    if "refresh_auth" not in seen:
+        try:
+            provider_class = _get_provider_class(name, cfg)
+            supported = provider_class.refresh_account_auth is not BaseProvider.refresh_account_auth
+        except Exception:
+            supported = False
+        if supported:
+            action = {
+                "id": "refresh_auth",
+                "label": "刷新授权",
+                "manual": True,
+                "display": {"format": "none", "label": "刷新授权"},
+                "default": {"enabled": _provider_supports_scheduled_refresh(provider_class),
+                            "frequency_unit": "daily", "frequency_value": 1,
+                            "daily_time": "10:00"},  # 对齐原每日 10:00 定时刷新的语义
+            }
+            action["config"] = _account_action_config(action)
+            actions.append(action)
+    return actions
+
+
+def _account_action_config(action: dict) -> dict:
+    """该动作的生效调度配置 = **spec 声明的 ``default``**（渠道代码定义，不做用户覆盖）。
+
+    供应商页只读展示这份解析结果 + 手动触发；要改频率/时刻/账号范围改渠道源码里的
+    ``account_actions[].default``。缺省归一为 daily 10:00 / 全账号。
+    """
+    base = {"enabled": True, "frequency_unit": "daily", "frequency_value": 1, "accounts": [], "daily_time": "10:00"}
+    default = action.get("default") or {}
+    if default.get("enabled") is not None:
+        base["enabled"] = bool(default.get("enabled"))
+    if default.get("frequency_unit"):
+        base["frequency_unit"] = default.get("frequency_unit")
+    if default.get("frequency_value"):
+        base["frequency_value"] = default.get("frequency_value")
+    if default.get("daily_time"):
+        base["daily_time"] = default.get("daily_time")
+    unit = str(base.get("frequency_unit") or "daily").lower()
+    base["frequency_unit"] = unit if unit in ("daily", "minutes", "hours") else "daily"
+    try:
+        base["frequency_value"] = max(1, int(base.get("frequency_value") or 1))
+    except (TypeError, ValueError):
+        base["frequency_value"] = 1
+    hh, mm = _parse_daily_time(base.get("daily_time"))
+    base["daily_time"] = f"{hh:02d}:{mm:02d}"
+    # 严格只收字符串用户名（spec 写错类型就丢掉，不做 str() 强转——免得把 1/None 变成 "1"/"None"）
+    base["accounts"] = [u.strip() for u in (default.get("accounts") or [])
+                        if isinstance(u, str) and u.strip()]
+    return base
+
+
+def _provider_instance_for_account(name: str, cfg: dict, account: dict):
+    """取该账号的 provider 实例：优先池内热实例，没有就按账号数据现场造一个。
+
+    原 _refresh_one_account_auth 内联构造逻辑抽出，供 refresh-auth 端点与账号动作共用，
+    避免两个调用点各写一份 provider 构造代码。
     """
     username = account.get("username") or ""
+    pool = ModelClientPool.get_provider_pool(name)
+    if pool:
+        for client in pool.clients:
+            if client.username == username:
+                return client.provider
+    provider_class = _get_provider_class(name, cfg)
+    runtime_acc = dict(account)
+    runtime_acc["proxy"] = _resolve_account_proxy(account)
+    runtime_acc["url_prefix"] = _resolve_account_url_prefix(account)
+    runtime_acc["proxy_config_id"] = _resolve_account_proxy_config_id(account)
+    extra = _provider_extra(name, cfg)
+    extra.update({k: v for k, v in runtime_acc.items() if k not in ("username", "password", "proxy", "url_prefix", "proxy_id", "switch")})
+    return provider_class(
+        username=runtime_acc.get("username", username),
+        password=runtime_acc.get("password", ""),
+        proxy=runtime_acc.get("proxy"),
+        url_prefix=runtime_acc.get("url_prefix"),
+        **extra,
+    )
+
+
+def _account_action_due(last_run: float, acfg: dict, now: float) -> bool:
+    """该动作是否到点。``last_run`` 为 0 视为从未跑过（启动首轮即到点）。
+
+    - ``daily`` 按**自然日 + 每日时刻**：``daily_time``（"HH:MM"，缺省 "10:00"，
+      对齐原每日 10:00 定时刷新的语义）决定今天的 target 时刻；当前已过 target 且
+      上次执行早于 target 才算到点。服务重启当天会补跑一次（last_run=0），之后按
+      target 时刻走；spec 自带的当日幂等（_today_checkin_done）再兜一层。
+    - ``minutes`` / ``hours`` 按间隔数字算秒数（对齐 scheduled_test）。
+    """
+    if not last_run:
+        return True
+    unit = (acfg.get("frequency_unit") or "daily").lower()
+    if unit == "daily":
+        now_dt = datetime.fromtimestamp(now)
+        hh, mm = _parse_daily_time(acfg.get("daily_time"))
+        target_today = now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return now_dt >= target_today and last_run < target_today.timestamp()
+    if unit == "minutes":
+        return now - last_run >= max(1, int(acfg.get("frequency_value") or 1)) * 60
+    if unit == "hours":
+        return now - last_run >= max(1, int(acfg.get("frequency_value") or 1)) * 3600
+    return False
+
+
+def _channel_tasks_meta(provider_class) -> list[dict]:
+    """代码渠道声明的渠道定时任务（spec 的 ``SCHEDULED_TASKS``，原站点
+    ``register_task`` 的移植）。返回 spec 端规范化后的任务表（validate_scheduled_tasks
+    已校验）。内置/非代码渠道返回空。"""
+    if not getattr(provider_class, "is_custom_providers", False) and not getattr(
+        provider_class, "PROVIDER_NAME", ""
+    ):
+        return []
+    tasks = getattr(provider_class, "SCHEDULED_TASKS", None)
+    if not tasks:
+        return []
+    return list(tasks)
+
+
+async def _run_channel_task(name: str, task: dict) -> None:
+    """执行一个渠道定时任务。``name``=渠道名，``task``=规范化任务表条目。
+
+    实例化 spec 方法时用的 ``p`` 是渠道级单例（``_build_scanner_instance`` 的同一套——
+    池外临时实例 + 兜底 Channel，能读 owner_user_id 等渠道级字段，浏览器门 p.run_js
+    的 owner 收窄语义和正常渠道实例一致）。异常只 warning，不抛回调度循环
+    （单任务失败不该炸循环，对齐原站点 tick_tasks 的语义）。
+    """
+    task_id = task["id"]
     try:
+        cfg = await _read_provider_config(name)
         provider_class = _get_provider_class(name, cfg)
-        if not _provider_supports_scheduled_refresh(provider_class):
-            return False
-        pool = ModelClientPool.get_provider_pool(name)
-        provider = None
-        if pool:
-            for client in pool.clients:
-                if client.username == username:
-                    provider = client.provider
-                    break
-        if provider is None:
-            runtime_acc = dict(account)
-            runtime_acc["proxy"] = _resolve_account_proxy(account)
-            runtime_acc["url_prefix"] = _resolve_account_url_prefix(account)
-            extra = _provider_extra(name, cfg)
-            extra.update({k: v for k, v in runtime_acc.items() if k not in ("username", "password", "proxy", "url_prefix", "proxy_id", "switch")})
-            provider = provider_class(
-                username=runtime_acc.get("username", username),
-                password=runtime_acc.get("password", ""),
-                proxy=runtime_acc.get("proxy"),
-                url_prefix=runtime_acc.get("url_prefix"),
-                **extra,
-            )
-        updates = await provider.refresh_account_auth(dict(account), cfg)
+        spec = getattr(provider_class, "spec", None)
+        if spec is None:
+            logger.warning(f"[channel-task] {name}/{task_id}: 无 spec 类")
+            return
+        from providers.code_spec import _spec_plain_callable
+        fn = _spec_plain_callable(spec, task_id)
+        if fn is None:
+            logger.warning(f"[channel-task] {name}/{task_id}: 方法不存在")
+            return
+        p = _build_scanner_instance(name, cfg)
+        result = fn(p)
+        if inspect.isawaitable(result):
+            await result
+        logger.info(f"[channel-task] {name}/{task_id} 完成")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[channel-task] {name}/{task_id} 失败: {type(exc).__name__}: {exc}")
+
+
+def _parse_daily_time(raw) -> tuple[int, int]:
+    """解析 "HH:MM"（daily 动作的每日执行时刻）。非法值回落 10:00。"""
+    try:
+        hh_s, mm_s = str(raw or "10:00").strip().split(":")[:2]
+        hh, mm = int(hh_s), int(mm_s)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
+    except (TypeError, ValueError):
+        pass
+    return 10, 0
+
+
+def _account_action_interval_seconds(cfg: dict) -> int:
+    """从渠道动作配置算出间隔秒数（daily=24h 近似；minutes/hours=数字*单位）。
+    返回 <=0 表示该动作禁用（不调度，仅手动可触发）。"""
+    unit = (cfg.get("frequency_unit") or "minutes").strip().lower()
+    value = int(cfg.get("frequency_value") or 0)
+    if unit == "daily":
+        return 24 * 3600
+    if unit == "minutes":
+        return max(1, value) * 60
+    if unit == "hours":
+        return max(1, value) * 3600
+    return 0
+
+
+async def _account_action_execute_one(task: dict) -> None:
+    """消费者：真正执行动作那一刻重找账号、重判状态、再执行。
+
+    队列只保存 provider + username + action_id，不保存 AccountClient/action 快照：
+    - 账号排队期间被删除 → 当前 pool.clients 找不到，直接跳过，绝不会操作已删账号；
+    - 渠道在排队期间被禁用/移除/热重载换池：丢弃，下一轮由新池重算；
+    - switch=False 的账号：跳过（与 refresh-auth 调度口径一致）。
+    """
+    provider_name = task["provider_name"]
+    pool = task.get("pool")
+    username = task["username"]
+    action_id = task["action_id"]
+    cfg = await _read_provider_config(provider_name)
+    current_pool = ModelClientPool.get_provider_pool(provider_name)
+    if pool is not None and current_pool is not pool:
+        logger.info(f"[account-action] {provider_name} 排队期间池已变更，跳过 {username}")
+        return
+    if pool is not None and not getattr(pool, "enabled", True):
+        logger.info(f"[account-action] {provider_name} 排队期间已禁用，跳过 {username}")
+        return
+    acc = next((a for a in cfg.get("accounts") or []
+                if isinstance(a, dict) and (a.get("username") or "").strip() == username), None)
+    if acc is None or acc.get("switch") is False:
+        return
+    await _run_account_action_once(provider_name, action_id, acc, cfg)
+
+
+async def _run_account_action_once(name: str, action_id: str, account: dict,
+                                    cfg: dict | None = None) -> dict:
+    """执行单账号单动作并窄写落库。返回 ``{ok, error, status, merged}``；不抛异常。
+
+    分发：
+    - ``refresh_auth`` → ``provider.refresh_account_auth``（要求 spec 覆盖了该钩子）；
+    - 其它 → 先过 ``checkin_condition`` 条件门（spec 声明才有）→ ``perform_account_action``。
+
+    签到类动作的结构化契约（spec 按 ``_checkin_status``/``_checkin_detail`` 返回）：
+    - ``ok`` 签到成功（detail = 签到了多少，如 "+80"）→ **解冻该账号**（签到拿到新额度
+      证明账号可用，额度不足类冻结就该在此时解除，而不是干等冻结到期）；
+    - ``failed`` 签到失败（detail = 失败原因）→ 不解冻；
+    - ``skipped`` 跳过（今日已签 / 无活动等，不解冻——跳过不能证明账号现在有额度）。
+    结果由框架统一记录（_action_last_result 内存态 + 账号行 checkin_runs 持久化）并
+    格式化进 spec 声明的徽标字段，spec 不再自己拼「签到成功 +80」字符串。
+
+    落库链路沿用 refresh-auth：返回字典窄写回单账号 + reload 池内实例 + 不整份重写。
+    """
+    cfg = cfg or await _read_provider_config(name)
+    username = account.get("username") or ""
+    ok = False
+    error = ""
+    status = 0
+    checkin_status = ""       # ok | failed | skipped（仅签到类动作带）
+    checkin_detail = ""
+    merged = dict(account)
+    try:
+        provider = _provider_instance_for_account(name, cfg, account)
+        if action_id == "refresh_auth":
+            # 按类比对（实例访问会得到 bound method，`is` 恒不等），与
+            # _provider_supports_scheduled_refresh 同口径：没覆盖 refresh_account_auth
+            # 就是 BaseProvider 的 501 桩，调下去只会 501。
+            if type(provider).refresh_account_auth is BaseProvider.refresh_account_auth:
+                raise HTTPException(status_code=400, detail="该渠道未实现刷新授权")
+            updates = await provider.refresh_account_auth(dict(account), cfg)
+        else:
+            fn = getattr(provider, "perform_account_action", None)
+            if fn is None:
+                raise HTTPException(status_code=400, detail=f"该渠道未声明动作 {action_id}")
+            # 条件门（spec 可选钩子 checkin_condition）：不具备条件就跳过，不碰 perform_action。
+            cond_fn = getattr(provider, "checkin_condition", None)
+            if cond_fn is not None:
+                cond = await cond_fn(action_id, dict(account), cfg)
+                if isinstance(cond, dict) and cond.get("ok") is False:
+                    updates = {
+                        "_checkin_status": "skipped",
+                        "_checkin_detail": str(cond.get("reason") or "条件不满足"),
+                    }
+                    logger.info(f"[account-action] {name}/{username} {action_id} 跳过：{updates['_checkin_detail']}")
+                else:
+                    updates = await fn(action_id, dict(account), cfg)
+            else:
+                updates = await fn(action_id, dict(account), cfg)
         if not isinstance(updates, dict):
-            logger.warning(f"[daily-auth-refresh] {name}/{username} refresh returned non-dict")
-            return False
+            raise HTTPException(status_code=500, detail="动作返回格式错误（非 dict）")
+        updates = dict(updates)
+        # spec 约定：返回里带 _error = 动作**执行失败**（如签到一个都没成）。徽标等字段
+        # 照常窄写落库（前端能看到「签到失败」），但本次执行结果记为失败，不把 _error 落库。
+        action_error = updates.pop("_error", None)
+        # spec 约定：返回里带 _next_run_at（epoch 毫秒）= 请求框架在此时刻补跑一次本动作
+        # （如 zcode 领取撞 1005 名额用完）。登记进内存表，调度循环到点入队；不落库。
+        next_run_at = updates.pop("_next_run_at", None)
+        if next_run_at:
+            try:
+                _action_next_run_at[(name, action_id, username)] = float(next_run_at) / 1000.0
+            except (TypeError, ValueError):
+                pass
         merged = dict(account)
+        # spec 约定：签到类动作返回 _checkin_status（ok|failed|skipped）+ _checkin_detail。
+        # 框架弹出这两个元数据键（不落库原样键），统一格式化进 spec 声明的徽标字段
+        # （account_actions[].display.badge_field/status_field，缺省 last_checkin[_status]），
+        # 并决定要不要解冻账号。格式化在窄写之后，框架是徽标字段的最终权威（老 spec
+        # 即便自己也回了 last_checkin 也会被框架口径覆盖，显示与实际执行结果恒一致）。
+        checkin_status = str(updates.pop("_checkin_status", "") or "").strip().lower()
+        checkin_detail = str(updates.pop("_checkin_detail", "") or "")
         merged.update({k: v for k, v in updates.items() if v is not None})
+        if checkin_status:
+            badge_field, status_field = _checkin_display_fields(name, cfg, action_id)
+            if checkin_status == "ok":
+                merged[badge_field] = f"签到成功{f' {checkin_detail}' if checkin_detail else ''}".strip()
+                merged[status_field] = f"{_today_key()}|ok{f'|{checkin_detail}' if checkin_detail else ''}"
+            elif checkin_status == "skipped":
+                merged[badge_field] = checkin_detail or "已签到（跳过）"
+                merged[status_field] = f"{_today_key()}|already"
+            else:  # failed 及任何未知状态按失败处理
+                checkin_status = "failed"
+                merged[badge_field] = f"签到失败: {checkin_detail}" if checkin_detail else "签到失败"
+                merged[status_field] = f"{_today_key()}|error"
+            # 结构化签到结果持久化进账号行（JSONB）：重启不清，页面「签到情况」读它显示
+            # 最近一次的状态 + 拿到了多少/原因 + 精确时间（徽标字段只有日期粒度，也没有
+            # 「成功/跳过/失败」的结构化枚举，不足以撑起展示与后续判冻）。
+            runs = merged.get("checkin_runs")
+            runs = dict(runs) if isinstance(runs, dict) else {}
+            runs[action_id] = {"status": checkin_status,
+                               "detail": (checkin_detail or "")[:200],
+                               "at": int(time.time())}
+            merged["checkin_runs"] = runs
         merged = _normalize_account_proxy_ref(merged, _read_proxies())
-        cfg.setdefault("accounts", [])[index] = merged
-        # 单账号窄写：只 UPSERT 该账号行 + 刷新内存 + 广播，不整份重写渠道。
         await _persist_account(name, merged)
         _reload_account_into_pool(name, merged, _provider_rpm(cfg), _provider_extra(name, cfg))
-        logger.info(f"[daily-auth-refresh] {name}/{username} token 刷新成功")
-        return True
-    except Exception as e:
-        logger.error(f"[daily-auth-refresh] {name}/{username} token 刷新失败: {e}")
-        return False
+        ok = not action_error
+        if action_error:
+            error = str(action_error)[:500]
+            logger.warning(f"[account-action] {name}/{username} {action_id} 失败：{error}")
+        else:
+            logger.info(f"[account-action] {name}/{username} {action_id} 成功")
+        # 签到成功才解冻：签到拿到新额度证明账号此刻可用，额度不足类冻结（冻到今天/月底）
+        # 在此解除，不用干等到期。失败/跳过/未返回签到状态的动作都不解冻——跳过与失败
+        # 都不能证明账号现在有额度。全链路复用 clear_runtime_freeze_on_success：
+        # 内存桶 + Redis（账号级 + 模型级键一并清）+ 跨实例广播 + 熔断清零。
+        if checkin_status == "ok":
+            pool = ModelClientPool.get_provider_pool(name)
+            if pool is not None and hasattr(pool, "clear_runtime_freeze_on_success"):
+                cleared = pool.clear_runtime_freeze_on_success(username)
+                if cleared:
+                    logger.info(f"[account-action] {name}/{username} 签到成功，已解除冻结")
+    except HTTPException as exc:
+        error, status = str(exc.detail), exc.status_code
+        # 留痕：手动触发会把 error 回给前端，但**调度路径**没人看返回值——不打日志
+        # 就等于静默失败（2026-09-30 排查 loomy 额度不显示时，整轮失败在日志里零痕迹）。
+        logger.warning(f"[account-action] {name}/{username} {action_id} 失败：HTTP {status} {error[:300]}")
+    except Exception as exc:  # noqa: BLE001 - 调度/手动都不该让一个账号的异常炸掉整轮
+        error = f"{type(exc).__name__}: {exc}"
+        logger.warning(f"[account-action] {name}/{username} {action_id} 异常：{error[:300]}")
+    finally:
+        _record_account_action_result(name, action_id, username, ok, error,
+                                       checkin_status=checkin_status, checkin_detail=checkin_detail)
+    return {"ok": ok, "error": error, "status": status, "merged": merged}
 
 
-async def _daily_auth_refresh_loop():
-    logger.info("[daily-auth-refresh] 定时刷新任务启动")
+def _record_account_action_result(name: str, action_id: str, username: str,
+                                   ok: bool, error: str = "",
+                                   checkin_status: str = "", checkin_detail: str = "") -> None:
+    """记录单账号单动作的最近一次执行结果（内存，进程重启即清）。
+
+    签到类动作额外带 checkin_status（ok|failed|skipped）/ checkin_detail，供前端「签到情况」
+    悬浮框显示最近一次签到的状态、拿到了多少/为什么失败/为什么跳过与时间。
+    """
+    entry = {"at": time.time(), "ok": bool(ok), "error": (error or "")[:500]}
+    if checkin_status:
+        entry["status"] = checkin_status
+        entry["detail"] = (checkin_detail or "")[:500]
+    _action_last_result[(name, action_id, username)] = entry
+
+
+def _checkin_display_fields(name: str, cfg: dict, action_id: str) -> tuple[str, str]:
+    """签到动作的展示字段名 = spec 在 account_actions[].display 声明的
+    badge_field / status_field（缺省 last_checkin / last_checkin_status，多渠道同款约定）。"""
+    badge_field, status_field = "last_checkin", "last_checkin_status"
+    try:
+        for meta in _account_actions_meta(name, cfg):
+            if meta.get("id") != action_id:
+                continue
+            display = meta.get("display") or {}
+            badge_field = str(display.get("badge_field") or badge_field)
+            status_field = str(display.get("status_field") or status_field)
+            break
+    except Exception:  # noqa: BLE001 - schema 求值失败回落约定键，不影响签到本身
+        pass
+    return badge_field, status_field
+
+
+def _today_key() -> str:
+    """本地日期键 YYYY-MM-DD（对齐各 spec last_checkin_status 的日期前缀口径）。"""
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+async def _account_action_worker():
+    """账号动作消费者：串行消费队列，避免对同一上游签到/余额接口并发打。"""
+    while True:
+        task = await _account_action_queue.get()
+        try:
+            if task is None:
+                return
+            await _account_action_execute_one(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - 单任务异常不影响 worker 继续消费
+            logger.error(f"[account-action] worker 异常：{e}")
+        finally:
+            if isinstance(task, dict):
+                _account_action_pending.discard(task.get("key"))
+            _account_action_queue.task_done()
+
+
+async def _account_action_loop():
+    """生产者：每 60s tick 扫描到点的 (渠道, 动作)，把候选账号塞进队列。
+
+    首轮等启动期账号加载完成（``_account_init_done``），避免与 init_all 抢同一批账号的
+    认证请求。``last_run`` 仅由本调度器写入——手动「立即执行」与单账号手动触发**不**改
+    ``last_run``，故不会推迟下一次自动调度（与 scheduled_test 同款语义）。
+    """
+    global _account_action_queue, _account_action_pending
+    await ModelClientPool._account_init_done.wait()
+    logger.info("[account-action] 账号动作调度器启动")
+    last_run = _action_last_run
     while True:
         try:
-            await asyncio.sleep(_seconds_until_next_10am())
+            await asyncio.sleep(60)
         except asyncio.CancelledError:
             break
         try:
+            now = time.time()
             providers = await config.Config.get_providers()
             for name in list(providers.keys()):
                 try:
                     cfg = await _read_provider_config(name)
                 except Exception:
                     continue
-                provider_class = _get_provider_class(name, cfg)
-                if not _provider_supports_scheduled_refresh(provider_class):
+                # 渠道定时任务（spec SCHEDULED_TASKS，原站点 register_task 的移植）。
+                # 独立于账号动作：纯保活渠道（无账号动作、无账号）也要跑，故放在
+                # 账号动作分支的 continue 之前。任务体是分钟级浏览器操作，异步起跑
+                # 不阻塞调度循环；同一 (渠道, 任务) 在途去重。
+                try:
+                    task_cls = _get_provider_class(name, cfg)
+                    for task in _channel_tasks_meta(task_cls):
+                        if task.get("enabled") is False:
+                            continue
+                        task_id = task["id"]
+                        if not _account_action_due(last_run.get((name, task_id), 0), task, now):
+                            continue
+                        run_key = (name, task_id)
+                        if run_key in _channel_task_running:
+                            continue
+                        last_run[(name, task_id)] = now
+                        _channel_task_running.add(run_key)
+
+                        async def _run_and_release(_name=name, _task=task, _key=run_key):
+                            try:
+                                await _run_channel_task(_name, _task)
+                            finally:
+                                _channel_task_running.discard(_key)
+
+                        asyncio.create_task(_run_and_release())
+                except Exception as exc:  # noqa: BLE001 - 渠道任务异常不影响账号动作调度
+                    logger.warning(f"[channel-task] {name} 调度异常：{exc}")
+                metas = _account_actions_meta(name, cfg)
+                if not metas:
                     continue
-                accounts = cfg.get("accounts", []) or []
-                for idx, acc in enumerate(accounts):
-                    if not isinstance(acc, dict) or acc.get("switch") is False:
+                accounts = [a for a in cfg.get("accounts") or [] if isinstance(a, dict)]
+                if not accounts:
+                    continue
+                pool = ModelClientPool.get_provider_pool(name)
+                if pool is not None and not getattr(pool, "enabled", True):
+                    continue
+                for meta in metas:
+                    action_id = meta["id"]
+                    # config 已由 _account_actions_meta 解析（spec default，调度真相源）
+                    acfg = meta.get("config") or _account_action_config(meta)
+                    if not acfg.get("enabled"):
                         continue
-                    # _refresh_one_account_auth 内部按账号窄写落库 + 广播，无需整份回写。
-                    await _refresh_one_account_auth(name, cfg, acc, idx)
+                    last = last_run.get((name, action_id), 0)
+                    if not _account_action_due(last, acfg, now):
+                        continue
+                    last_run[(name, action_id)] = now
+                    scope = acfg.get("accounts") or []
+                    fired = 0
+                    for account in accounts:
+                        if account.get("switch") is False:
+                            continue
+                        uname = (account.get("username") or "").strip()
+                        if not uname or (scope and uname not in scope):
+                            continue
+                        key = (name, uname, action_id)
+                        if key in _account_action_pending:
+                            continue
+                        _account_action_pending.add(key)
+                        _account_action_queue.put_nowait({
+                            "provider_name": name, "action_id": action_id,
+                            "username": uname, "key": key, "pool": pool,
+                        })
+                        fired += 1
+                    if fired:
+                        logger.info(f"[account-action] {name}/{action_id} 到点，入队 {fired} 个账号")
+                # 一次性补跑：spec 经 _next_run_at 登记的恢复时刻（epoch 秒）。到点即入队
+                # 对应账号（不改 last_run，不影响正常调度节奏），入队后自动清。
+                due_retry = [(n, a, u) for (n, a, u), at in _action_next_run_at.items()
+                             if now >= at]
+                for (n, a, u) in due_retry:
+                    _action_next_run_at.pop((n, a, u), None)
+                    if n not in providers:
+                        continue
+                    key = (n, u, a)
+                    if key in _account_action_pending:
+                        continue
+                    _account_action_pending.add(key)
+                    _account_action_queue.put_nowait({
+                        "provider_name": n, "action_id": a,
+                        "username": u, "key": key, "pool": None,
+                    })
+                    logger.info(f"[account-action] {n}/{a}/{u} 补跑到点（_next_run_at），入队")
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            logger.error(f"[daily-auth-refresh] loop error: {e}")
+        except Exception as e:  # noqa: BLE001 - 一个渠道异常不能炸掉整个调度循环
+            logger.error(f"[account-action] 调度循环异常：{e}")
 
 
-async def start_daily_auth_refresh():
-    global _daily_auth_refresh_task
-    if _daily_auth_refresh_task and not _daily_auth_refresh_task.done():
+async def start_account_action_scheduler():
+    """启动账号动作调度器（生产者 loop + 消费者 worker）。
+
+    队列与 pending 集合在此创建，保证「立即执行」端点在 loop 首轮 sleep 期间也能入队。
+    必须用 ``global`` 声明 queue/pending——否则下面两行赋值会变成局部变量，
+    loop 读模块全局时仍是 None，60s 后第一次 put_nowait 就炸。
+    """
+    global _account_action_task, _account_action_worker_task, _account_action_queue, _account_action_pending
+    if _account_action_task and not _account_action_task.done():
         return
-    _daily_auth_refresh_task = asyncio.create_task(_daily_auth_refresh_loop())
+    _account_action_queue = asyncio.Queue()
+    _account_action_pending = set()
+    _account_action_worker_task = asyncio.create_task(_account_action_worker())
+    _account_action_task = asyncio.create_task(_account_action_loop())
 
 
-async def stop_daily_auth_refresh():
-    global _daily_auth_refresh_task
-    if _daily_auth_refresh_task and not _daily_auth_refresh_task.done():
-        _daily_auth_refresh_task.cancel()
-        try:
-            await _daily_auth_refresh_task
-        except asyncio.CancelledError:
-            pass
-    _daily_auth_refresh_task = None
+async def stop_account_action_scheduler():
+    global _account_action_task, _account_action_worker_task, _account_action_queue, _account_action_pending
+    for attr in ("_account_action_task", "_account_action_worker_task"):
+        task = globals().get(attr)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        globals()[attr] = None
+    _account_action_queue = None
+    _account_action_pending = None
+
 
 
 def _admin_stream_payloads(chunk) -> list[dict]:
@@ -855,8 +1330,14 @@ def _proxy_id(item: dict) -> str:
     if raw:
         return raw
     mode = str(item.get("mode") or "network").strip().lower()
-    # node 模式 url 为空，改以 node_id 入 seed，避免同名不同节点的条目撞 id。
-    disc = item.get("node_id", "") if mode == "node" else item.get("url", "")
+    # node 模式 url 为空，改以 node_id 入 seed；browser 模式以 client_id 入 seed——
+    # 否则同名不同节点/不同浏览器的条目 url 都空，会撞 id。
+    if mode == "node":
+        disc = item.get("node_id", "")
+    elif mode == "browser":
+        disc = item.get("client_id", "")
+    else:
+        disc = item.get("url", "")
     # owner_id 入 seed：不同用户用同名同 URL 建代理也不会撞 id（owner_id 是归属，
     # 不影响已存在条目的哈希——见 _normalize_proxy_item 对 owner_id 的保留）。
     # 仅当条目带 owner_id 时入 seed；owner-less（管理员/历史建）保持原 seed 口径，
@@ -879,9 +1360,10 @@ def _normalize_proxy_item(item: dict) -> dict:
     name = (item.get("name") or "").strip()
     url = (item.get("url") or "").strip()
     mode = str(item.get("mode") or "network").strip().lower()
-    if mode not in ("network", "url_prefix", "direct", "node"):
+    if mode not in ("network", "url_prefix", "direct", "node", "browser"):
         raise HTTPException(status_code=400, detail=f"代理 mode 非法: {mode}")
     node_id = ""
+    client_id = ""
     # direct=强制直连，无需 URL；network/url_prefix 必须有 name 和 url。
     if mode == "direct":
         if not name:
@@ -894,6 +1376,14 @@ def _normalize_proxy_item(item: dict) -> dict:
         node_id = (item.get("node_id") or "").strip()
         if not node_id:
             raise HTTPException(status_code=400, detail="node 模式必须选择转发节点")
+        url, username, password = "", "", ""
+    elif mode == "browser":
+        # browser=经某台已连 CDP 的浏览器出网（浏览器当代理节点）：无 URL，靠 client_id 选浏览器。
+        if not name:
+            raise HTTPException(status_code=400, detail="代理配置必须包含 name")
+        client_id = (item.get("client_id") or "").strip()
+        if not client_id:
+            raise HTTPException(status_code=400, detail="browser 模式必须选择浏览器客户端")
         url, username, password = "", "", ""
     elif not name or not url:
         raise HTTPException(status_code=400, detail="代理配置必须包含 name 和 url")
@@ -933,6 +1423,9 @@ def _normalize_proxy_item(item: dict) -> dict:
     # node_id 仅 node 模式携带，避免污染其余模式的条目结构。
     if mode == "node":
         result["node_id"] = node_id
+    # client_id 仅 browser 模式携带。
+    if mode == "browser":
+        result["client_id"] = client_id
     return result
 
 
@@ -1189,7 +1682,12 @@ def _provider_extra(name: str, cfg: dict) -> dict:
     provider_extra = {k: v for k, v in cfg.items() if k not in ("accounts", "rate_limit")}
     provider_extra.update({"provider_name": name, "rate_limit": cfg.get("rate_limit", {})})
     try:
-        provider_extra["limit_policy"] = get_effective_provider_policy_sync(name)
+        # 只挂「确实读到的」权威策略：冷缓存时留空（不挂全零模板），让限额兜底链落到
+        # 渠道 rate_limit 档。挂全零会把并发/RPM 静默归零——「设了限流不生效」的一半根因。
+        from limit_policy_store import peek_cached_provider_policy
+        cached_policy = peek_cached_provider_policy(name)
+        if cached_policy is not None:
+            provider_extra["limit_policy"] = cached_policy
     except Exception:
         pass
     return provider_extra
@@ -1668,12 +2166,35 @@ _ACCOUNT_CREDENTIAL_KEYS = {
 }
 
 
-def _account_limit_from(acc: dict, key: str, per_account_key: str, rate_limit_extra: dict) -> int:
-    return int(acc.get(key, acc.get(per_account_key, rate_limit_extra.get(per_account_key, 0))) or 0)
+def _account_limit_with_policy(
+    acc: dict, key: str, per_account_key: str | None,
+    channel_base: int, limit_policy: dict | None, policy_key: str,
+) -> int:
+    """账号限额解析：账号级覆盖 → 限流策略 account_* → 渠道档 channel_base → 0。
+
+    与建池口径逐字一致（rate_limiter.ProviderPool.add_accounts 的 1237-1253 与 1279-1284）：
+    渠道 base 先取策略 ``account_*``、缺省才落渠道 ``*_per_account``；策略停用（enabled is
+    False）时策略档与渠道档**都**归 0，只保留账号级显式覆盖；账号级再按
+    ``acc[key] → acc[per_account_key] → base`` 覆盖。
+
+    热加载与 60s 对账必须走这条链。此前就地重载只读「账号级 → 渠道 rate_limit」，整条链
+    不含 limit_policy，导致限流策略里设的账号并发/RPM/TPM 在首次保存后一分钟内被对账
+    重算成 0——表现为「并发设了 1 却不拦、请求照样打进同一账号」，且只能靠重启恢复。
+    """
+    if limit_policy and limit_policy.get("enabled", True) is False:
+        base = 0
+    else:
+        base = int((limit_policy or {}).get(policy_key, channel_base) or 0)
+    if per_account_key is None:
+        # 无账号级覆盖维度（渠道级 RPM 即最终值），与建池直接把渠道 rpm_limit 传给
+        # AccountClient 的口径一致（1275-1278 仅有 USES_ACCOUNT_RPM 闸，不读账号键）。
+        return base
+    return int(acc.get(key, acc.get(per_account_key, base)) or 0)
 
 
 def _apply_account_update_in_place(pool, client, runtime_acc: dict, rpm: int,
-                                   rate_limit_extra: dict, is_disabled: bool):
+                                   rate_limit_extra: dict, is_disabled: bool,
+                                   limit_policy: dict | None = None):
     """就地更新现有 AccountClient/provider 的账号级字段，保留运行态。
 
     保留：_in_flight / 冷却 / RPM·TPM 滑窗 / auth 缓存 / 智能路由统计。
@@ -1752,9 +2273,29 @@ def _apply_account_update_in_place(pool, client, runtime_acc: dict, rpm: int,
 
     # ---- 账号级限额：改阈值，不动运行态窗口 ----
     # RPM/TPM/并发仍支持账号级覆盖；RPD 已收敛到渠道级策略 account_rpd。
-    client.rpm_limit = rpm
-    client.tpm_limit = _account_limit_from(runtime_acc, "tpm_limit", "tpm_per_account", rate_limit_extra)
-    client.concurrent_limit = _account_limit_from(runtime_acc, "concurrent_limit", "concurrent_per_account", rate_limit_extra)
+    # 兜底链必须含 limit_policy（与建池同源），否则 60s 对账会把限流策略里的
+    # account_concurrent/account_tpm 重算成 0——「设了并发却不生效」的根因。
+    rl = rate_limit_extra or {}
+    client.rpm_limit = _account_limit_with_policy(
+        runtime_acc, "rpm_limit", None, int(rpm or 0), limit_policy, "account_rpm")
+    client.tpm_limit = _account_limit_with_policy(
+        runtime_acc, "tpm_limit", "tpm_per_account",
+        int(rl.get("tpm_per_account", rl.get("tokens_per_minute_per_account", 0)) or 0),
+        limit_policy, "account_tpm")
+    client.concurrent_limit = _account_limit_with_policy(
+        runtime_acc, "concurrent_limit", "concurrent_per_account",
+        int(rl.get("concurrent_per_account", 0) or 0),
+        limit_policy, "account_concurrent")
+    # 到量冻结维度（rph/tph/rpd/tpd）：建池只从策略取、无账号级覆盖键，这里同口径。
+    client.rph_limit = _account_limit_with_policy(
+        runtime_acc, "rph_limit", None, 0, limit_policy, "account_rph")
+    client.tph_limit = _account_limit_with_policy(
+        runtime_acc, "tph_limit", None, 0, limit_policy, "account_tph")
+    client.rpd_limit = _account_limit_with_policy(
+        runtime_acc, "rpd_limit", "rpd_per_account",
+        int(rl.get("rpd_per_account", 0) or 0), limit_policy, "account_rpd")
+    client.tpd_limit = _account_limit_with_policy(
+        runtime_acc, "tpd_limit", None, 0, limit_policy, "account_tpd")
     if runtime_acc.get("balance") is not None:
         client.balance = float(runtime_acc.get("balance") or 0)
     client.balance_threshold = float(runtime_acc.get("balance_threshold") or 0)
@@ -1801,11 +2342,15 @@ def _reload_account_into_pool(provider_name: str, acc: dict, rpm: int, extra: di
     runtime_acc["proxy_config_id"] = _resolve_account_proxy_config_id(acc, proxies)
     is_disabled = acc.get("switch") is False
     rate_limit_extra = extra.get("rate_limit", {}) if isinstance(extra.get("rate_limit"), dict) else {}
+    # limit_policy 随 extra 传入（_provider_extra 已装配）；热加载与建池同一条兜底链，
+    # 缺失/读取失败时按 None 处理（策略档失效，行为与修复前的热加载一致）。
+    limit_policy = extra.get("limit_policy") if isinstance(extra.get("limit_policy"), dict) else None
 
     existing = next((c for c in pool.clients if c.username == username), None)
     if existing is not None:
         # 已有账号：就地字段级更新，保留运行态。
-        _apply_account_update_in_place(pool, existing, runtime_acc, rpm, rate_limit_extra, is_disabled)
+        _apply_account_update_in_place(pool, existing, runtime_acc, rpm, rate_limit_extra, is_disabled,
+                                       limit_policy=limit_policy)
         return
 
     # 新账号：构建 provider + AccountClient 入池。
@@ -1824,9 +2369,19 @@ def _reload_account_into_pool(provider_name: str, acc: dict, rpm: int, extra: di
         provider.attach_channel(pool.channel)
     client = AccountClient(
         provider,
-        rpm,
-        tpm_limit=_account_limit_from(runtime_acc, "tpm_limit", "tpm_per_account", rate_limit_extra),
-        concurrent_limit=_account_limit_from(runtime_acc, "concurrent_limit", "concurrent_per_account", rate_limit_extra),
+        _account_limit_with_policy(runtime_acc, "rpm_limit", None, int(rpm or 0), limit_policy, "account_rpm"),
+        tpm_limit=_account_limit_with_policy(
+            runtime_acc, "tpm_limit", "tpm_per_account",
+            int(rate_limit_extra.get("tpm_per_account", 0) or 0), limit_policy, "account_tpm"),
+        concurrent_limit=_account_limit_with_policy(
+            runtime_acc, "concurrent_limit", "concurrent_per_account",
+            int(rate_limit_extra.get("concurrent_per_account", 0) or 0), limit_policy, "account_concurrent"),
+        rph_limit=_account_limit_with_policy(runtime_acc, "rph_limit", None, 0, limit_policy, "account_rph"),
+        tph_limit=_account_limit_with_policy(runtime_acc, "tph_limit", None, 0, limit_policy, "account_tph"),
+        rpd_limit=_account_limit_with_policy(
+            runtime_acc, "rpd_limit", "rpd_per_account",
+            int(rate_limit_extra.get("rpd_per_account", 0) or 0), limit_policy, "account_rpd"),
+        tpd_limit=_account_limit_with_policy(runtime_acc, "tpd_limit", None, 0, limit_policy, "account_tpd"),
         balance=float(acc.get("balance") or 0) if acc.get("balance") is not None else None,
         balance_threshold=float(acc.get("balance_threshold") or 0),
         is_frozen=bool(acc.get("is_frozen") or False),
@@ -2018,16 +2573,19 @@ _ADMIN_INDEX_FILE = Path(__file__).parent / "user-frontend" / "dist" / "index.ht
 
 @router.get("")
 async def admin_page():
+    """返回管理端单页应用首页。"""
     return FileResponse(_ADMIN_INDEX_FILE)
 
 
 @router.get("/page/{name}", include_in_schema=False)
 async def admin_static_page(name: str):
+    """返回管理端单页应用首页（静态子路径刷新回落）。"""
     return FileResponse(_ADMIN_INDEX_FILE)
 
 
 @router.get("/provider/{name}", include_in_schema=False)
 async def admin_provider_page(name: str):
+    """返回管理端单页应用首页（渠道子路径刷新回落）。"""
     return FileResponse(_ADMIN_INDEX_FILE)
 
 
@@ -2052,6 +2610,7 @@ _MAIN_CONFIG_PATCH_FIELDS = {
         },
     },
     "stream": {"incomplete_error_enabled": None},
+    "api_docs": {"enabled": None},
     "rate_limit": {"status_codes": None, "cooldown_seconds": None, "exception_cooldown_seconds": None, "allow_token_reservation_overflow": None},
     "account_test": {"types": None},
 }
@@ -2090,6 +2649,11 @@ def _merge_main_config_patch(current: dict, patch: dict, allowed: dict = _MAIN_C
 
 @router.get("/config/main")
 async def get_main_config(token: str = Header(None, alias="Authorization")):
+    """获取主配置。
+
+    剔除 postgres/redis 等引导字段；retry/account_test 段缺失时回填后端默认值，
+    使前端首次打开即看到可编辑的默认项。
+    """
     await _require_admin(token)
     data = _strip_bootstrap_config(_read_json(CONFIG_FILE))
     # 合并不可重试规则默认值：配置未设置时返回后端默认值
@@ -2114,6 +2678,11 @@ async def get_main_config(token: str = Header(None, alias="Authorization")):
 
 @router.put("/config/main")
 async def update_main_config(data: dict, token: str = Header(None, alias="Authorization")):
+    """按补丁合并更新主配置。
+
+    仅接受白名单字段（_MAIN_CONFIG_PATCH_FIELDS），未登记的键一律 400；递归合并对象段，
+    写库并记录审计快照。
+    """
     await _require_admin(token)
     try:
         current = await _read_json_async(CONFIG_FILE)
@@ -2480,6 +3049,7 @@ async def get_owned_by_list(token: str = Header(None, alias="Authorization")):
 
 @router.put("/config/main/server")
 async def update_server_config(host: str = "0.0.0.0", port: int = 8001, token: str = Header(None, alias="Authorization")):
+    """更新服务监听地址与端口。"""
     await _require_admin(token)
     cfg = _read_json(CONFIG_FILE)
     cfg.setdefault("server", {})["host"] = host
@@ -2491,6 +3061,7 @@ async def update_server_config(host: str = "0.0.0.0", port: int = 8001, token: s
 
 @router.put("/config/main/logging")
 async def update_logging_config(level: str = "DEBUG", token: str = Header(None, alias="Authorization")):
+    """更新日志级别（统一转大写后写库）。"""
     await _require_admin(token)
     cfg = _read_json(CONFIG_FILE)
     cfg.setdefault("logging", {})["level"] = level.upper()
@@ -2501,6 +3072,7 @@ async def update_logging_config(level: str = "DEBUG", token: str = Header(None, 
 
 @router.put("/config/main/model-refresh")
 async def update_model_refresh(interval_minutes: int = 30, token: str = Header(None, alias="Authorization")):
+    """更新模型目录自动刷新间隔（分钟）。"""
     await _require_admin(token)
     cfg = _read_json(CONFIG_FILE)
     cfg.setdefault("model_refresh", {})["interval_minutes"] = interval_minutes
@@ -2511,6 +3083,7 @@ async def update_model_refresh(interval_minutes: int = 30, token: str = Header(N
 
 @router.put("/config/main/message-delete")
 async def update_message_delete(enabled: bool, interval_minutes: int = 30, token: str = Header(None, alias="Authorization")):
+    """更新消息自动清理的开关与间隔（分钟）。"""
     await _require_admin(token)
     cfg = _read_json(CONFIG_FILE)
     cfg.setdefault("message_delete", {})["enabled"] = enabled
@@ -2553,6 +3126,11 @@ async def update_data_retention_config(
     cleanup_hour: int | None = None,
     token: str = Header(None, alias="Authorization"),
 ):
+    """更新数据保留策略：请求日志保留天数与每日清理触发的本地整点。
+
+    log_days 最小为 1；cleanup_hour 省略时保留原值，传入时限定 0-23。
+    已下线的归档/响应体保留旧键在此一并移除，避免残留策略生效。
+    """
     await _require_admin(token)
     if log_days < 1:
         raise HTTPException(status_code=400, detail="log_days 最小为 1")
@@ -2691,6 +3269,11 @@ def _clean_output_interception_rules(raw) -> dict:
 
 @router.put("/config/main/retry")
 async def update_retry_config(data: dict | None = None, max_retries: int = 3, token: str = Header(None, alias="Authorization")):
+    """更新重试配置。
+
+    max_retries 限 0-10；body 可附带 context_overflow_not_retryable_enabled 与
+    non_retryable_parameter_errors（状态码/类型/参数等不可重试规则，经清洗后写库）。
+    """
     await _require_admin(token)
     if isinstance(data, dict) and "max_retries" in data:
         max_retries = data.get("max_retries")
@@ -2714,6 +3297,7 @@ async def update_retry_config(data: dict | None = None, max_retries: int = 3, to
 
 @router.put("/config/main/stream")
 async def update_stream_config(data: dict, token: str = Header(None, alias="Authorization")):
+    """更新流式响应配置（是否对流式不完整输出报错）。"""
     await _require_admin(token)
     cfg = _read_json(CONFIG_FILE)
     cfg.setdefault("stream", {})["incomplete_error_enabled"] = data.get("incomplete_error_enabled") is not False
@@ -2724,6 +3308,12 @@ async def update_stream_config(data: dict, token: str = Header(None, alias="Auth
 
 @router.put("/config/main/rate-limit")
 async def update_rate_limit_config(data: dict, token: str = Header(None, alias="Authorization")):
+    """更新限流配置。
+
+    整体重建 rate_limit 段：触发限流的状态码、常规冷却、异常冷却与「允许 token 预占
+    触线放行」开关。未随请求提交的开关显式保留原值，避免被静默清回默认。写库后
+    热加载 Config 让改动立即进入请求热路径。
+    """
     await _require_admin(token)
     raw_codes = data.get("status_codes")
     if isinstance(raw_codes, (int, str)):
@@ -2775,6 +3365,7 @@ async def update_rate_limit_config(data: dict, token: str = Header(None, alias="
 
 @router.put("/config/main/system")
 async def update_system_config(debug: bool = False, token: str = Header(None, alias="Authorization")):
+    """更新系统运行模式（debug 开关）。"""
     await _require_admin(token)
     cfg = _read_json(CONFIG_FILE)
     cfg.setdefault("system", {})["debug"] = debug
@@ -2848,6 +3439,10 @@ async def update_account_test_config(data: dict, token: str = Header(None, alias
 
 @router.get("/config/api-keys")
 async def get_api_keys(token: str = Header(None, alias="Authorization")):
+    """获取 API Key 列表（只取展示列，附 API Key 总开关状态）。
+
+    不拉 rate_limit/白名单等大 JSONB 字段，全字段详情按需走 /config/api-keys/{key_id}。
+    """
     await _require_admin(token)
     # 列表只取展示列（id/name/disabled/parent_id/expires_at/key 等），不拉
     # rate_limit/whitelist/thinking_config/usage_limit/group_ids 等大 JSONB——
@@ -2859,6 +3454,7 @@ async def get_api_keys(token: str = Header(None, alias="Authorization")):
 
 @router.put("/config/api-keys/enabled")
 async def toggle_api_keys(enabled: bool, token: str = Header(None, alias="Authorization")):
+    """启用/停用 API Key 鉴权总开关。"""
     await _require_admin(token)
     cfg = await _read_json_async(CONFIG_FILE)
     cfg.setdefault("api_keys", {})["enabled"] = enabled
@@ -2869,6 +3465,10 @@ async def toggle_api_keys(enabled: bool, token: str = Header(None, alias="Author
 
 @router.put("/config/api-keys/add")
 async def add_api_key(data: dict, token: str = Header(None, alias="Authorization")):
+    """新增一枚 API Key（明文只在本次响应返回）。
+
+    刷新鉴权缓存、写操作审计，并后台广播 api_key.created 通知。
+    """
     await _require_admin(token)
     row = await PostgresClient.add_api_key(data)
     await config.Config.refresh_api_keys_cache()
@@ -2886,6 +3486,10 @@ async def add_api_key(data: dict, token: str = Header(None, alias="Authorization
 
 @router.put("/config/api-keys/{key_id}")
 async def update_api_key(key_id: int, data: dict, token: str = Header(None, alias="Authorization")):
+    """更新指定 API Key 的配置。
+
+    子 Key 编辑越权（白/黑名单/配额/过期超出父范围）返回 400；写库前按 id 取旧值做审计快照。
+    """
     await _require_admin(token)
     # 审计快照只需这一行的旧值，直接按 id 取；原实现 list_api_keys() 全量拉所有 key
     # （含明文）再线性找一条，每次改/删都把整张表搬一遍。
@@ -2932,6 +3536,7 @@ async def copy_api_key(key_id: int, data: dict | None = None, token: str = Heade
 
 @router.delete("/config/api-keys/{key_id}")
 async def delete_api_key(key_id: int, token: str = Header(None, alias="Authorization")):
+    """删除指定 API Key（不可恢复）。"""
     await _require_admin(token)
     old_row = await PostgresClient.get_api_key_by_id(key_id)
     ok = await PostgresClient.delete_api_key(key_id)
@@ -2946,6 +3551,11 @@ async def delete_api_key(key_id: int, token: str = Header(None, alias="Authoriza
 
 @router.get("/config/api-keys/usage")
 async def get_api_keys_usage(token: str = Header(None, alias="Authorization")):
+    """获取全部 API Key 的用量与限流余量。
+
+    PG ledger 用量批量一次拉齐（避免每 key 一条连接打满连接池），Redis 余量并发读，
+    两者口径与单 key 版一致。
+    """
     await _require_admin(token)
     from rate_limiter import RateLimiter
     keys = await PostgresClient.list_api_keys()
@@ -2983,6 +3593,7 @@ async def get_api_key_detail(key_id: int, token: str = Header(None, alias="Autho
 
 @router.put("/config/api-keys/{key_id}/disable")
 async def disable_api_key(key_id: int, disabled: bool = True, token: str = Header(None, alias="Authorization")):
+    """停用/启用指定 API Key。"""
     await _require_admin(token)
     row = await PostgresClient.toggle_api_key_disabled(key_id, disabled)
     if not row:
@@ -3167,12 +3778,25 @@ async def _validate_model_groups(groups: dict):
                 if metadata_model not in real_model_ids:
                     raise HTTPException(status_code=400, detail=f"模型组 '{group_name}' metadata_model '{metadata_model}' 不是有效的真实模型")
             group["metadata_model"] = metadata_model
+        metadata_mode_raw = group.get("metadata_mode")
+        if metadata_mode_raw is not None:
+            if not isinstance(metadata_mode_raw, str):
+                raise HTTPException(status_code=400, detail=f"模型组 '{group_name}' metadata_mode 必须是字符串")
+            import model_catalog
+            mode = metadata_mode_raw.strip().lower()
+            if mode and mode not in model_catalog.GROUP_METADATA_MODES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"模型组 '{group_name}' metadata_mode '{metadata_mode_raw}' 非法，只能是 {'/'.join(model_catalog.GROUP_METADATA_MODES)}",
+                )
+            group["metadata_mode"] = mode
         _sanitize_model_group_provider_filters(group, group_name)
         _validate_model_group_schemes(group, group_name)
 
 
 @router.get("/model-routing")
 async def get_model_routing(token: str = Header(None, alias="Authorization")):
+    """获取模型路由页聚合数据：自定义模型组、渠道、可选模型与 API Key。"""
     await _require_admin(token)
     provider_configs, api_keys, groups = await asyncio.gather(
         config.Config.get_providers(),
@@ -3274,6 +3898,10 @@ async def _validate_model_group_write(name: str, group: dict) -> dict:
 
 @router.post("/model-groups")
 async def create_model_group(data: dict, token: str = Header(None, alias="Authorization")):
+    """新建自定义模型组。
+
+    名称为空 400；已存在 409；对 kind=real 的真实模型元数据行拒绝创建（改由模型元数据页管理）。
+    """
     await _require_admin(token)
     name = (data or {}).get("name")
     if not isinstance(name, str) or not name.strip():
@@ -3299,6 +3927,11 @@ async def create_model_group(data: dict, token: str = Header(None, alias="Author
 
 @router.put("/model-groups/{name}")
 async def update_model_group(name: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """更新自定义模型组（整组 PUT）。
+
+    kind=real 行拒绝（走模型元数据接口）；未随请求提交的 schemes/active_scheme/
+    metadata_model/metadata_mode 缺键时回源现有值，避免用空值覆盖已存配置。
+    """
     await _require_admin(token)
     old_group = await PostgresClient.get_model_group(name)
     if not old_group:
@@ -3320,6 +3953,14 @@ async def update_model_group(name: str, data: dict, token: str = Header(None, al
         payload["schemes"] = old_group.get("schemes", [])
     if not str(payload.get("active_scheme") or "").strip():
         payload["active_scheme"] = old_group.get("active_scheme", "")
+    # metadata_model/metadata_mode 同款兜底：这两个字段是后加的，旧前端 bundle/旧 App
+    # 的 payload 不带这两个键，缺键会让取值模式经 normalize 塌回 min（重启后编辑成员
+    # 即复现「元数据被清成最小」）。缺键时回源现有值；新前端总是显式携带（清空指定
+    # 模型传 metadata_model=null），带键的空值按「显式清空」处理，不回源。
+    if "metadata_model" not in payload:
+        payload["metadata_model"] = old_group.get("metadata_model", "")
+    if "metadata_mode" not in payload:
+        payload["metadata_mode"] = old_group.get("metadata_mode", "")
     try:
         payload = await _validate_model_group_write(name, payload)
         group = await PostgresClient.upsert_model_group(name, payload)
@@ -3332,6 +3973,7 @@ async def update_model_group(name: str, data: dict, token: str = Header(None, al
 
 @router.delete("/model-groups/{name}")
 async def delete_model_group(name: str, token: str = Header(None, alias="Authorization")):
+    """删除自定义模型组（kind=real 元数据行不可经此删除）。"""
     await _require_admin(token)
     old_group = await PostgresClient.get_model_group(name)
     if not old_group:
@@ -3346,8 +3988,81 @@ async def delete_model_group(name: str, token: str = Header(None, alias="Authori
     return {"ok": True}
 
 
+@router.post("/model-groups/effective-metadata")
+async def preview_group_effective_metadata(data: dict, token: str = Header(None, alias="Authorization")):
+    """按「取值模式」计算自定义模型对外暴露的元数据（供管理端详情弹框预览/查看当前值）。
+
+    接受草稿片段：members（未给时按 name 回源已保存组的激活方案成员）、metadata_model、
+    metadata_mode。返回聚合后的 effective 元数据、参与计算的成员明细与基准成员 id，
+    使弹框在保存前也能看到「最大/最小/平均/指定模型」四种模式下的具体值。
+    """
+    await _require_admin(token)
+    import model_catalog
+
+    payload = data or {}
+    metadata_model = str(payload.get("metadata_model") or "").strip()
+    metadata_mode = payload.get("metadata_mode")
+    members = payload.get("models")
+    if not isinstance(members, list) or not [m for m in members if isinstance(m, str) and m.strip()]:
+        name = str(payload.get("name") or "").strip()
+        group = await PostgresClient.get_model_group(name) if name else None
+        if not group:
+            raise HTTPException(status_code=400, detail="缺少 members，且无法按 name 回源已保存组")
+        members = list(group.get("models") or [])
+        if metadata_mode is None:
+            metadata_mode = group.get("metadata_mode")
+        if not metadata_model:
+            metadata_model = str(group.get("metadata_model") or "").strip()
+    members = [m.strip() for m in members if isinstance(m, str) and m.strip()]
+
+    snapshot = model_catalog.current_snapshot()
+    metadata = {model_id: _mutable_metadata(record) for model_id, record in snapshot.metadata.items()}
+    default = dict(snapshot.default or {})
+    mode = model_catalog.normalize_group_metadata_mode(metadata_mode, metadata_model)
+    effective = model_catalog.compute_group_metadata(members, metadata_model, metadata_mode, metadata, default)
+
+    member_rows = []
+    for member in members:
+        record = metadata.get(member)
+        member_rows.append({
+            "model_id": member,
+            "has_metadata": record is not None,
+            "max_tokens": (record or {}).get("max_tokens"),
+            "max_context_tokens": (record or {}).get("max_context_tokens"),
+        })
+    base_id = None
+    # model 模式命中指定模型时基准即它；否则（含 model 未命中的回落）按 max_tokens 最小者。
+    if mode == "model" and metadata_model in metadata:
+        base_id = metadata_model
+    else:
+        candidates = [m for m in members if m in metadata]
+        if candidates:
+            base_id = min(candidates, key=lambda mid: model_catalog._effective_max_tokens(metadata[mid], default))
+        if mode == "model":
+            mode = "min"
+
+    return {
+        "name": str(payload.get("name") or "").strip(),
+        "metadata_mode": mode,
+        "metadata_model": metadata_model,
+        "base_model_id": base_id,
+        "members": member_rows,
+        "effective": effective or {},
+    }
+
+
+def _mutable_metadata(value):
+    """把 snapshot 里冻结的 mappingproxy 递归还原成可变 dict/list（供 JSON 序列化）。"""
+    from model_metadata import _mutable
+    return _mutable(value)
+
+
 @router.put("/model-routing")
 async def update_model_routing(data: dict, token: str = Header(None, alias="Authorization")):
+    """整体更新模型路由（模型组集合）。
+
+    逐组校验并归一化后整份替换：未出现在提交列表里的已有组被删除。
+    """
     await _require_admin(token)
     groups = data.get("model_groups", {}).get("groups", data.get("groups", {}))
     await _validate_model_groups(groups)
@@ -3378,6 +4093,7 @@ async def update_model_routing(data: dict, token: str = Header(None, alias="Auth
             "backup_model_group": backup_name,
             "response_model": (str(group.get("response_model")) if group.get("response_model") is not None else existing_group.get("response_model", "")).strip(),
             "metadata_model": (str(group.get("metadata_model")) if group.get("metadata_model") is not None else existing_group.get("metadata_model", "")).strip(),
+            "metadata_mode": (str(group.get("metadata_mode")) if group.get("metadata_mode") is not None else existing_group.get("metadata_mode", "")).strip().lower(),
             "schemes": group.get("schemes") if group.get("schemes") is not None else existing_group.get("schemes", []),
             "active_scheme": group.get("active_scheme") if group.get("active_scheme") is not None else existing_group.get("active_scheme", ""),
         }
@@ -3471,6 +4187,20 @@ def _provider_base_response(name: str, cfg: dict) -> dict:
         "health_check": cfg.get("health_check", {}),
         "scheduled_test": cfg.get("scheduled_test", {}),
         "last_scheduled_test_at": ModelClientPool.last_scheduled_test_triggered_at(name),
+        # 账号动作（签到 / 同步额度 / 刷新授权…）：spec 声明的动作清单 + 用户保存的频率/开关
+        # 覆盖 + 调度器上次点火时间。前端在「账号动作」面板按 meta.default 与 config 合并渲染。
+        # 账号动作（签到 / 同步额度 / 刷新授权…）：spec 声明的动作清单，每条带**解析好的
+        # config**（enabled/频率/daily_time/账号范围）——调度配置由渠道代码定义，供应商页
+        # 只读展示 + 手动触发。另有调度器上次点火时间。
+        "account_actions_meta": _account_actions_meta(name, cfg),
+        "account_action_last_runs": {
+            action_id: ts for (provider_name, action_id), ts in _action_last_run.items()
+            if provider_name == name
+        },
+        # 模型列表「上一次更新」的时间戳（Unix 秒或 None）。前端按 auto_update_models 取舍：
+        # 定时更新开 → models_synced_at（最近一次从上游拉取），关 → models_updated_at（最近一次改模型）。
+        "models_synced_at": cfg.get("models_synced_at"),
+        "models_updated_at": cfg.get("models_updated_at"),
         "models": _provider_models(name),
         "model_rows": ModelClientPool.get_provider_routes(name),
     }
@@ -3621,6 +4351,12 @@ async def _provider_accounts_response(name: str, cfg: dict) -> list[dict]:
             if ref_value:
                 proxy_url_by_ref[ref_value] = proxy_url
                 proxy_mode_by_ref[ref_value] = mode
+    # 账号动作执行结果（内存态）：{username: {action_id: {at, ok, error}}}。
+    # 供前端账号行渲染签到/额度徽标的悬浮详情（上次执行时间与失败原因）。
+    action_runs_by_username: dict[str, dict[str, dict]] = {}
+    for (owner, action_id, uname), run in _action_last_result.items():
+        if owner == name:
+            action_runs_by_username.setdefault(uname, {})[action_id] = run
     for acc in cfg.get("accounts", []):
         if not isinstance(acc, dict):
             continue
@@ -3630,6 +4366,9 @@ async def _provider_accounts_response(name: str, cfg: dict) -> list[dict]:
         seen_usernames.add(username)
 
         account_info = dict(acc)
+        # 显示名（备注优先）：前端下拉/徽标直接读 display_name，不做回落判断。
+        account_info["display_name"] = _account_display_name(acc)
+        account_info["action_runs"] = action_runs_by_username.get(username, {})
         proxy_ref = (account_info.get("proxy_id") or account_info.get("proxy") or "").strip()
         account_info["proxy_url"] = proxy_url_by_ref.get(proxy_ref, (account_info.get("proxy") or "").strip())
         account_info["proxy_mode"] = proxy_mode_by_ref.get(proxy_ref, "network")
@@ -3712,14 +4451,19 @@ async def _provider_accounts_response(name: str, cfg: dict) -> list[dict]:
             })
         has_model_cooldown = bool(model_cooldowns) or bool(memory_models)
         memory_remaining = int(client.cooldown_remaining() or 0)
+        # Redis 是权威来源，但 value 存的 reason 可能为空（写入侧抽取失败的历史 key）。
+        # 与下方 cooldown_reason 同口径：Redis reason 空时回落内存桶，避免展示「无原因」。
+        memory_freeze_reason = client.freeze_reason()
         account_status = cooldown_info
         if account_cooldown and account_status is None:
             account_status = {
                 "remaining": None if memory_remaining <= 0 else memory_remaining,
                 "until": None if memory_remaining <= 0 else int(now + memory_remaining),
-                "reason": client.freeze_reason(),
+                "reason": memory_freeze_reason,
                 "permanent": memory_remaining <= 0,
             }
+        elif account_cooldown and account_status and not account_status.get("reason") and memory_freeze_reason:
+            account_status = {**account_status, "reason": memory_freeze_reason}
         freeze_items = _freeze_items(account_status, model_cooldowns)
         if account_cooldown and has_model_cooldown:
             cooldown_scope = "mixed"
@@ -3821,6 +4565,8 @@ async def _provider_lite_accounts_response(name: str, cfg: dict) -> list[dict]:
             state = client.state().value
         result.append({
             "username": username,
+            # 显示名（备注优先）：下拉 label 直接读 display_name，value 仍用 username。
+            "display_name": _account_display_name(accounts_by_username[username]),
             "switch": switch_on,
             "cooldown": memory_frozen,
             "state": state,
@@ -4067,6 +4813,11 @@ async def list_providers(
     lite: bool = False,
     token: str = Header(None, alias="Authorization"),
 ):
+    """渠道列表。
+
+    仅返回已持久化的渠道；非管理员只看自己建的（管理员建的对本人不可见但选路可用）。
+    lite=true 返回精简条目（列表/下拉用），否则返回带冻结计数的完整摘要。
+    """
     user_id, is_admin = await _require_admin_or_user(token)
     provider_configs = await config.Config.get_providers()
     # 仅返回已在 Postgres 持久化（即真正“已创建”）的渠道。
@@ -4096,6 +4847,11 @@ async def list_providers(
 
 @router.delete("/providers/{name}")
 async def delete_provider(name: str, token: str = Header(None, alias="Authorization")):
+    """删除渠道（不可恢复）。
+
+    删除前落整份备份供误删恢复，并清理其在路由/API Key 过滤里的引用、释放运行池；
+    非管理员只能删除自己建的渠道（403）。
+    """
     user_id, is_admin = await _require_admin_or_user(token)
     cfg = await _read_provider_config(name)
     if not _provider_owned_by(cfg.get("owner_user_id"), user_id, is_admin):
@@ -4125,6 +4881,10 @@ async def delete_provider(name: str, token: str = Header(None, alias="Authorizat
 
 @router.get("/providers/{name}/base")
 async def get_provider_base_config(name: str, token: str = Header(None, alias="Authorization")):
+    """获取渠道基础配置（不含账号列表等重字段）。
+
+    非管理员访问不可见渠道时按 404 处理，避免泄露渠道存在性。
+    """
     user_id, is_admin = await _require_admin_or_user(token)
     cfg = await _read_provider_base_config(name)
     if cfg is not None and not _provider_visible_to(cfg.get("owner_user_id"), user_id, is_admin):
@@ -4142,6 +4902,10 @@ def _normalize_account_schema(name: str, cfg: dict, schema: dict | None) -> dict
         "auth_start": {"enabled": False},
         "add_guidance": "",
         "metadata_badges": [],
+        # 渠道**有没有 refresh_auth 钩子**——前端据此决定「刷新授权」按钮显隐
+        # （按渠道代码决定，而非按 auth_start/add_methods 推断，避免 inscode 这类
+        # 声明了 device_code 却没 refresh_auth 的渠道显示一个点了 400 的按钮）。
+        "supports_refresh_auth": False,
     }
     if isinstance(schema, dict):
         base.update(schema)
@@ -4187,6 +4951,28 @@ def _normalize_account_schema(name: str, cfg: dict, schema: dict | None) -> dict
             auth_start["completion"] = "poll"
     if not isinstance(base.get("metadata_badges"), list):
         base["metadata_badges"] = []
+    # 模型「其他信息」列声明：spec 声明模型行要额外展示的条目（如龙虾的积分倍率），
+    # 前端模型 tab 据此渲染「其他信息」列。每项 {key, label, format?}；key 是模型行里的
+    # 字段名（值优先取行顶层，其次 extra_config[key]）。未声明 = 不渲染该列（存量渠道零改动）。
+    cols = []
+    for col in base.get("model_info_columns") or []:
+        if not isinstance(col, dict) or not col.get("key"):
+            continue
+        cols.append({
+            "key": str(col["key"]),
+            "label": str(col.get("label") or col["key"]),
+            "format": str(col.get("format") or ""),
+        })
+    base["model_info_columns"] = cols
+    # 渠道是否实现了 refresh_auth（覆盖 ≠ BaseProvider 的 501 桩）。前端据此显示/隐藏
+    # 「刷新授权」按钮——真相源是渠道代码，不能用 auth_start/add_methods 推断。
+    try:
+        provider_class = _get_provider_class(name, cfg)
+        base["supports_refresh_auth"] = (
+            provider_class.refresh_account_auth is not BaseProvider.refresh_account_auth
+        )
+    except Exception:  # noqa: BLE001 - spec 加载失败时保守视为不支持，按钮不显示
+        base["supports_refresh_auth"] = False
     return base
 
 
@@ -4442,12 +5228,34 @@ def _account_from_auth_result(result: dict) -> dict:
     return {}
 
 
-async def _finalize_authorized_auth(name: str, state: str, record: dict) -> dict:
+def _normalize_auth_account_data(account_data: dict) -> dict:
+    """把 spec 返回的 account_data 归一成「前端可直接回填表单」的形态。
+
+    统一模型下授权完成不自动落库，account_data 原样回传前端回填。以前这层归一是
+    ``_finalize_authorized_auth`` 落库时做的（username / password / switch 补默认），
+    现在不落库了就必须在这里补齐——否则前端按 ``acc.username`` 判空时整块回填被跳过
+    （autoclaw 只返回 ``user_name``，正是这个坑）。
+    """
+    data = dict(account_data or {})
+    if not str(data.get("username") or "").strip():
+        for key in ("user_name", "user_email", "account_id", "user_id", "name"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                data["username"] = value
+                break
+    return data
+
+
+async def _finalize_authorized_auth(name: str, state: str, record: dict,
+                                    add_method: str = "device_code",
+                                    audit_code: str = "device_code_auth_complete",
+                                    message: str = "设备码授权成功，已写入账号列表") -> dict:
     """把 authorized 的授权结果真正落库并标记 completed；幂等。
 
     三个入口共用（扫描器 authorized、loopback 回调 authorized、/auth/status 读到遗留
-    authorized）。record 已 completed 就直接返回已存账号——loopback 回调与扫描器可能
-    抢跑，账号 upsert 本身按 username 合并是安全的，护栏挡的是状态行被回写覆盖。
+    authorized）。步骤认证（steps）也复用此路径，靠 ``add_method`` / ``audit_code`` /
+    ``message`` 三个参数区分来源。record 已 completed 就直接返回已存账号——loopback 回调与
+    扫描器可能抢跑，账号 upsert 本身按 username 合并是安全的，护栏挡的是状态行被回写覆盖。
     """
     if record.get("completed"):
         return record.get("account") or {}
@@ -4455,22 +5263,22 @@ async def _finalize_authorized_auth(name: str, state: str, record: dict) -> dict
     account_data.setdefault("username", account_data.get("user_name") or account_data.get("user_email") or account_data.get("account_id") or f"{name}-user")
     account_data.setdefault("password", account_data.get("github_token") or account_data.get("refresh_token") or "")
     account_data.setdefault("switch", True)
-    account_data.setdefault("add_method", "device_code")
+    account_data.setdefault("add_method", add_method)
 
     cfg = await _read_provider_config(name)
     account, old_account = _upsert_account_in_config(cfg, account_data)
     account = _normalize_account_proxy_ref(account, _read_proxies())
     await _persist_account(name, account)
     _reload_account_into_pool(name, account, _provider_rpm(cfg), _provider_extra(name, cfg))
-    await _log_operation("", "device_code_auth_complete", "account", account.get("username"), {"provider": name, "account": old_account}, {"provider": name, "account": account})
+    await _log_operation("", audit_code, "account", account.get("username"), {"provider": name, "account": old_account}, {"provider": name, "account": account})
 
     # 标记完成：写回 Postgres，扫描器据 status!=pending 自然停止轮询。
     record["status"] = "completed"
     record["completed"] = True
     record["account"] = account
-    record["message"] = "设备码授权成功，已写入账号列表"
+    record["message"] = message
     await _set_account_auth_state(state, record)
-    logger.info(f"[admin] auth finalize provider={name} state={state} username={account.get('username')!r}")
+    logger.info(f"[admin] auth finalize provider={name} state={state} username={account.get('username')!r} method={add_method}")
     return account
 
 
@@ -4504,9 +5312,220 @@ def _upsert_account_in_config(cfg: dict, incoming: dict) -> tuple[dict, dict | N
 
 @router.get("/providers/{name}/account-schema")
 async def get_provider_account_schema(name: str, token: str = Header(None, alias="Authorization")):
+    """获取渠道账号表单 schema（字段定义、添加方式与授权入口）。"""
     await _require_admin(token)
     cfg = await _read_provider_config(name)
     return _provider_account_schema(name, cfg)
+
+
+# 凭据文件导入的大小上限：凭据文件都很小（HAR 可能几 MB），给足余量即可。
+ACCOUNT_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+
+
+@router.post("/providers/{name}/accounts/import-file")
+async def import_provider_account_credentials(
+    name: str,
+    file: UploadFile = File(...),
+    token: str = Header(None, alias="Authorization"),
+):
+    """导入认证：上传凭据文件（JSON / HAR / cookies.txt）→ 识别字段 → 回填账号表单。
+
+    **不落库**：返回识别结果，前端把 fields 填进账号表单、用户确认后走正常 add 流程
+    （PUT /accounts/add）。渠道声明 ``parse_credential_file`` 钩子时完全由钩子解析，
+    否则走 ``providers.credential_import`` 的通用解析器。
+    """
+    admin_token = await _require_admin(token)
+    cfg = await _read_provider_config(name)
+    filename = (getattr(file, "filename", "") or "").strip()
+    try:
+        content = await file.read()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"读取上传文件失败：{e}") from e
+    if not content:
+        raise HTTPException(status_code=400, detail="上传的文件为空")
+    if len(content) > ACCOUNT_IMPORT_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件过大（{len(content) // 1024}KB），上限 {ACCOUNT_IMPORT_MAX_BYTES // 1024 // 1024}MB",
+        )
+
+    provider_class = _get_provider_class(name, cfg)
+    schema = _provider_account_schema(name, cfg)
+    schema_fields = schema.get("fields") or []
+
+    result: dict | None = None
+    # 渠道自定义解析优先（非标格式的渠道自己认）
+    if getattr(provider_class, "parse_credential_file", None):
+        account = dict(cfg.get("accounts", [{}])[0]) if cfg.get("accounts") else {}
+        provider = _build_auth_runtime_instance(name, cfg, account)
+        try:
+            raw = await provider.parse_credential_file(filename, content, cfg)
+            if isinstance(raw, dict) and (raw.get("fields") or raw.get("extras")):
+                result = {
+                    "format": "custom",
+                    "fields": raw.get("fields") or {},
+                    "extras": raw.get("extras") or {},
+                    "notes": raw.get("notes") or ["由渠道自定义解析器识别"],
+                }
+        except Exception as e:  # noqa: BLE001 - 钩子失败回落到通用解析
+            logger.warning(f"[admin] parse_credential_file 失败 provider={name}，回落通用解析：{type(e).__name__}: {e}")
+
+    if result is None:
+        fmt = credential_import.detect_format(filename, content)
+        if fmt == "unknown":
+            raise HTTPException(
+                status_code=400,
+                detail="无法识别文件格式，请上传凭据 JSON、HAR 抓包文件或 cookies.txt",
+            )
+        base_url = str(cfg.get("base_url") or "")
+        try:
+            result = credential_import.parse_credentials(content, fmt, schema_fields, base_url=base_url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    await _log_operation(admin_token, "import_account_credentials", "account", name, None,
+                         {"provider": name, "filename": filename, "format": result.get("format"),
+                          "field_keys": sorted((result.get("fields") or {}).keys())})
+    logger.info(
+        f"[admin] accounts/import-file provider={name} file={filename!r} "
+        f"format={result.get('format')} fields={sorted((result.get('fields') or {}).keys())}"
+    )
+    return {"ok": True, **result}
+
+
+# JSON 批量导入的大小上限：与凭据文件同档（批量账号文本都很小）。
+ACCOUNT_JSON_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _validate_account_import_row(account: dict, schema_fields: list[dict], existing: set[str],
+                                 seen: set[str]) -> list[str]:
+    """校验一条导入账号，返回错误列表（空 = 可导入）。
+
+    用户名缺失 / 重复 / 必填字段缺失都拦在导入前——批量导入最容易踩这三坑
+    （上游 JSON 一个条目漏了 enterprise_id，入库后该账号全请求 500）。
+    """
+    errors: list[str] = []
+    username = str(account.get("username") or "").strip()
+    if not username:
+        errors.append("缺少用户名")
+        return errors
+    if username in existing:
+        errors.append(f"用户名 '{username}' 已存在")
+    if username in seen:
+        errors.append(f"用户名 '{username}' 重复")
+    for field in schema_fields:
+        key = str(field.get("key") or "")
+        if not key or not field.get("required"):
+            continue
+        value = account.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            errors.append(f"缺少必填字段 {field.get('label') or key}")
+    return errors
+
+
+@router.post("/providers/{name}/accounts/import-json")
+async def import_provider_accounts_json(name: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """JSON 批量导入账号：解析 → 按账号 schema 映射 → 预览（**不落库**）。
+
+    与 `/accounts/import-file`（单账号凭据识别）同一约定：这里只把粘贴的 JSON 变成
+    「前端能预览、用户核对后走 batch-add 落库」的账号行，不直接写库。
+
+    body: {"text": "<json 文本>"}
+    接受的 JSON 形态（都是用户拿得到的导出形态）：
+      [ {...}, {...} ]                        —— 顶层就是账号数组
+      {"accounts": [{...}, {...}]}            —— 带 accounts 包裹
+      {"data": [...]} / {"list": [...]}       —— 其它单键包裹（取该键的数组值）
+    每条 dict 的键按 ``account_schema()["fields"]`` 的 key 名映射到账号字段；
+    上游原始键名（token/api_key/access_token…）也认，走凭据导入那套槽位映射。
+    """
+    admin_token = await _require_admin(token)
+    cfg = await _read_provider_config(name)
+    text = str(data.get("text") or "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="请粘贴要导入的 JSON 文本")
+    if len(text.encode("utf-8")) > ACCOUNT_JSON_IMPORT_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文本过大（{len(text) // 1024}KB），上限 {ACCOUNT_JSON_IMPORT_MAX_BYTES // 1024 // 1024}MB",
+        )
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"无效的 JSON：{e}") from e
+
+    entries: list = []
+    if isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict):
+        for wrapper in ("accounts", "data", "list", "items", "result"):
+            value = payload.get(wrapper)
+            if isinstance(value, list):
+                entries = value
+                break
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="JSON 顶层必须是账号数组，或含 accounts/data/list/items/result 数组的对象",
+            )
+    else:
+        raise HTTPException(status_code=400, detail="JSON 顶层必须是账号数组或含账号数组的对象")
+    if not entries:
+        raise HTTPException(status_code=400, detail="JSON 里没有账号条目")
+
+    schema = _provider_account_schema(name, cfg)
+    schema_fields = schema.get("fields") or []
+    existing = {str(a.get("username")) for a in cfg.get("accounts", []) if a.get("username")}
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    importable: list[dict] = []
+    for index, raw in enumerate(entries, 1):
+        if not isinstance(raw, dict):
+            rows.append({"index": index, "username": "", "errors": ["条目必须是对象"],
+                         "fields": {}, "extras": {}})
+            continue
+        account, extras = credential_import.map_account_entry(raw, schema_fields)
+        account.setdefault("switch", True)
+        # schema 没声明的键照样是账号配置的一部分（运行时挂 p.<key>、编辑表单进「额外字段」区），
+        # 与单账号凭据导入把 extras 合并回表单同一口径——批量导入不该悄悄丢字段。
+        for key, value in extras.items():
+            account.setdefault(key, value)
+        errors = _validate_account_import_row(account, schema_fields, existing, seen)
+        if not errors:
+            seen.add(str(account.get("username") or "").strip())
+        # 预览行：凭据字段脱敏展示（token 类遮蔽）。可导入的**完整**账号只出现在顶层
+        # accounts 里（供确认后原样发回 batch-add），预览行不重复携带明文凭据。
+        preview = {
+            "index": index,
+            "username": str(account.get("username") or ""),
+            "errors": errors,
+            "fields": {k: _mask_secret(v) if credential_import.is_secret_field(k, schema_fields)
+                       and isinstance(v, str) else v
+                       for k, v in account.items() if k != "switch"},
+            "extras": extras,
+        }
+        rows.append(preview)
+        if not errors:
+            importable.append(account)
+
+    ok_rows = [r for r in rows if not r["errors"]]
+    await _log_operation(admin_token, "import_accounts_json_preview", "account", name, None,
+                         {"provider": name, "total": len(rows), "importable": len(ok_rows)})
+    logger.info(
+        f"[admin] accounts/import-json provider={name} total={len(rows)} "
+        f"importable={len(ok_rows)} failed={len(rows) - len(ok_rows)}"
+    )
+    return {
+        "ok": True,
+        "provider_name": name,
+        "schema_fields": [{"key": f.get("key"), "label": f.get("label") or f.get("key")}
+                          for f in schema_fields if f.get("key")],
+        "rows": rows,
+        "accounts": importable,
+        "total": len(rows),
+        "importable": len(importable),
+        "failed": len(rows) - len(importable),
+    }
 
 
 @router.get("/providers/code-channel/docs")
@@ -4527,6 +5546,9 @@ def _build_auth_runtime_instance(name: str, cfg: dict, account: dict):
     runtime_acc = dict(account or {})
     if not runtime_acc.get("username"):
         runtime_acc["username"] = f"{name}-auth"
+    # 先按原始引用解出 proxy_config_id，再覆盖 runtime_acc["proxy"]——顺序反了会把
+    # 原始 ref 冲掉（url_prefix 模式 resolve 出 None，id 就再也找不回来）。
+    runtime_acc["proxy_config_id"] = _resolve_account_proxy_config_id(runtime_acc)
     runtime_acc["proxy"] = _resolve_account_proxy(runtime_acc)
     runtime_acc["url_prefix"] = _resolve_account_url_prefix(runtime_acc)
     extra = _provider_extra(name, cfg)
@@ -4597,17 +5619,220 @@ def _shape_device_code_response(result: dict, interval: int, completion: str = "
     return result
 
 
+# ==================== 步骤认证（step auth）====================
+# 与 device_code 的根本区别：同步交互、不轮询、不进扫描器。用户每提交一步，服务端立刻
+# 执行该步动作并返回下一步；状态仍存在 account_auth_states（task_type='steps'），
+# 过期由 delete_expired_account_auth_states 照常清理。
+
+
+async def _invoke_begin_step_auth(provider_class, name: str, cfg: dict, account: dict, auth_context: dict) -> dict:
+    """调 ``begin_step_auth``（throwaway 实例）并校验返回形态。"""
+    begin = getattr(provider_class, "begin_step_auth", None)
+    if not begin:
+        raise HTTPException(status_code=501, detail=f"渠道 {name} 未实现步骤认证（begin_step_auth）")
+    provider = _build_auth_runtime_instance(name, cfg, account)
+    if isinstance(begin, classmethod):
+        bound = begin.__func__
+        if _accepts_extra_arg(bound, 2):
+            result = await bound(provider_class, provider, auth_context)
+        else:
+            result = await bound(provider_class, provider)
+    else:
+        bound = provider.begin_step_auth
+        result = (await bound(auth_context)
+                  if _accepts_extra_arg(bound, 0)
+                  else await bound())
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail="provider.begin_step_auth 返回格式错误")
+    if result.get("task_type") != "steps":
+        raise HTTPException(status_code=500, detail="provider.begin_step_auth 未声明 task_type=steps")
+    # exit=True：本渠道不需要交互步骤（纯手填），直接进账号表单。带 step 则正常起步。
+    if result.get("exit"):
+        return result
+    if not isinstance(result.get("step"), dict):
+        raise HTTPException(status_code=500, detail="provider.begin_step_auth 未返回 step 描述")
+    return result
+
+
+def _device_flow_to_step(flow: dict, completion: str = "poll") -> dict:
+    """把设备码/OAuth 的 begin 结果**包装成一个异步步骤**（兼容层）。
+
+    存量 spec 只声明 ``begin_device_flow``，不写步骤钩子；框架把它包成 step 后，
+    前端只需要一套步骤 UI——步骤显示 user_code / 授权地址，后台仍走原有设备码扫描器
+    轮询（关页面也能完成）。这样存量渠道零改动即被纳入统一步骤模型。
+    """
+    interval = max(int(flow.get("interval") or 5), 1)
+    expires_in = int(flow.get("expires_in") or ACCOUNT_AUTH_STATE_TTL)
+    user_code = str(flow.get("user_code") or "")
+    verification_uri = str(flow.get("verification_uri") or "")
+    auth_url = str(flow.get("auth_url") or flow.get("login_url") or "")
+    hint_parts = []
+    if user_code:
+        hint_parts.append(f"验证码：{user_code}")
+    if verification_uri:
+        hint_parts.append(f"授权地址：{verification_uri}")
+    elif auth_url:
+        hint_parts.append(f"授权地址：{auth_url}")
+    if completion == "loopback":
+        hint_parts.append("跨机部署时若浏览器停在打不开的 127.0.0.1 地址，请把地址栏整条 URL 粘到下方补投。")
+    step: dict = {
+        "id": "device_authorize",
+        "title": flow.get("title") or "设备码授权",
+        "description": flow.get("description") or "请在授权页面完成登录，完成后自动继续。",
+        "fields": [],
+        "user_code": user_code,
+        "verification_uri": verification_uri,
+        "auth_url": auth_url,
+        "poll": {"interval": interval, "expires_in": expires_in},
+    }
+    if hint_parts:
+        step["hint"] = "\n".join(hint_parts)
+    return step
+
+
+async def _start_flow_as_step(provider_class, name: str, cfg: dict, account: dict,
+                              auth_context: dict, state: str, state_data: dict,
+                              completion: str, *, redirect_uri: str = "",
+                              prefer_callback: bool = False) -> dict:
+    """把设备码 / 回调式 OAuth 的 begin 结果**包装成异步步骤**返回（兼容层）。
+
+    内部状态机照旧（``task_type='device_code'``，扫描器不动），对外统一成 ``mode='steps'``
+    + ``step``（带 ``poll``），前端只认步骤一种形态。``prefer_callback=True`` 时先试
+    ``build_account_auth_start``（回调式），其 501 由调用方退回设备码。
+    """
+    if prefer_callback:
+        flow = await provider_class.build_account_auth_start(
+            name, account, redirect_uri, state, cfg, auth_context=auth_context)
+        if not isinstance(flow, dict):
+            flow = {}
+        # 回调式：依赖 callback 端点写 completed；不写 poll_params，扫描器跳过该行。
+        auth_url = str(flow.get("auth_url") or flow.get("login_url") or "")
+        step: dict = {
+            "id": "oauth_authorize",
+            "title": flow.get("title") or "跳转登录",
+            "description": flow.get("description") or "在新窗口完成登录，完成后自动继续。",
+            "fields": [],
+            "auth_url": auth_url,
+            "poll": {"interval": 3, "expires_in": int(flow.get("expires_in") or ACCOUNT_AUTH_STATE_TTL)},
+        }
+        result = {"mode": "steps", "step": step, "redirect_uri": redirect_uri,
+                  **{k: v for k, v in flow.items() if k not in ("title", "description", "auth_url", "login_url")}}
+        logger.info(f"[admin] auth/start callback→step provider={name} state={state} redirect_uri={redirect_uri}")
+        return result
+
+    flow = await _invoke_begin_device_flow(provider_class, name, cfg, account, auth_context)
+    interval, expires_in = _apply_device_code_state(state_data, flow)
+    await _set_account_auth_state(state, state_data)
+    result = {
+        "mode": "steps",
+        "step": _device_flow_to_step(flow, completion),
+        "step_state": flow.get("poll_params") or {},
+    }
+    logger.info(
+        f"[admin] auth/start device_code→step provider={name} state={state} "
+        f"completion={completion} origin={auth_context['origin']} "
+        f"interval={interval}s expires_in={expires_in}s"
+    )
+    return result
+
+
+def _apply_async_step_polling(state_data: dict) -> None:
+    """按当前步骤是否为「异步步骤」落/清轮询字段（start 与 step 推进**共用**）。
+
+    异步步骤（step 带 ``poll`` 且 step_state 带 ``poll_params``）：把 poll_params 提到
+    顶层并写 ``next_poll_at``/``interval``——后台扫描器据此继续调 spec 的
+    ``poll_device_flow``（与存量设备码同一条轮询链路），**loopback 认领也从
+    pending 任务列表里找本会话**（autoclaw 补投框就靠这个）。
+
+    同步步骤：清掉轮询字段（会话从异步步退回同步步时不留脏数据，扫描器天然不碰）。
+    """
+    step = state_data.get("step") or {}
+    step_state = state_data.get("step_state") or {}
+    poll = step.get("poll") if isinstance(step, dict) else None
+    poll_params = step_state.get("poll_params") if isinstance(step_state, dict) else None
+    if isinstance(poll, dict) and isinstance(poll_params, dict) and poll_params:
+        state_data["poll_params"] = poll_params
+        state_data["interval"] = max(int(poll.get("interval") or 5), 1)
+        state_data["next_poll_at"] = time.time() + state_data["interval"]
+    else:
+        state_data.pop("poll_params", None)
+        state_data.pop("next_poll_at", None)
+        state_data.pop("interval", None)
+
+
+def _apply_step_auth_state(state_data: dict, result: dict) -> int:
+    """把步骤认证字段写进 ``state_data``；返回 expires_in。"""
+    now = time.time()
+    expires_in = int(result.get("expires_in") or ACCOUNT_AUTH_STATE_TTL)
+    state_data.update({
+        "task_type": "steps",
+        "status": "pending",
+        "step": result.get("step") or {},
+        "step_state": result.get("step_state") or {},
+        "expires_at": now + expires_in,
+    })
+    _apply_async_step_polling(state_data)
+    return expires_in
+
+
+def _shape_step_auth_response(result: dict) -> dict:
+    """步骤认证响应：不带 poll_status（前端据此不启轮询）。"""
+    result.setdefault("mode", "steps")
+    result.pop("poll_status", None)
+    result.pop("poll_interval", None)
+    # provider 内部 state 与后端管理态 state 是两个东西，前端不要混
+    if "state" in result:
+        result["provider_state"] = result.pop("state")
+    return result
+
+
+async def _invoke_submit_step_auth(provider_class, name: str, cfg: dict, account: dict,
+                                   step_id: str, values: dict, step_state: dict,
+                                   action: str | None, auth_context: dict) -> dict:
+    """调 ``submit_step_auth``（throwaway 实例）并校验返回形态。"""
+    submit = getattr(provider_class, "submit_step_auth", None)
+    if not submit:
+        raise HTTPException(status_code=501, detail=f"渠道 {name} 未实现步骤提交（submit_step_auth）")
+    provider = _build_auth_runtime_instance(name, cfg, account)
+    if isinstance(submit, classmethod):
+        bound = submit.__func__
+        base = (provider_class, provider, step_id, values, step_state)
+        if _accepts_extra_arg(bound, len(base)):
+            base = base + (action,)
+        if _accepts_extra_arg(bound, len(base)):
+            base = base + (auth_context,)
+        result = await bound(*base)
+    else:
+        bound = provider.submit_step_auth
+        base = (step_id, values, step_state)
+        if _accepts_extra_arg(bound, len(base)):
+            base = base + (action,)
+        if _accepts_extra_arg(bound, len(base)):
+            base = base + (auth_context,)
+        result = await bound(*base)
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail="provider.submit_step_auth 返回格式错误")
+    status = str(result.get("status") or "").strip().lower()
+    if status not in ("next", "pending", "authorized", "error"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"provider.submit_step_auth 返回了未知 status={status!r}（应为 next/pending/authorized/error）",
+        )
+    return result
+
+
 @router.post("/providers/{name}/accounts/auth/start")
 async def start_provider_account_auth(name: str, data: dict, request: Request, token: str = Header(None, alias="Authorization")):
-    """启动账号授权（callback / device-code 统一入口）。
+    """启动账号授权（callback / device-code / steps 统一入口）。
 
     分发依据是 ``account_schema()["auth_start"]["mode"]``：``oauth_callback`` 走
-    ``build_account_auth_start``，``device_code`` 走 ``begin_device_flow``；两者都没声明的
-    老渠道保留「先试 callback、撞 501 再退设备码」的兼容路径。
+    ``build_account_auth_start``，``device_code`` 走 ``begin_device_flow``，
+    ``steps`` 走 ``begin_step_auth``（同步交互、不轮询）；三者都没声明的老渠道保留
+    「先试 callback、撞 501 再退设备码」的兼容路径。
 
     回调地址由框架用「浏览器 origin + 框架路径」拼好后作为 ``redirect_uri`` /
     ``auth_context`` 交给渠道，渠道不自己决定服务端地址。
-    """
+"""
     admin_token = await _require_admin(token)
     cfg = await _read_provider_config(name)
     provider_class = _get_provider_class(name, cfg)
@@ -4631,43 +5856,51 @@ async def start_provider_account_auth(name: str, data: dict, request: Request, t
         "completion": completion,
     }
     await _set_account_auth_state(state, state_data)
+    has_step_hook = bool(getattr(provider_class, "begin_step_auth", None))
+    has_device_hook = bool(getattr(provider_class, "begin_device_flow", None))
+    has_callback_hook = bool(getattr(provider_class, "build_account_auth_start", None))
+    exit_step = False
     try:
-        if mode == "device_code":
-            result = await _invoke_begin_device_flow(provider_class, name, cfg, account, auth_context)
-            interval, expires_in = _apply_device_code_state(state_data, result)
-            await _set_account_auth_state(state, state_data)
-            result = _shape_device_code_response(result, interval, completion)
-            logger.info(
-                f"[admin] auth/start device_code provider={name} state={state} "
-                f"completion={completion} origin={auth_context['origin']} "
-                f"interval={interval}s expires_in={expires_in}s"
-            )
-        elif mode in ("oauth_callback", "callback", "popup"):
-            result = await provider_class.build_account_auth_start(
-                name, account, redirect_uri, state, cfg, auth_context=auth_context)
-            # callback 型：依赖 callback 端点写 completed，不写 task_type，扫描器跳过
-            if isinstance(result, dict):
-                result.setdefault("completion", "callback")
-            logger.info(f"[admin] auth/start {mode} provider={name} state={state} redirect_uri={redirect_uri}")
-        else:
-            # 未声明 mode 的老渠道：先试 callback，只有 501（未实现）才回退设备码。
-            try:
-                result = await provider_class.build_account_auth_start(
-                    name, account, redirect_uri, state, cfg, auth_context=auth_context)
-                if isinstance(result, dict):
-                    result.setdefault("completion", "callback")
-            except HTTPException as e:
-                if e.status_code != 501 or not getattr(provider_class, "begin_device_flow", None):
-                    raise
-                result = await _invoke_begin_device_flow(provider_class, name, cfg, account, auth_context)
-                interval, expires_in = _apply_device_code_state(state_data, result)
+        # 统一步骤入口：优先原生 begin_step_auth（迁移后的 spec 同时保留设备码钩子供
+        # 步骤内部调用，所以这里不看 mode 只看钩子）；否则把设备码/回调包装成异步步骤。
+        # 都没有的渠道 → exit（纯手填，直接进账号表单）。前端只认 steps 一种形态。
+        if has_step_hook:
+            result = await _invoke_begin_step_auth(provider_class, name, cfg, account, auth_context)
+            if result.get("exit"):
+                exit_step = True
+                result = {"mode": "steps", "exit": True,
+                          "account": result.get("account_data") or {}}
+            else:
+                expires_in = _apply_step_auth_state(state_data, result)
                 await _set_account_auth_state(state, state_data)
-                result = _shape_device_code_response(result, interval, completion)
+                result = _shape_step_auth_response(result)
                 logger.info(
-                    f"[admin] auth/start device_code (legacy probe) provider={name} state={state} "
-                    f"completion={completion} origin={auth_context['origin']} "
-                    f"interval={interval}s expires_in={expires_in}s"
+                    f"[admin] auth/start steps provider={name} state={state} "
+                    f"step={(result.get('step') or {}).get('id')!r} expires_in={expires_in}s"
                 )
+        elif mode == "device_code" and has_device_hook:
+            # 声明 mode=device_code：直接设备码，不撞 callback 的 501。
+            result = await _start_flow_as_step(
+                provider_class, name, cfg, account, auth_context, state, state_data, completion)
+        elif has_callback_hook:
+            # 回调式 OAuth 优先（保持存量「先试 callback」语义）；501 未实现才退设备码。
+            try:
+                result = await _start_flow_as_step(
+                    provider_class, name, cfg, account, auth_context, state, state_data,
+                    completion, redirect_uri=redirect_uri, prefer_callback=True)
+            except HTTPException as e:
+                if e.status_code != 501 or not has_device_hook:
+                    raise
+                result = await _start_flow_as_step(
+                    provider_class, name, cfg, account, auth_context, state, state_data, completion)
+        elif has_device_hook:
+            result = await _start_flow_as_step(
+                provider_class, name, cfg, account, auth_context, state, state_data, completion)
+        else:
+            # 无任何授权钩子：不需要步骤，直接进账号表单。
+            exit_step = True
+            result = {"mode": "steps", "exit": True, "account": {}}
+            logger.info(f"[admin] auth/start exit provider={name} state={state}（渠道无授权入口）")
     except HTTPException as e:
         await _del_account_auth_state(state)
         logger.warning(
@@ -4689,14 +5922,19 @@ async def start_provider_account_auth(name: str, data: dict, request: Request, t
         raise HTTPException(status_code=500, detail="渠道授权入口返回格式错误")
     await _log_operation(admin_token, "start_account_auth", "account", account.get("username") or name, None, {"provider": name, "state": state})
     payload = {"ok": True, "state": state, **result}
-    # redirect_uri 只对回调式授权有意义；device_code 模式不回传，避免前端误用。
-    if state_data.get("task_type") != "device_code":
-        payload["redirect_uri"] = redirect_uri
+    # exit：不需要步骤，直接进账号表单；删掉 state 行（无会话要保留）。
+    if exit_step:
+        await _del_account_auth_state(state)
     return payload
 
 
 @router.get("/providers/{name}/accounts/auth/callback", name="account_auth_callback")
 async def account_auth_callback(name: str, request: Request):
+    """渠道授权回调落账：校验 state → 交给渠道钩子处理 → 写入账号并返回结果页。
+
+    该端点被上游浏览器直接回调（无鉴权头），安全性由 state 会话校验保障；
+    授权成功后清理 state 行；失败时以 HTML 页回显原因。
+    """
     params = dict(request.query_params)
     state = (params.get("state") or "").strip()
     if not state:
@@ -4777,8 +6015,14 @@ async def _provider_declares_loopback(provider_class) -> bool:
 
 
 @loopback_router.get("/oauth/callback")
+@loopback_router.get("/auth/callback")
+@loopback_router.get("/authorize")
 async def oauth_loopback_callback(request: Request):
     """根级本机回调：上游只回调 127.0.0.1:{port}/oauth/callback 的桌面客户端型 OAuth。
+
+    ``/authorize`` 是 Trae（native_ide 授权流程）的固定回调路径——其授权页前端会校验
+    ``auth_callback_url`` 必须为 ``http://127.0.0.1:<port>/authorize``，路径不符时
+    GetPCAuthCode 报「网络错误」，所以这里与 ``/oauth/callback`` 共用同一段处理。
 
     上游回调不带我们的 state（它带的是自己那套 secret/redirect/code），所以这里按
     「枚举 pending 会话 → 渠道钩子认领」处理：只遍历 device_code + pending 且声明了
@@ -4832,7 +6076,7 @@ async def replay_provider_account_auth(name: str, data: dict, token: str = Heade
         await _log_operation(admin_token, "replay_account_auth", "account",
                              result.get("username") or name, None, {"provider": name})
         return {"ok": True, "status": "completed", "message": result["message"],
-                "username": result.get("username") or ""}
+                "username": result.get("username") or "", "account": result.get("account")}
     if kind == "redirect":
         # 第一阶段：secret 已回填，扫描器下一轮就会用新参数拿到凭证；无需用户再操作。
         return {"ok": True, "status": "pending",
@@ -4841,6 +6085,104 @@ async def replay_provider_account_auth(name: str, data: dict, token: str = Heade
         raise HTTPException(status_code=result.get("status_code", 400), detail=result["message"])
     raise HTTPException(status_code=400,
                         detail="没有渠道认领这条回调地址：可能授权会话已过期或地址不完整，请重新发起授权")
+
+
+@router.post("/providers/{name}/accounts/auth/step")
+async def submit_provider_account_auth_step(name: str, data: dict, request: Request, token: str = Header(None, alias="Authorization")):
+    """提交步骤认证（step auth）的一步输入。
+
+    与 device-code 不同，步骤认证是**同步交互**：前端每提交一步，服务端立刻调渠道的
+    ``submit_step_auth`` 执行该步动作，返回下一步（``next``）、原地提示（``pending``，
+    如「验证码已发送」）、完成（``authorized``）或失败（``error``）。
+
+    完成时复用 ``_finalize_authorized_auth``（唯一落库路径，幂等），add_method='steps'。
+    """
+    admin_token = await _require_admin(token)
+    state = str((data or {}).get("state") or "").strip()
+    step_id = str((data or {}).get("step_id") or "").strip()
+    values = (data or {}).get("values")
+    action = (data or {}).get("action")
+    if not state:
+        raise HTTPException(status_code=400, detail="缺少 state 参数")
+    if not step_id:
+        raise HTTPException(status_code=400, detail="缺少 step_id 参数")
+    if not isinstance(values, dict):
+        values = {}
+    action = str(action).strip() if action else None
+
+    state_data = await _get_account_auth_state(state)
+    if not state_data or state_data.get("provider") != name:
+        raise HTTPException(status_code=404, detail="授权状态已过期或不存在，请重新发起授权")
+    if state_data.get("task_type") != "steps":
+        raise HTTPException(status_code=400, detail="该授权会话不是步骤认证")
+    if state_data.get("completed"):
+        return {
+            "ok": True, "status": "completed",
+            "message": state_data.get("message", "步骤认证已完成"),
+            "account": state_data.get("account_data") or {},
+        }
+
+    cfg = await _read_provider_config(name)
+    provider_class = _get_provider_class(name, cfg)
+    account = dict(state_data.get("account") or {})
+    step_state = state_data.get("step_state") or {}
+    auth_context = _build_auth_context(request, data if isinstance(data, dict) else {}, name, state)
+
+    try:
+        result = await _invoke_submit_step_auth(
+            provider_class, name, cfg, account, step_id, values, step_state, action, auth_context)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[admin] auth/step 未预期异常 provider={name} state={state}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"提交步骤失败：{type(e).__name__}") from e
+
+    status = str(result.get("status") or "").strip().lower()
+    await _log_operation(admin_token, "submit_account_auth_step", "account",
+                         account.get("username") or name, None,
+                         {"provider": name, "state": state, "step_id": step_id, "status": status})
+
+    if status == "authorized":
+        # authorized 不落库：标记 completed，把 account_data 返回给前端回填表单，用户确认后手动保存
+        state_data["status"] = "completed"
+        state_data["account_data"] = _normalize_auth_account_data(result.get("account_data") or {})
+        await _set_account_auth_state(state, state_data)
+        logger.info(f"[admin] auth/step authorized provider={name} state={state} 返回 account_data 待前端回填")
+        return {
+            "ok": True, "status": "completed",
+            "message": "步骤认证完成，请核对下方表单后保存账号",
+            "account": state_data.get("account_data"),
+        }
+
+    if status == "error":
+        raise HTTPException(status_code=400, detail=result.get("error") or "步骤执行失败")
+
+    # next / pending：更新状态行；pending 不推进步骤，只带回提示。
+    if status == "next":
+        next_step = result.get("step")
+        if not isinstance(next_step, dict) or not next_step.get("id"):
+            raise HTTPException(status_code=500, detail="渠道返回 next 但未给出下一步 step 描述")
+        state_data["step"] = next_step
+        state_data["step_state"] = result.get("step_state") or step_state
+    state_data["status"] = "pending"
+    # 步骤推进后重算轮询字段：下一步若是异步步（带 poll + poll_params，如 autoclaw 的
+    # 短信/凭证补投步），必须写 next_poll_at 才会进扫描器与 loopback 认领列表——
+    # 否则用户粘验证码时「没有渠道认领这条回调地址」。
+    _apply_async_step_polling(state_data)
+    await _set_account_auth_state(state, state_data)
+    logger.info(f"[admin] auth/step provider={name} state={state} step_id={step_id} → {status}")
+    return {
+        "ok": True,
+        "status": status,
+        "state": state,
+        "step": state_data.get("step"),
+        "step_state": state_data.get("step_state"),
+        "message": result.get("message") or result.get("hint") or "",
+        # 补投框文案透传：loopback 渠道（autoclaw 等）在步骤里换「粘凭证/输验证码」提示
+        "replay_hint": result.get("replay_hint") or "",
+        "replay_label": result.get("replay_label") or "",
+        "polling_hint": result.get("polling_hint") or "",
+    }
 
 
 async def _process_loopback_params(params: dict, only_provider: str | None = None,
@@ -4920,20 +6262,18 @@ async def _process_loopback_params(params: dict, only_provider: str | None = Non
             return {"kind": "redirect", "redirect_url": redirect, "provider": provider_name}
 
         if status == "authorized":
-            # 第二阶段：渠道已用回调参数换到凭证，直接落库完成。
-            record["status"] = "authorized"
-            record["account_data"] = outcome.get("account_data") or {}
+            # 第二阶段：渠道已用回调参数换到凭证。统一模型下**不自动落库**——
+            # 标记 completed + 存 account_data，前端回填表单供用户确认保存。
+            record["status"] = "completed"
+            record["completed"] = True
+            record["account_data"] = _normalize_auth_account_data(outcome.get("account_data") or {})
             await _set_account_auth_state(state, record)
             display = _provider_display_name(provider_class, provider_name)
-            try:
-                account = await _finalize_authorized_auth(provider_name, state, record)
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"[admin] loopback finalize failed provider={provider_name} state={state}: {e}")
-                return {"kind": "error", "provider": display,
-                        "message": f"授权完成但写账号失败：{e}", "status_code": 500}
             return {"kind": "authorized", "provider": display,
-                    "message": "账号授权成功，已写入账号列表",
-                    "username": account.get("username") or ""}
+                    "message": "授权完成，请核对账号信息后保存",
+                    "username": (record["account_data"] or {}).get("username") or "",
+                    # 回传识别到的账号数据：前端拿它回填表单，用户确认后手动保存。
+                    "account": record["account_data"]}
 
         if status == "error":
             return {"kind": "error", "provider": _provider_display_name(provider_class, provider_name),
@@ -4974,11 +6314,15 @@ async def get_provider_account_auth_status(name: str, state: str, token: str = H
     task_status = state_data.get("status", "idle")
     result: dict = {"status": task_status, "state": state}
 
-    # callback 型完成（由 account_auth_callback 端点写入 completed）
+    # 完成态（扫描器/loopback/步骤 authorized 统一写 completed + account_data）
     if state_data.get("completed"):
+        # 统一模型下授权完成**不落库**，凭证在 account_data；state 里的 account 只是
+        # /auth/start 时落的请求表单（空壳、恒为真值 dict），放在前面会把凭证整个
+        # 遮住——codearts 等 steps/设备码渠道曾因此「显示授权已完成但字段全空」。
+        # account 只兜底存量 callback 落库行（旧 _finalize_authorized_auth 写的是 account）。
         return {
             "status": "completed",
-            "account": state_data.get("account"),
+            "account": state_data.get("account_data") or state_data.get("account") or {},
             "message": state_data.get("message", "授权已完成"),
         }
 
@@ -4990,20 +6334,25 @@ async def get_provider_account_auth_status(name: str, state: str, token: str = H
             created_at = state_data.get("created_at") or state_data.get("next_poll_at") or time.time()
             result["elapsed"] = int(time.time() - created_at)
         elif task_status == "authorized":
-            # 正常路径下扫描器已在 _poll_one_auth_task 里落库；这里只兜底处理
-            # 落库失败/旧数据残留的 authorized 行（幂等）。
-            logger.info(f"[admin] auth/status AUTHORIZED provider={name} state={state} 走兜底落库")
-            try:
-                account = await _finalize_authorized_auth(name, state, state_data)
-            except Exception as e:
-                logger.error(f"[admin] device-code auth 落库失败 provider={name} state={state}: {e}")
-                account = dict(state_data.get("account_data") or {})
-
+            # 统一模型：不再自动落库。旧数据残留的 authorized 行按「已完成待确认」处理，
+            # 把 account_data 回传前端回填表单。
+            logger.info(f"[admin] auth/status AUTHORIZED provider={name} state={state} 回传待确认")
             result["status"] = "completed"
-            result["account"] = account
-            result["message"] = "设备码授权成功"
+            result["account"] = dict(state_data.get("account_data") or {})
+            result["message"] = "授权完成，请核对账号信息后保存"
         elif task_status == "error":
             result["error"] = state_data.get("error", "授权失败")
+        elif task_status == "expired":
+            result["message"] = "授权已过期，请重新发起"
+
+    # steps 型：同步交互，不轮询。返回当前步骤，页面刷新后据此恢复 UI。
+    if state_data.get("task_type") == "steps":
+        result["step"] = state_data.get("step") or {}
+        result["step_state"] = state_data.get("step_state") or {}
+        if task_status == "pending":
+            result["message"] = state_data.get("message", "请继续完成当前步骤")
+        elif task_status == "error":
+            result["error"] = state_data.get("error", "步骤执行失败")
         elif task_status == "expired":
             result["message"] = "授权已过期，请重新发起"
 
@@ -5030,53 +6379,144 @@ async def cancel_provider_account_auth(name: str, state: str, token: str = Heade
     return {"ok": True}
 
 
+@router.post("/providers/{name}/accounts/auth/proxy")
+async def update_provider_account_auth_proxy(name: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """改进行中授权会话的**出口代理**（步骤认证/设备码都适用）。
+
+    为什么需要：新增账号的授权阶段账号表单是隐藏的（凭证永远最后一步回填），且有些上游
+    直连根本不通（国内连 chatgpt.com / 海外站点的短信接口）——必须能在授权途中现选代理。
+    会话的账号快照（``state_data["account"]``）是 ``/auth/start`` 时落的，不在这里更新，
+    后续每一 ``/auth/step``、扫描器轮询、loopback 认领就仍按旧代理（或直连）出站。
+
+    只改代理引用，不动其它账号字段；引用必须是代理池条目（id/名称/URL 任一形态）。
+    代理换了 → 按会话缓存的扫描器实例必须一起丢弃，否则它仍持旧 ``proxy_config_id``。
+    """
+    await _require_admin(token)
+    state = str((data or {}).get("state") or "").strip()
+    if not state:
+        raise HTTPException(status_code=400, detail="缺少 state 参数")
+    state_data = await _get_account_auth_state(state)
+    if not state_data or state_data.get("provider") != name:
+        raise HTTPException(status_code=404, detail="授权状态已过期或不存在，请重新发起授权")
+
+    proxies = _read_proxies()
+    account = dict(state_data.get("account") or {})
+    # proxy=None/"" = 显式改回直连；非空必须是代理池命中条目（命中后一律落成 proxy_id，
+    # 与账号持久化路径 _normalize_account_proxy_ref 同口径，避免 proxy/proxy_id 双写漂移）。
+    ref = (data or {}).get("proxy")
+    ref = str(ref).strip() if ref is not None else ""
+    if ref:
+        proxy = _find_proxy(proxies, ref)
+        if proxy is None:
+            raise HTTPException(status_code=400, detail=f"代理 {ref} 不在代理池中，请到代理池维护后重试")
+        account["proxy_id"] = proxy["id"]
+        account.pop("proxy", None)
+    else:
+        account.pop("proxy_id", None)
+        account.pop("proxy", None)
+    state_data["account"] = account
+    await _set_account_auth_state(state, state_data)
+
+    # 扫描器/loopback 用的 provider 实例按 (渠道, state) 缓存，构造时就把代理烧进去了。
+    _auth_scanner_instances.pop(f"{name}:{state}", None)
+    resolved = _resolve_account_proxy_config_id(account, proxies)
+    logger.info(f"[admin] auth/proxy provider={name} state={state} proxy_config_id={resolved or '(直连)'}")
+    return {"ok": True, "proxy_config_id": resolved, "proxy": _resolve_account_proxy(account, proxies)}
+
+
 @router.post("/providers/{name}/accounts/{username}/refresh-auth")
 async def refresh_provider_account_auth(name: str, username: str, token: str = Header(None, alias="Authorization")):
+    """手动刷新单账号 token（老端点保留；等价于执行 ``refresh_auth`` 账号动作）。"""
     admin_token = await _require_admin(token)
     cfg = await _read_provider_config(name)
-    accounts = cfg.get("accounts", [])
-    target_index = None
     target = None
-    for index, account in enumerate(accounts):
+    for account in cfg.get("accounts", []):
         if isinstance(account, dict) and account.get("username") == username:
-            target_index = index
             target = account
             break
-    if target_index is None or target is None:
+    if target is None:
         raise HTTPException(status_code=404, detail=f"账号 '{username}' 不存在")
-
-    pool = ModelClientPool.get_provider_pool(name)
-    provider = None
-    if pool:
-        for client in pool.clients:
-            if client.username == username:
-                provider = client.provider
-                break
-    if provider is None:
-        provider_class = _get_provider_class(name, cfg)
-        runtime_acc = dict(target)
-        runtime_acc["proxy"] = _resolve_account_proxy(target)
-        runtime_acc["url_prefix"] = _resolve_account_url_prefix(target)
-        extra = _provider_extra(name, cfg)
-        extra.update({k: v for k, v in runtime_acc.items() if k not in ("username", "password", "proxy", "url_prefix", "proxy_id", "switch")})
-        provider = provider_class(
-            username=runtime_acc.get("username", username),
-            password=runtime_acc.get("password", ""),
-            proxy=runtime_acc.get("proxy"),
-            url_prefix=runtime_acc.get("url_prefix"),
-            **extra,
-        )
-
-    updates = await provider.refresh_account_auth(dict(target), cfg)
-    if not isinstance(updates, dict):
-        raise HTTPException(status_code=500, detail="刷新授权返回格式错误")
-    merged = dict(target)
-    merged.update({k: v for k, v in updates.items() if v is not None})
-    merged = _normalize_account_proxy_ref(merged, _read_proxies())
-    await _persist_account(name, merged)
-    _reload_account_into_pool(name, merged, _provider_rpm(cfg), _provider_extra(name, cfg))
-    await _log_operation(admin_token, "refresh_account_auth", "account", username, {"provider": name, "account": target}, {"provider": name, "account": merged})
+    result = await _run_account_action_once(name, "refresh_auth", target, cfg)
+    if not result["ok"]:
+        raise HTTPException(status_code=result.get("status") or 500, detail=result.get("error") or "刷新授权失败")
+    merged = result["merged"]
+    await _log_operation(admin_token, "refresh_account_auth", "account", username,
+                        {"provider": name, "account": target}, {"provider": name, "account": merged})
     return {"ok": True, "username": merged.get("username", username)}
+
+
+@router.post("/providers/{name}/accounts/{username}/actions/{action_id}")
+async def run_provider_account_action(name: str, username: str, action_id: str,
+                                       token: str = Header(None, alias="Authorization")):
+    """手动执行单账号单动作（签到 / 同步额度 / 刷新授权…）。
+
+    ``action_id`` 必须在渠道动作清单 ``_account_actions_meta`` 里（spec 声明或自动合成的
+    refresh_auth）；执行失败按 spec 抛出的 ``HTTPException`` 状态码回传（refresh_auth 路径
+    禁用 401/403——避免触发前端登录态踢出，见 memory admin-refresh-no-401-403）。
+    """
+    admin_token = await _require_admin(token)
+    cfg = await _read_provider_config(name)
+    known = {m["id"] for m in _account_actions_meta(name, cfg)}
+    if action_id not in known:
+        raise HTTPException(status_code=404, detail=f"渠道 '{name}' 未声明动作 '{action_id}'")
+    target = None
+    for account in cfg.get("accounts", []):
+        if isinstance(account, dict) and account.get("username") == username:
+            target = account
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"账号 '{username}' 不存在")
+    result = await _run_account_action_once(name, action_id, target, cfg)
+    if not result["ok"]:
+        raise HTTPException(status_code=result.get("status") or 500,
+                            detail=result.get("error") or "动作执行失败")
+    await _log_operation(admin_token, f"account_action:{action_id}", "account", username,
+                        {"provider": name}, {"action_id": action_id})
+    return {"ok": True, "username": username, "action_id": action_id}
+
+
+@router.post("/providers/{name}/actions/{action_id}/run-all")
+async def run_provider_account_actions_all(name: str, action_id: str,
+                                            body: dict = Body(default_factory=dict),
+                                            token: str = Header(None, alias="Authorization")):
+    """批量执行某动作（异步入队，由账号动作 worker 串行消费，不阻塞调用方）。
+
+    ``body.accounts`` 可选：限定本轮要执行的账号范围（不传 = 该动作配置里的 accounts，
+    仍未配置 = 全部启用账号）。
+    """
+    admin_token = await _require_admin(token)
+    cfg = await _read_provider_config(name)
+    known = {m["id"] for m in _account_actions_meta(name, cfg)}
+    if action_id not in known:
+        raise HTTPException(status_code=404, detail=f"渠道 '{name}' 未声明动作 '{action_id}'")
+    if _account_action_queue is None or _account_action_pending is None:
+        raise HTTPException(status_code=503, detail="账号动作调度器未启动")
+    override = body if isinstance(body, dict) else {}
+    scope = override.get("accounts") if isinstance(override.get("accounts"), list) else None
+    pool = ModelClientPool.get_provider_pool(name)
+    enqueued = 0
+    skipped = 0
+    for acc in cfg.get("accounts") or []:
+        if not isinstance(acc, dict):
+            continue
+        uname = (acc.get("username") or "").strip()
+        if not uname or acc.get("switch") is False:
+            continue
+        if scope and uname not in scope:
+            continue
+        key = (name, uname, action_id)
+        if key in _account_action_pending:
+            skipped += 1
+            continue
+        _account_action_pending.add(key)
+        _account_action_queue.put_nowait({
+            "provider_name": name, "action_id": action_id,
+            "username": uname, "key": key, "pool": pool,
+        })
+        enqueued += 1
+    await _log_operation(admin_token, f"account_action:{action_id}", "provider", name,
+                        None, {"action_id": action_id, "enqueued": enqueued, "skipped": skipped})
+    return {"ok": True, "enqueued": enqueued, "skipped": skipped}
 
 
 @router.get("/providers/{name}/accounts")
@@ -5085,6 +6525,10 @@ async def get_provider_accounts(
     view: Literal["full", "lite", "copy"] = "full",
     token: str = Header(None, alias="Authorization"),
 ):
+    """获取渠道账号列表。
+
+    view=full 全字段；lite 精简（列表页）；copy 只返回可复制的形态（不含凭据）。
+    """
     await _require_admin(token)
     cfg = await _read_provider_config(name)
     if view == "lite":
@@ -5096,6 +6540,7 @@ async def get_provider_accounts(
 
 @router.get("/providers/{name}/accounts/duplicate-tokens")
 async def get_provider_duplicate_tokens(name: str, token: str = Header(None, alias="Authorization")):
+    """查该渠道内凭据重复的账号（同 token/密钥被多个账号占用）。"""
     await _require_admin(token)
     cfg = await _read_provider_config(name)
     duplicates = _find_duplicate_account_tokens(cfg.get("accounts", []))
@@ -5158,6 +6603,7 @@ def _apply_policy_to_runtime(provider_name: str, policy: dict):
 
 @router.get("/providers/{name}/limit-policy")
 async def get_provider_limit_policy(name: str, token: str = Header(None, alias="Authorization")):
+    """获取渠道生效的限流/冷却/冻结策略（回源刷新后读取）。"""
     await _require_admin(token)
     if not await _provider_config_exists(name):
         raise HTTPException(status_code=404, detail=f"provider '{name}' 不存在")
@@ -5166,6 +6612,11 @@ async def get_provider_limit_policy(name: str, token: str = Header(None, alias="
 
 @router.put("/providers/{name}/limit-policy")
 async def update_provider_limit_policy(name: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """更新渠道限流策略。
+
+    冷却/冻结策略先过校验（非法 400）再落库；随后清策略缓存、回源生效值并把
+    rpm/tpm/并发与到量冻结维度同步到运行池账号，使改动立即生效。
+    """
     await _require_admin(token)
     if not await _provider_config_exists(name):
         raise HTTPException(status_code=404, detail=f"provider '{name}' 不存在")
@@ -5193,6 +6644,7 @@ async def update_provider_limit_policy(name: str, data: dict, token: str = Heade
 
 @router.get("/config/providers/{name}")
 async def get_provider_raw_config(name: str, token: str = Header(None, alias="Authorization")):
+    """获取渠道原始配置（供编辑弹窗回填）。"""
     await _require_admin(token)
     return await _read_provider_base_config(name)
 
@@ -5452,6 +6904,8 @@ def _custom_provider_config_from_payload(data: dict) -> dict:
         "account_weight": data.get("account_weight", 0),
         "health_check": data.get("health_check", {"enabled": False, "interval_minutes": 30, "test_model": ""}),
         "scheduled_test": data.get("scheduled_test", {"enabled": False}),
+        # account_actions 不落库：调度配置由渠道代码（spec 的 account_actions[].default）定义，
+        # 供应商页只读展示 + 手动触发，不做用户覆盖。
         "chat_protocols": chat_protocols,
         "rate_limit": data.get("rate_limit", {"rpm_per_account": 0, "tpm_per_account": 0, "tpm_per_model": 0}),
         "billing_mode": (str(data.get("billing_mode") or "token").lower()) if str(data.get("billing_mode") or "").lower() in ("token", "request") else "token",
@@ -5471,12 +6925,16 @@ async def _fetch_unsaved_custom_provider_models(data: dict) -> list[dict]:
         raise HTTPException(status_code=400, detail="至少需要填写一个账号 API Key")
     acc = _runtime_accounts([accounts[0]])[0]
     extra = {k: v for k, v in _provider_extra(data.get("name") or "custom-preview", cfg).items() if k != "proxies"}
-    provider = CustomProvider(
-        username=acc.get("username") or "preview",
-        password=acc.get("password") or acc.get("api_key") or acc.get("key") or "",
-        proxy=acc.get("proxy"),
-        **extra,
-    )
+    # 代理三件套必须一起带上：出站路由只认 proxy_config_id，self.proxy 会被 ProxyManager
+    # facade 吞掉。少了它，向导里选了代理的账号拉模型也会静默直连（漏账号代理）。
+    extra.update({
+        "username": acc.get("username") or "preview",
+        "password": acc.get("password") or acc.get("api_key") or acc.get("key") or "",
+        "proxy": acc.get("proxy"),
+        "url_prefix": acc.get("url_prefix"),
+        "proxy_config_id": acc.get("proxy_config_id") or "",
+    })
+    provider = CustomProvider(**extra)
     models = await provider.fetch_upstream_model_list()
     if not models:
         fetch_err = getattr(provider, "_last_fetch_models_error", "") or ""
@@ -5489,6 +6947,7 @@ async def _fetch_unsaved_custom_provider_models(data: dict) -> list[dict]:
 
 @router.post("/custom-providers/detect")
 async def detect_custom_provider_input(data: dict, token: str = Header(None, alias="Authorization")):
+    """识别用户粘贴的渠道信息（地址/密钥等原始文本），返回推测的配置项。"""
     await _require_admin(token)
     return await _detect_quick_custom_provider(data.get("raw", ""))
 
@@ -5591,6 +7050,10 @@ async def _create_provider_from_config(
 
 @router.post("/custom-providers")
 async def create_custom_provider(data: dict, token: str = Header(None, alias="Authorization")):
+    """创建渠道（内置模板 / 自定义两条分支共用同一实现）。
+
+    非管理员也可创建：归属记为本人 user_id；管理员建 = NULL（对所有人可用）。
+    """
     user_id, is_admin = await _require_admin_or_user(token)
     return await _create_provider_from_config(
         data, token=token, is_admin=is_admin, user_id=user_id,
@@ -5599,6 +7062,11 @@ async def create_custom_provider(data: dict, token: str = Header(None, alias="Au
 
 @router.post("/custom-providers/upstream-models")
 async def preview_custom_provider_upstream_models(data: dict, token: str = Header(None, alias="Authorization")):
+    """预览未保存自定义渠道的上游模型列表（创建向导用，不落库）。
+
+    展示键（spec 顶层下划线键，如 _cost_multiplier）原样透传，供前端落库写进
+    extra_config 快照。
+    """
     await _require_admin(token)
     models = await _fetch_unsaved_custom_provider_models(data)
     upstream_models = []
@@ -5606,13 +7074,26 @@ async def preview_custom_provider_upstream_models(data: dict, token: str = Heade
         upstream_id = (model.get("id") or "").strip()
         if not upstream_id:
             continue
-        upstream_models.append({
+        # 积分倍率独立列：spec 顶层 _cost_multiplier 提为行顶层 cost_multiplier
+        # （非下划线键），前端按「上游声明才覆盖」落 provider_models.cost_multiplier。
+        # 取值口径与 rate_limiter.ModelClientPool._cost_multiplier_from_row 同一份定义。
+        preview_multiplier = ModelClientPool._cost_multiplier_from_row(model)
+        row = {
             "upstream_model_id": upstream_id,
+            "model_id": upstream_id,
             "name": model.get("name") or upstream_id,
-            "tracked": False,
-            "current_model_id": upstream_id,
+            # 展示键（spec 在模型条目顶层带的下划线键，如 _model_desc/_cost_multiplier）：
+            # 原样透传，前端落库写进 extra_config 快照，模型 tab「其他信息」列按
+            # account_schema.model_info_columns 声明取用。只放标量，与
+            # rate_limiter._build_upstream_model_rows 同一口径。
+            **{k: v for k, v in model.items()
+               if isinstance(k, str) and k.startswith("_")
+               and isinstance(v, (str, int, float, bool))},
             "raw": model.get("raw"),
-        })
+        }
+        if preview_multiplier is not None:
+            row["cost_multiplier"] = preview_multiplier
+        upstream_models.append(row)
     return {"ok": True, "provider": data.get("name") or "custom-preview", "upstream_models": upstream_models, "models": upstream_models}
 
 
@@ -5630,6 +7111,11 @@ def _channel_catalog_builtin_entries() -> list[dict]:
     from user_platform.marketplace.channel_catalog import _preset_from_config
     for name, info in _BUILTIN_PROVIDER_TYPES.items():
         cfg = _builtin_provider_default_config(name) or {}
+        preset = _preset_from_config(cfg)
+        # 地址自拼型内置渠道（cloudflare/edgeone-ai）：渠道级 base_url 本来就该留空，
+        # 地址由账号字段现拼。目录 preset 必须显式带豁免标记，否则向导第 2 步的
+        # 「供应商地址不能为空」硬校验会把这类渠道的新建路堵死（见 Channels.tsx）。
+        preset["requires_base_url"] = bool(getattr(_get_provider_class(name, cfg), "REQUIRES_BASE_URL", True))
         entries.append({
             "id": name,
             "name": str(info.get("remark") or name),
@@ -5637,13 +7123,14 @@ def _channel_catalog_builtin_entries() -> list[dict]:
             "category": "模型服务",
             "tags": [],
             "builtin_type": name,
-            "preset": _preset_from_config(cfg),
+            "preset": preset,
         })
     return entries
 
 
 @router.get("/channel-catalog")
 async def get_channel_catalog(token: str = Header(None, alias="Authorization")):
+    """获取统一加渠道目录（系统内置 + 市场/服务端条目）。"""
     await _require_admin(token)
     from user_platform.marketplace.channel_catalog import get_catalog
     return await get_catalog()
@@ -5651,6 +7138,7 @@ async def get_channel_catalog(token: str = Header(None, alias="Authorization")):
 
 @router.post("/channel-catalog/refresh")
 async def refresh_channel_catalog(token: str = Header(None, alias="Authorization")):
+    """刷新加渠道目录缓存（重新拉取市场渠道条目）。"""
     await _require_admin(token)
     from user_platform.marketplace.channel_catalog import refresh
     return await refresh()
@@ -5796,6 +7284,7 @@ async def list_builtin_providers(token: str = Header(None, alias="Authorization"
 
 @router.get("/custom-providers")
 async def list_custom_providers(token: str = Header(None, alias="Authorization")):
+    """列出自定义渠道（完整配置内联返回）。"""
     await _require_admin(token)
     providers_config = await config.Config.get_providers()
     return [
@@ -5854,6 +7343,11 @@ async def _init_and_check_provider_in_background(name: str, pool) -> None:
 
 @router.put("/providers/{name}/enabled")
 async def toggle_provider(name: str, enabled: bool, token: str = Header(None, alias="Authorization")):
+    """启用/停用渠道（热更新）。
+
+    只翻转启用状态，不重建运行池账号；从禁用改启用时后台先补 init_auth 再体检，
+    避免账号状态停在「待检查」。
+    """
     await _require_admin(token)
     cfg = await _read_provider_config(name)
     old_cfg = dict(cfg)
@@ -5912,11 +7406,15 @@ async def replace_provider_models_endpoint(name: str, data: dict, authorization:
         model_id = (item.get("model_id") or "").strip() or upstream_id
         # 行级启用开关：缺省视为启用（旧客户端不带该字段），显式 false 才停用。
         enabled = item.get("enabled")
+        # 积分倍率独立列：整覆盖语义，前端每行都带（没有 = 空 → 写 NULL）。
+        # 前端手填框清空同样走 null，不用 sentinel。
+        cost_multiplier = item.get("cost_multiplier")
         rows.append({
             "upstream_model_id": upstream_id,
             "model_id": model_id,
             "extra_config": item.get("extra_config") if isinstance(item.get("extra_config"), dict) else {},
             "enabled": True if enabled is None else bool(enabled),
+            "cost_multiplier": PostgresClient._coerce_cost_multiplier(cost_multiplier),
         })
     await PostgresClient.bulk_replace_provider_models(name, rows)
     await _reload_provider_models_local(name)
@@ -5927,9 +7425,10 @@ async def replace_provider_models_endpoint(name: str, data: dict, authorization:
 
 @router.post("/providers/{name}/models")
 async def upsert_provider_model_endpoint(name: str, data: dict, authorization: Optional[str] = Header(None)):
-    """新增或重命名单行。body: {upstream_model_id, model_id?, enabled?}
+    """新增或重命名单行。body: {upstream_model_id, model_id?, enabled?, extra_config?, cost_multiplier?}
 
     enabled 不传时沿用库内现状（新行默认启用）——定时同步/改名路径不该重置开关。
+    cost_multiplier 同理：不传 = 不动已有行的倍率；传 null = 显式清空（手填框清空）。
     """
     await _require_admin(authorization)
     upstream_id = (data.get("upstream_model_id") or "").strip()
@@ -5937,13 +7436,19 @@ async def upsert_provider_model_endpoint(name: str, data: dict, authorization: O
         raise HTTPException(status_code=400, detail="upstream_model_id 必填")
     model_id = (data.get("model_id") or "").strip() or upstream_id
     enabled = data.get("enabled")
+    kwargs = {}
+    if "cost_multiplier" in data:
+        kwargs["cost_multiplier"] = PostgresClient._coerce_cost_multiplier(data.get("cost_multiplier"))
+        kwargs["cost_multiplier_set"] = True
     await PostgresClient.upsert_provider_model(
         name,
         upstream_id,
         model_id,
         extra_config=data.get("extra_config") if isinstance(data.get("extra_config"), dict) else {},
         enabled=None if enabled is None else bool(enabled),
+        **kwargs,
     )
+    await PostgresClient.touch_provider_models_updated_at(name)
     await _reload_provider_models_local(name)
     await _log_operation(authorization, "upsert_provider_model", "provider", name, None, {"upstream_model_id": upstream_id, "model_id": model_id})
     return {"ok": True}
@@ -5951,8 +7456,12 @@ async def upsert_provider_model_endpoint(name: str, data: dict, authorization: O
 
 @router.delete("/providers/{name}/models/{upstream_model_id:path}")
 async def delete_provider_model_endpoint(name: str, upstream_model_id: str, authorization: Optional[str] = Header(None)):
+    """删除该渠道模型表中指定上游模型的一行。"""
     await _require_admin(authorization)
     ok = await PostgresClient.delete_provider_model(name, upstream_model_id)
+    if ok:
+        # 删除确实改动了模型行才记；删不存在的行不算修改。
+        await PostgresClient.touch_provider_models_updated_at(name)
     await _reload_provider_models_local(name)
     await _log_operation(authorization, "delete_provider_model", "provider", name, {"upstream_model_id": upstream_model_id}, None)
     return {"ok": ok}
@@ -5971,16 +7480,31 @@ async def refresh_provider_models(name: str, authorization: Optional[str] = Head
 
 
 @router.get("/providers/{name}/upstream-models")
-async def get_provider_upstream_models(name: str, authorization: Optional[str] = Header(None)):
+async def get_provider_upstream_models(name: str, account: Optional[str] = None, authorization: Optional[str] = Header(None)):
     """获取渠道上游全量模型列表，用于管理白名单。
 
-    每行同时返回 model_id（套改写规则后的短名）与 raw_model_id（原始上游名），
-    前端按开关在两者间切换显示，无需重新拉取上游。
+    每行同时返回 model_id（未套规则的短名）、regex_model_id（套规则后的名字）与
+    is_regex（规则是否命中），前端按开关在两者间切换显示，无需重新拉取上游。
+
+    ``account`` 非空 = 「重新获取」时复用上一次显示的那个账号，不轮换到别的号。
+    响应里的 ``account`` 是本次实际用的账号 username，``account_display`` 是其显示名
+    （备注 price_remark 优先，否则 username）。
     """
     await _require_admin(authorization)
     if not await _ensure_provider_runtime(name):
         raise HTTPException(status_code=404, detail=f"渠道 '{name}' 不存在")
-    return {"ok": True, **await ModelClientPool.fetch_provider_upstream_models(name)}
+    data = await ModelClientPool.fetch_provider_upstream_models(name, account or "")
+    username = str(data.get("account") or "").strip()
+    if username:
+        try:
+            cfg = await _read_provider_config(name)
+            data["account_display"] = _account_display_name(next(
+                (a for a in (cfg.get("accounts") or []) if isinstance(a, dict) and str(a.get("username") or "").strip() == username),
+                None,
+            )) or username
+        except Exception:
+            data["account_display"] = username
+    return {"ok": True, **data}
 
 
 @router.post("/providers/{name}/health-check")
@@ -6061,6 +7585,12 @@ async def fetch_models_endpoint(data: dict, token: str = Header(None, alias="Aut
 
 @router.put("/providers/{name}/custom")
 async def update_custom_provider_config(name: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """更新自定义渠道配置（窄写基础字段，热更新不重建账号池）。
+
+    各字段先过归一化校验（retry_count/tags/rewrite 规则等，非法 400）；account_actions
+    不接受写入；改 base_url/code 会触发渠道地址必填校验，改 code（代码渠道）走完整重载
+    换 Provider 类。保留 RPM/TPM 窗口、冷却等运行时状态。
+    """
     await _require_admin(token)
     try:
         cfg = await _read_provider_config(name)
@@ -6089,6 +7619,9 @@ async def update_custom_provider_config(name: str, data: dict, token: str = Head
             data["website_url"] = _normalize_provider_website_url(data.get("website_url"))
         if "icon" in data:
             data["icon"] = _normalize_provider_icon(data.get("icon"))
+        # account_actions 不接受写入：调度真相源是渠道源码（spec 的 account_actions[].default），
+        # 供应商页只读展示 + 手动触发；旧配置里可能残留的 cfg.account_actions 一并忽略。
+        data.pop("account_actions", None)
         for key in (
             "remark", "tags", "price_remark", "base_url", "models_path", "image_path", "video_path", "speech_path",
             "supports_image_generation", "supports_video_generation", "supports_tts",
@@ -6148,6 +7681,7 @@ async def update_custom_provider_config(name: str, data: dict, token: str = Head
 
 @router.put("/providers/{name}/accounts/add")
 async def add_account(name: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """为渠道新增账号（归一化代理引用后落库并热加载进运行池）。"""
     await _require_admin(token)
     cfg = await _read_provider_config(name)
     data.setdefault("switch", True)
@@ -6193,56 +7727,78 @@ def _demask_custom_account_credentials(provider_cls, acc: dict, data: dict, merg
 
 @router.put("/providers/{name}/accounts/{username}")
 async def update_account(name: str, username: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """更新渠道指定账号（窄写，详见 apply_account_update）。"""
     await _require_admin(token)
+    await apply_account_update(name, username, data, log_token=token)
+    return {"ok": True}
+
+
+# 账号更新的「凭据字段」集：这些字段前端编辑时通常不回传（空值要保留旧值），
+# 否则 OAuth/设备码/自动登录拿到的 token 会被一次表单提交清空。
+_ACCOUNT_SECRET_KEYS = {
+    "password",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "github_token",
+    "api_key",
+    "authorization",
+    "cookie",
+    "cookies",
+    "session",
+    "access_token_expires_at_ms",
+    "secure_1psid",
+    "secure_1psidts",
+}
+
+
+async def apply_account_update(name: str, username: str, data: dict, *, log_token: str | None = None) -> None:
+    """窄写一个账号：合并 secret 保留、消解陈旧遮蔽、落库 + 热加载池。
+
+    账号更新的唯一实现（REST ``PUT /providers/{name}/accounts/{username}`` 直接调它）。
+    账号不存在抛 HTTPException(404)。``log_token`` 非空时写操作审计。
+    """
     cfg = await _read_provider_config(name)
     proxy_was_explicitly_cleared = (
         ("proxy" in data or "proxy_id" in data)
         and not (data.get("proxy_id") or data.get("proxy") or "").strip()
     )
     data = _normalize_account_proxy_ref(data, _read_proxies())
-    secret_keys = {
-        "password",
-        "token",
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "github_token",
-        "api_key",
-        "authorization",
-        "cookie",
-        "cookies",
-        "session",
-        "access_token_expires_at_ms",
-        "secure_1psid",
-        "secure_1psidts",
-    }
-    for i, acc in enumerate(cfg.get("accounts", [])):
-        if acc.get("username") == username:
-            merged = dict(acc)
-            merged.update(data)
-            # 前端编辑账号时通常不会回传 password/token 等 secret 字段；
-            # 不能用表单数据整体替换账号，否则 OAuth/设备码授权得到的 token 会被清空。
-            for key in secret_keys:
-                if acc.get(key) not in (None, "") and data.get(key) in (None, ""):
-                    merged[key] = acc.get(key)
-            if proxy_was_explicitly_cleared:
-                merged.pop("proxy_id", None)
-                merged.pop("proxy", None)
-            # 自定义系渠道：消解 DB 里的陈旧 api_key/key 遮蔽，避免重启后 password 被覆盖。
-            _demask_custom_account_credentials(_get_provider_class(name, cfg), acc, data, merged)
-            # 改名：先删旧账号行（DB + 内存 + 广播），再写新账号行。
-            if merged.get("username") != username:
-                await _remove_account_row(name, username)
-                _remove_account_from_pool(name, username)
-            await _persist_account(name, merged)
-            _reload_account_into_pool(name, merged, _provider_rpm(cfg), _provider_extra(name, cfg))
-            await _log_operation(token, "update_account", "account", username, _scrub_relay_secret(dict(acc)), _scrub_relay_secret(dict(merged)))
-            return {"ok": True}
+    for acc in cfg.get("accounts", []):
+        if acc.get("username") != username:
+            continue
+        merged = dict(acc)
+        merged.update(data)
+        # 前端编辑账号时通常不会回传 password/token 等 secret 字段；
+        # 不能用表单数据整体替换账号，否则 OAuth/设备码授权得到的 token 会被清空。
+        for key in _ACCOUNT_SECRET_KEYS:
+            if acc.get(key) not in (None, "") and data.get(key) in (None, ""):
+                merged[key] = acc.get(key)
+        if proxy_was_explicitly_cleared:
+            merged.pop("proxy_id", None)
+            merged.pop("proxy", None)
+        # 自定义系渠道：消解 DB 里的陈旧 api_key/key 遮蔽，避免重启后 password 被覆盖。
+        _demask_custom_account_credentials(_get_provider_class(name, cfg), acc, data, merged)
+        # 改名：先删旧账号行（DB + 内存 + 广播），再写新账号行。
+        if merged.get("username") != username:
+            await _remove_account_row(name, username)
+            _remove_account_from_pool(name, username)
+        await _persist_account(name, merged)
+        _reload_account_into_pool(name, merged, _provider_rpm(cfg), _provider_extra(name, cfg))
+        if log_token:
+            await _log_operation(log_token, "update_account", "account", username,
+                                 _scrub_relay_secret(dict(acc)), _scrub_relay_secret(dict(merged)))
+        return
     raise HTTPException(status_code=404, detail=f"账号 '{username}' 不存在")
 
 
 @router.delete("/providers/{name}/accounts/{username}")
 async def delete_account(name: str, username: str, token: str = Header(None, alias="Authorization")):
+    """删除渠道指定账号。
+
+    删除前落备份（账号 + 当时完整渠道配置）供误删恢复；同步清理路由引用并移出运行池。
+    """
     await _require_admin(token)
     cfg = await _read_provider_config(name)
     accounts = cfg.get("accounts", [])
@@ -6265,6 +7821,7 @@ async def delete_account(name: str, username: str, token: str = Header(None, ali
 
 @router.put("/providers/{name}/accounts/{username}/switch")
 async def toggle_account_switch(name: str, username: str, switch: bool, token: str = Header(None, alias="Authorization")):
+    """启用/停用账号的发送门禁（switch 只挡正式发送，不删运行时账号）。"""
     await _require_admin(token)
     cfg = await _read_provider_config(name)
     found = None
@@ -6944,6 +8501,10 @@ def _build_test_dispatch_input(
     # headers：模拟客户端时用该客户端的真实头（含 User-Agent + session 头），
     # 服务端 _detect_client_type 据 User-Agent 探测出 client_type。通用测试用空头。
     headers = dict(CustomProvider.CLIENT_PRESETS.get(preset_key, {})) if preset_key else {}
+    # opencode 的会话头是每请求现造的（不在 CLIENT_PRESETS 常量里），这里补上，
+    # 否则模拟请求会缺掉真实客户端必带的 x-session-affinity / x-session-id。
+    if preset_key in ("opencode", "opencode-cli"):
+        headers = CustomProvider._opencode_headers(headers, {})
 
     # extra_kwargs：只带协议行（自定义渠道按所选协议选的 chat_protocols 行），不带 client_preset。
     extra_kwargs: dict = {}
@@ -7243,6 +8804,11 @@ def _build_client_sim_body(preset_key: str, model: str, stream: bool, data: dict
 
 @router.post("/providers/{name}/accounts/test")
 async def test_provider_accounts(name: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """手动测试渠道账号（与定时检测共用同一实现）。
+
+    data：username（str 单选 / list 多选 / 留空=全部）、model、test_type、client_type、
+    protocol。手动测试失败不冻结、不影响健康度；成功解除冻结但不改变 switch/enabled。
+    """
     await _require_admin(token)
     # main -> admin 是启动期导入，反向引用统一入口必须延迟导入，避免模块加载期循环依赖。
     # _detect_client_type：与真实端点同源地从测试请求 headers/body 探测 client_type，
@@ -7973,18 +9539,21 @@ _OAUTH_DEPRECATED_DETAIL = "该接口已废弃，请使用 /providers/{name}/acc
 
 @router.post("/providers/{name}/oauth/start")
 async def start_oauth_device_flow(name: str, token: str = Header(None, alias="Authorization")):
+    """已废弃（410）：旧设备码授权起点，请改用 accounts/auth/start。"""
     await _require_admin(token)
     raise HTTPException(status_code=410, detail=_OAUTH_DEPRECATED_DETAIL)
 
 
 @router.get("/providers/{name}/oauth/status")
 async def get_oauth_status(name: str, token: str = Header(None, alias="Authorization")):
+    """已废弃（410）：旧设备码授权状态查询，请改用 accounts/auth/status。"""
     await _require_admin(token)
     raise HTTPException(status_code=410, detail=_OAUTH_DEPRECATED_DETAIL)
 
 
 @router.post("/providers/{name}/oauth/cancel")
 async def cancel_oauth_device_flow(name: str, token: str = Header(None, alias="Authorization")):
+    """已废弃（410）：旧设备码授权取消，请改用 accounts/auth/cancel。"""
     await _require_admin(token)
     raise HTTPException(status_code=410, detail=_OAUTH_DEPRECATED_DETAIL)
 
@@ -7996,6 +9565,11 @@ async def cancel_oauth_device_flow(name: str, token: str = Header(None, alias="A
 
 @router.get("/config/proxies")
 async def get_proxies(token: str = Header(None, alias="Authorization")):
+    """获取代理池。
+
+    管理员返回全量（运行时选路靠它）；非管理员只返回自己建的条目
+    （url/密码不外泄，管理员建的对其不可见）。
+    """
     user_id, is_admin = await _require_admin_or_user(token)
     # 全量读（_read_proxies 不过滤，运行时选路靠它）；非管理员按归属过滤，
     # 管理员建的条目对非管理员不可见（url/密码不外泄）。
@@ -8067,6 +9641,7 @@ async def update_proxies(data: list[dict], token: str = Header(None, alias="Auth
 
 @router.get("/global-config/run-mode")
 async def get_global_run_mode_config(token: str = Header(None, alias="Authorization")):
+    """获取全局运行模式（debug 开关）。"""
     await _require_admin(token)
     cfg = _read_json(CONFIG_FILE)
     return {"debug": bool((cfg.get("system") or {}).get("debug", False))}
@@ -8074,6 +9649,7 @@ async def get_global_run_mode_config(token: str = Header(None, alias="Authorizat
 
 @router.put("/global-config/run-mode")
 async def update_global_run_mode_config(data: dict, token: str = Header(None, alias="Authorization")):
+    """更新全局运行模式（debug 必须是 boolean）。"""
     await _require_admin(token)
     if not isinstance(data, dict) or not isinstance(data.get("debug"), bool):
         raise HTTPException(status_code=400, detail="debug 必须是 boolean")
@@ -8083,6 +9659,7 @@ async def update_global_run_mode_config(data: dict, token: str = Header(None, al
 
 @router.get("/global-config/proxy-pool")
 async def get_global_proxy_pool_config(token: str = Header(None, alias="Authorization")):
+    """获取全局代理池配置（非管理员只返回自己建的条目）。"""
     user_id, is_admin = await _require_admin_or_user(token)
     proxies = _normalize_proxies(_read_json(CONFIG_FILE).get("proxies", []))
     if not is_admin:
@@ -8092,12 +9669,18 @@ async def get_global_proxy_pool_config(token: str = Header(None, alias="Authoriz
 
 @router.put("/global-config/proxy-pool")
 async def update_global_proxy_pool_config(data: list[dict], token: str = Header(None, alias="Authorization")):
+    """更新全局代理池配置（转发到代理池更新，返回精简结果）。"""
     result = await update_proxies(data, token=token)
     return {"ok": result.get("ok", True), "count": result.get("count", 0)}
 
 
 @router.get("/global-config/channels")
 async def get_global_channels_config(token: str = Header(None, alias="Authorization")):
+    """获取「渠道运行」Tab 聚合配置。
+
+    各段缺失时回填后端默认值（不可重试规则/输出拦截规则/账号测试类型/限流开关/
+    消息切分阈值等），并附带定时检测全局参数、默认冻结策略与模板库。
+    """
     await _require_admin(token)
     cfg = _strip_bootstrap_config(_read_json(CONFIG_FILE))
     retry = dict(cfg.get("retry") or {})
@@ -8112,6 +9695,13 @@ async def get_global_channels_config(token: str = Header(None, alias="Authorizat
     rate_limit = dict(cfg.get("rate_limit") or {})
     if "allow_token_reservation_overflow" not in rate_limit:
         rate_limit["allow_token_reservation_overflow"] = config.DEFAULT_ALLOW_TOKEN_RESERVATION_OVERFLOW
+    # 超长单条消息切分：全局默认（部分第三方上游对单条另设 ~40000 token 上限，
+    # 超限即 400 "Message N content exceeds maximum length"）。渠道级可覆盖。
+    message_split = dict(cfg.get("message_split") or {})
+    if "enabled" not in message_split:
+        message_split["enabled"] = config.DEFAULT_MESSAGE_SPLIT_ENABLED
+    if "max_tokens" not in message_split:
+        message_split["max_tokens"] = config.DEFAULT_MESSAGE_SPLIT_MAX_TOKENS
     return {
         "scheduled": {"model_refresh": dict(cfg.get("model_refresh") or {}), "message_delete": dict(cfg.get("message_delete") or {})},
         "scheduled_test": {
@@ -8121,6 +9711,7 @@ async def get_global_channels_config(token: str = Header(None, alias="Authorizat
         "retry": retry,
         "stream": dict(cfg.get("stream") or {}),
         "rate_limit": rate_limit,
+        "message_split": message_split,
         "default_freeze_policy": get_default_freeze_policy(),
         "account_test": account_test,
         "header_templates": await PostgresClient.get_header_templates(),
@@ -8130,6 +9721,12 @@ async def get_global_channels_config(token: str = Header(None, alias="Authorizat
 
 @router.put("/global-config/channels")
 async def update_global_channels_config(data: dict, token: str = Header(None, alias="Authorization")):
+    """更新「渠道运行」Tab 聚合配置（各段窄写，互不覆盖）。
+
+    scheduled/scheduled_test/retry/stream/rate_limit/message_split/account_test/
+    default_freeze_policy 按段合并写入；header_templates 与 model_rule_templates
+    落 PG 并广播运行时同步。写库后热加载 Config 让开关立即进入热路径。
+    """
     await _require_admin(token)
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="渠道配置必须是对象")
@@ -8185,6 +9782,21 @@ async def update_global_channels_config(data: dict, token: str = Header(None, al
                 cfg[key] = dict(cfg.get(key) or {}) | data[key]
     if isinstance(data.get("account_test"), dict) and "types" in data["account_test"]:
         cfg.setdefault("account_test", {})["types"] = _clean_test_types(data["account_test"]["types"])
+    # 超长单条消息切分：只写这两个键，未提供则保持原值（与其它 Tab 的「窄写」语义一致）。
+    if isinstance(data.get("message_split"), dict):
+        raw = data["message_split"]
+        existing = dict(cfg.get("message_split") or {})
+        if "enabled" in raw:
+            existing["enabled"] = raw["enabled"] is not False
+        if "max_tokens" in raw:
+            try:
+                value = int(raw["max_tokens"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="单条消息切分阈值必须是正整数")
+            if value <= 0:
+                raise HTTPException(status_code=400, detail="单条消息切分阈值必须大于 0")
+            existing["max_tokens"] = value
+        cfg["message_split"] = existing
     # 新增渠道默认冻结策略：只作为创建渠道时的快照来源，改这里不动任何已建渠道。
     if isinstance(data.get("default_freeze_policy"), dict):
         try:
@@ -8209,6 +9821,7 @@ async def update_global_channels_config(data: dict, token: str = Header(None, al
 
 @router.get("/global-config/models")
 async def get_global_models_config(token: str = Header(None, alias="Authorization")):
+    """获取「模型」Tab 聚合配置：tokenizer 策略/词表检查、上下文识别、推理思考与 owned_by 列表。"""
     await _require_admin(token)
     tokenizer = _read_json(CONFIG_FILE).get("tokenizer") or {}
     thinking = await get_thinking_global_config(token=token)
@@ -8239,6 +9852,12 @@ async def get_global_models_config(token: str = Header(None, alias="Authorizatio
 
 @router.put("/global-config/models")
 async def update_global_models_config(data: dict, token: str = Header(None, alias="Authorization")):
+    """更新「模型」Tab 配置。
+
+    接受 context_detection_enabled（热路径开关，立即热加载）、tokenizer_vocab
+    词表检查参数、thinking 全局配置；tokenizer_rules 与 default_metadata 已废弃，
+    随整包 PUT 携带时直接忽略。
+    """
     await _require_admin(token)
     # tokenizer_rules 已不可编辑：忽略旧前端整包 PUT 里可能携带的字段，不写回主配置。
     if "context_detection_enabled" in data:
@@ -8294,6 +9913,10 @@ async def query_notifications(
     q: str = "",
     token: str = Header(None, alias="Authorization"),
 ):
+    """分页查询平台通知。
+
+    支持 status/severity/kind/event_type/关键词过滤；账号名就地覆盖为备注显示名。
+    """
     await _require_admin(token)
     page = max(1, int(page or 1))
     page_size = max(1, min(int(page_size or 20), 100))
@@ -8308,8 +9931,11 @@ async def query_notifications(
         "q": q,
     }
     data = await PostgresClient.query_notifications(filters, page_size, offset)
+    rows = data.get("rows") or []
+    # 账号名就地覆盖为备注（显示名），前端按原字段渲染（同请求日志口径）。
+    await _attach_provider_remark(rows)
     return {
-        "items": data.get("rows") or [],
+        "items": rows,
         "total": data.get("total") or 0,
         "page": page,
         "page_size": page_size,
@@ -8319,12 +9945,16 @@ async def query_notifications(
 
 @router.get("/notifications/summary")
 async def get_notifications_summary(token: str = Header(None, alias="Authorization")):
+    """获取平台通知汇总（计数与最近条目）。"""
     await _require_admin(token)
-    return await PostgresClient.notification_summary()
+    summary = await PostgresClient.notification_summary()
+    await _attach_provider_remark(summary.get("latest") or [])
+    return summary
 
 
 @router.put("/notifications/read-all")
 async def mark_all_notifications_read(token: str = Header(None, alias="Authorization")):
+    """把全部平台通知标记为已读。"""
     await _require_admin(token)
     updated = await PostgresClient.mark_all_notifications_read()
     return {"ok": True, "updated": updated}
@@ -8346,6 +9976,7 @@ async def list_notify_event_types(token: str = Header(None, alias="Authorization
 
 @router.get("/notifications/subscription-rules")
 async def list_notify_subscription_rules(token: str = Header(None, alias="Authorization")):
+    """获取平台级通知订阅规则列表。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     rows = await notify_service.list_rules(_PLATFORM_OWNER_ID, owner_type="platform")
@@ -8354,6 +9985,7 @@ async def list_notify_subscription_rules(token: str = Header(None, alias="Author
 
 @router.post("/notifications/subscription-rules")
 async def create_notify_subscription_rule(data: dict, token: str = Header(None, alias="Authorization")):
+    """新建平台级通知订阅规则（订阅事件或通知渠道无效时 400）。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     row = await notify_service.create_rule(_PLATFORM_OWNER_ID, data, owner_type="platform")
@@ -8365,6 +9997,7 @@ async def create_notify_subscription_rule(data: dict, token: str = Header(None, 
 
 @router.put("/notifications/subscription-rules/{rule_id}")
 async def update_notify_subscription_rule(rule_id: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """更新平台级通知订阅规则。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     ok = await notify_service.update_rule(_PLATFORM_OWNER_ID, rule_id, data, owner_type="platform")
@@ -8376,6 +10009,7 @@ async def update_notify_subscription_rule(rule_id: str, data: dict, token: str =
 
 @router.delete("/notifications/subscription-rules/{rule_id}")
 async def delete_notify_subscription_rule(rule_id: str, token: str = Header(None, alias="Authorization")):
+    """删除平台级通知订阅规则。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     ok = await notify_service.delete_rule(_PLATFORM_OWNER_ID, rule_id, owner_type="platform")
@@ -8387,6 +10021,7 @@ async def delete_notify_subscription_rule(rule_id: str, token: str = Header(None
 
 @router.get("/notifications/events")
 async def list_notify_events_admin(token: str = Header(None, alias="Authorization")):
+    """获取平台级通知事件列表。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     return {"items": await notify_service.list_events(_PLATFORM_OWNER_ID, owner_type="platform")}
@@ -8394,6 +10029,7 @@ async def list_notify_events_admin(token: str = Header(None, alias="Authorizatio
 
 @router.post("/notifications/events")
 async def create_notify_event_admin(data: dict, token: str = Header(None, alias="Authorization")):
+    """新建平台级通知事件（事件类型或参数无效时 400）。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     row = await notify_service.create_event(_PLATFORM_OWNER_ID, data, owner_type="platform")
@@ -8405,6 +10041,7 @@ async def create_notify_event_admin(data: dict, token: str = Header(None, alias=
 
 @router.put("/notifications/events/{event_id}")
 async def update_notify_event_admin(event_id: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """更新平台级通知事件。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     ok = await notify_service.update_event(_PLATFORM_OWNER_ID, event_id, data, owner_type="platform")
@@ -8416,6 +10053,7 @@ async def update_notify_event_admin(event_id: str, data: dict, token: str = Head
 
 @router.delete("/notifications/events/{event_id}")
 async def delete_notify_event_admin(event_id: str, token: str = Header(None, alias="Authorization")):
+    """删除平台级通知事件。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     ok = await notify_service.delete_event(_PLATFORM_OWNER_ID, event_id, owner_type="platform")
@@ -8435,6 +10073,7 @@ async def list_notify_channels_admin(token: str = Header(None, alias="Authorizat
 
 @router.post("/notifications/channels")
 async def create_notify_channel_admin(data: dict, token: str = Header(None, alias="Authorization")):
+    """新建平台级通知出站渠道。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     try:
@@ -8447,6 +10086,7 @@ async def create_notify_channel_admin(data: dict, token: str = Header(None, alia
 
 @router.put("/notifications/channels/{channel_id}")
 async def update_notify_channel_admin(channel_id: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """更新平台级通知出站渠道。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     ok = await notify_service.update_channel(_PLATFORM_OWNER_ID, channel_id, data, owner_type="platform")
@@ -8458,6 +10098,7 @@ async def update_notify_channel_admin(channel_id: str, data: dict, token: str = 
 
 @router.delete("/notifications/channels/{channel_id}")
 async def delete_notify_channel_admin(channel_id: str, token: str = Header(None, alias="Authorization")):
+    """删除平台级通知出站渠道。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     ok = await notify_service.delete_channel(_PLATFORM_OWNER_ID, channel_id, owner_type="platform")
@@ -8469,6 +10110,7 @@ async def delete_notify_channel_admin(channel_id: str, token: str = Header(None,
 
 @router.post("/notifications/channels/{channel_id}/test")
 async def test_notify_channel_admin(channel_id: str, token: str = Header(None, alias="Authorization")):
+    """向指定出站渠道发送一条测试消息。"""
     await _require_admin(token)
     from user_platform.notify_service import notify_service
     result = await notify_service.test_channel(_PLATFORM_OWNER_ID, channel_id, owner_type="platform")
@@ -8521,15 +10163,18 @@ async def clear_all_notifications(token: str = Header(None, alias="Authorization
 
 @router.get("/notifications/{notification_id}")
 async def get_notification_detail(notification_id: int, token: str = Header(None, alias="Authorization")):
+    """获取单条平台通知详情（账号名就地覆盖为备注显示名）。"""
     await _require_admin(token)
     row = await PostgresClient.get_notification_detail(notification_id)
     if not row:
         raise HTTPException(status_code=404, detail="通知不存在")
+    await _attach_provider_remark([row])
     return row
 
 
 @router.put("/notifications/{notification_id}/read")
 async def mark_notification_read(notification_id: int, token: str = Header(None, alias="Authorization")):
+    """把单条平台通知标记为已读。"""
     await _require_admin(token)
     ok = await PostgresClient.mark_notification_read(notification_id)
     if not ok:
@@ -8539,6 +10184,7 @@ async def mark_notification_read(notification_id: int, token: str = Header(None,
 
 @router.delete("/notifications/{notification_id}")
 async def delete_notification(notification_id: int, token: str = Header(None, alias="Authorization")):
+    """删除单条平台通知。"""
     await _require_admin(token)
     ok = await PostgresClient.delete_notification(notification_id)
     if not ok:
@@ -8557,6 +10203,7 @@ async def admin_list_agent_conversations(
     limit: int = 20,
     token: str = Header(None, alias="Authorization"),
 ):
+    """管理端游标分页列出 Agent 对话（数据在 ClickHouse，未启用时 503）。"""
     await _require_admin(token)
     from agent import conversation_store
     if not conversation_store.is_ready():
@@ -8572,6 +10219,7 @@ async def admin_list_chat_conversations(
     limit: int = 20,
     token: str = Header(None, alias="Authorization"),
 ):
+    """管理端游标分页列出聊天对话（数据在 ClickHouse，未启用时 503）。"""
     await _require_admin(token)
     from agent import conversation_store
     if not conversation_store.is_ready():
@@ -8598,7 +10246,7 @@ async def admin_get_agent_conversation(
     conv = await conversation_store.get_conversation(conv_id)
     if conv is None or conv.get("status") == "deleted":
         raise HTTPException(status_code=404, detail="对话不存在")
-    messages = await conversation_store.get_messages(conv_id)
+    messages = await conversation_store.get_messages(conv_id, timeline=True)
     return {"conversation": conv, "messages": messages}
 
 
@@ -8615,7 +10263,7 @@ async def admin_get_chat_conversation(
     conv = await conversation_store.get_conversation(conv_id)
     if conv is None or conv.get("status") == "deleted":
         raise HTTPException(status_code=404, detail="对话不存在")
-    messages = await conversation_store.get_messages(conv_id)
+    messages = await conversation_store.get_messages(conv_id, timeline=True)
     return {"conversation": conv, "messages": messages}
 
 
@@ -8623,17 +10271,63 @@ async def admin_get_chat_conversation(
 
 @router.get("/recent-logs")
 async def get_recent_logs(limit: int = 50, token: str = Header(None, alias="Authorization")):
+    """获取最近的请求日志（上限 500 条）。"""
     await _require_admin(token)
     logs = await PostgresClient.recent_logs(min(limit, 500))
     return logs
 
 
-async def _attach_provider_remark(rows: list[dict]) -> None:
-    """给请求日志行附带 provider_remark（渠道备注/显示名）。
+def _account_display_name(acc: dict) -> str:
+    """账号显示名：写了备注（price_remark）取备注，否则取原 username。"""
+    if not isinstance(acc, dict):
+        return ""
+    remark = str(acc.get("price_remark") or "").strip()
+    if remark:
+        return remark
+    return str(acc.get("username") or "").strip()
 
-    请求日志页只展示渠道名，不再前端拉全量渠道列表做 id→remark 反查；remark 由这里
-    从配置内存快照补到每行。渠道已删除（快照里没有）时留空，前端回落到 provider_name
-    （即渠道 id）。一次调用只读一次 get_providers()，列表/详情均 O(行数)。
+
+def _account_remark_map(cfg: dict) -> dict[str, str]:
+    """渠道配置 → {username: price_remark}（只收录有备注的账号）。"""
+    out: dict[str, str] = {}
+    for acc in ((cfg or {}).get("accounts") or []):
+        if not isinstance(acc, dict):
+            continue
+        username = str(acc.get("username") or "").strip()
+        remark = str(acc.get("price_remark") or "").strip()
+        if username and remark:
+            out[username] = remark
+    return out
+
+
+async def _account_display_map(provider_name: str = "") -> dict[str, str]:
+    """{username: price_remark} 全局映射（只含有备注的账号），供账号维度榜覆盖显示名。
+
+    限定渠道时只查该渠道；不限定则扫全平台（同名账号首命中）。读内存快照，不查库。
+    """
+    try:
+        provider_configs = await config.Config.get_providers() or {}
+    except Exception:
+        return {}
+    if not isinstance(provider_configs, dict):
+        return {}
+    names = [provider_name] if provider_name else list(provider_configs.keys())
+    out: dict[str, str] = {}
+    for name in names:
+        for username, remark in _account_remark_map(provider_configs.get(name)).items():
+            out.setdefault(username, remark)
+    return out
+
+
+async def _attach_provider_remark(rows: list[dict]) -> None:
+    """给请求日志/通知行补渠道备注，并把账号名就地改写为账号备注（显示名）。
+
+    - ``provider_remark``：渠道备注/显示名。渠道已删除（快照里没有）时留空，前端回落到
+      provider_name（即渠道 id）；请求日志页只展示渠道名，不再前端拉全量渠道列表反查。
+    - ``account_username``：**就地覆盖**为账号备注（price_remark），账号无备注时保留原
+      username。前端按原字段直接渲染，不做回落判断。
+
+    一次调用只读一次 get_providers()，按渠道懒建 {username: price_remark} 映射，O(行数)。
     """
     if not rows:
         return
@@ -8641,6 +10335,7 @@ async def _attach_provider_remark(rows: list[dict]) -> None:
         provider_configs = await config.Config.get_providers() or {}
     except Exception:
         provider_configs = {}
+    remark_map_cache: dict[str, dict[str, str]] = {}
     for row in rows:
         name = row.get("provider_name")
         if not name:
@@ -8648,6 +10343,14 @@ async def _attach_provider_remark(rows: list[dict]) -> None:
         cfg = provider_configs.get(name) if isinstance(provider_configs, dict) else None
         remark = ((cfg or {}).get("remark") or "")
         row["provider_remark"] = remark.strip() if isinstance(remark, str) else ""
+        username = row.get("account_username")
+        if not username:
+            continue
+        if name not in remark_map_cache:
+            remark_map_cache[name] = _account_remark_map(cfg)
+        display = remark_map_cache[name].get(str(username).strip())
+        if display:
+            row["account_username"] = display
 
 
 @router.get("/request-logs")
@@ -8670,6 +10373,11 @@ async def query_request_logs(
     offset: int = 0,
     token: str = Header(None, alias="Authorization"),
 ):
+    """分页查询请求日志（多维度过滤，结果补渠道备注）。
+
+    source 字段保留向后兼容，实际只查实时主表（日志归档已下线）。返回行内账号名
+    就地覆盖为账号备注显示名。
+    """
     t0 = time.perf_counter()
     await _require_admin(token)
     t1 = time.perf_counter()
@@ -8719,6 +10427,7 @@ async def query_request_logs(
 
 @router.get("/request-logs/{log_id}")
 async def get_request_log_detail(log_id: int, token: str = Header(None, alias="Authorization")):
+    """获取单条请求日志详情，并附同 request_id 的兄弟 attempts（一次性补备注）。"""
     await _require_admin(token)
     row = await PostgresClient.get_request_log_detail(log_id)
     if not row:
@@ -8747,9 +10456,14 @@ async def get_dashboard_stats(
     end_time: Optional[float] = None,
     token: str = Header(None, alias="Authorization"),
 ):
+    """获取看板统计：按多维度过滤的时段总量与各维度占比榜。
+
+    榜单内账号维度的 name 就地改写为账号备注显示名（无备注保留原值）。
+    """
     await _require_admin(token)
-    return await PostgresClient.dashboard_stats({
-        "provider_name": provider_name or provider,
+    resolved_provider = provider_name or provider
+    result = await PostgresClient.dashboard_stats({
+        "provider_name": resolved_provider,
         "account_username": account_username or account,
         "api_key_name": api_key_name or api_key,
         "model": model,
@@ -8758,12 +10472,25 @@ async def get_dashboard_stats(
         "start_time": start_time if start_time is not None else start,
         "end_time": end_time if end_time is not None else end,
     })
+    # 账号维度占比榜的 name 是聚合后的 account_username（多为随机串），就地改写为账号
+    # 备注显示名（无备注保留原值），前端环形图 hover 直接渲染 name、不做回落判断。
+    rankings = result.get("rankings") if isinstance(result, dict) else None
+    if isinstance(rankings, dict):
+        display_map = await _account_display_map(resolved_provider)
+        if display_map:
+            for key in ("account_usage_top", "account_requests_top"):
+                for row in rankings.get(key) or []:
+                    display = display_map.get(str(row.get("name") or "").strip())
+                    if display:
+                        row["name"] = display
+    return result
 
 
 # ==================== 统计 ====================
 
 @router.get("/stats")
 async def get_stats(include_token_stats: bool = False, token: str = Header(None, alias="Authorization")):
+    """获取平台概览统计：各渠道账号/认证/冻结计数、模型数与总成功请求数。"""
     await _require_admin(token)
     now = time.time()
     provider_list = []
@@ -8806,6 +10533,8 @@ _METADATA_FIELDS = (
     "capabilities", "icon_url",
     # real 行的按模型渠道标签过滤（写入 model_groups 顶层列，不进 metadata JSONB）。
     "provider_whitelist", "provider_blacklist",
+    # 压缩模型候选列表（同样写入 model_groups 顶层列，不进 metadata JSONB）。
+    "compress_models",
 )
 
 
@@ -8817,7 +10546,7 @@ def _clean_metadata_payload(data: dict) -> dict:
         value = data[key]
         if value is None:
             continue
-        if key in ("provider_whitelist", "provider_blacklist"):
+        if key in ("provider_whitelist", "provider_blacklist", "compress_models"):
             # 与模型组渠道过滤同规则：仅去空白 + 去重，不按存在性丢弃（运行时现取现判）。
             if not isinstance(value, list):
                 raise HTTPException(status_code=400, detail=f"{key} 必须是数组")
@@ -8872,6 +10601,7 @@ def _model_market_payload(metadata_payload: dict) -> dict:
 
 @router.get("/model-metadata")
 async def list_model_metadata(token: str = Header(None, alias="Authorization")):
+    """列出模型元数据，并附运行时路由快照（哪些模型有哪些渠道路由）。"""
     await _require_admin(token)
     payload = await _mm.list_metadata_from_db_async()
     return _model_market_payload(payload)
@@ -8918,12 +10648,14 @@ def _normalize_header_templates(templates: list) -> list[dict]:
 
 @router.get("/header-templates")
 async def list_header_templates(token: str = Header(None, alias="Authorization")):
+    """获取 Header 模板列表。"""
     await _require_admin(token)
     return {"templates": await PostgresClient.get_header_templates()}
 
 
 @router.put("/header-templates")
 async def update_header_templates(payload: dict, token: str = Header(None, alias="Authorization")):
+    """更新 Header 模板列表（校验后落库并广播运行时同步）。"""
     await _require_admin(token)
     templates = _normalize_header_templates(payload.get("templates") if isinstance(payload, dict) else payload)
     saved = await PostgresClient.set_header_templates(templates)
@@ -8974,12 +10706,14 @@ def _normalize_model_rule_templates(templates: list) -> list[dict]:
 
 @router.get("/model-rule-templates")
 async def list_model_rule_templates(token: str = Header(None, alias="Authorization")):
+    """获取模型规则模版列表。"""
     await _require_admin(token)
     return {"templates": await PostgresClient.get_model_rule_templates()}
 
 
 @router.put("/model-rule-templates")
 async def update_model_rule_templates(payload: dict, token: str = Header(None, alias="Authorization")):
+    """更新模型规则模版列表（校验后落库并广播运行时同步）。"""
     await _require_admin(token)
     templates = _normalize_model_rule_templates(payload.get("templates") if isinstance(payload, dict) else payload)
     saved = await PostgresClient.set_model_rule_templates(templates)
@@ -9217,8 +10951,49 @@ async def sync_from_llm_metadata(data: dict, token: str = Header(None, alias="Au
     return {"ok": True, "imported": imported, "results": results}
 
 
+@router.get("/model-metadata/auto-import")
+async def get_model_metadata_auto_import(token: str = Header(None, alias="Authorization")):
+    """自动导入状态：开关/间隔/渠道上游兜底 + 最近一次执行结果。"""
+    await _require_admin(token)
+    import model_metadata_auto_import as _auto
+
+    return {"ok": True, **_auto.public_state()}
+
+
+@router.put("/model-metadata/auto-import")
+async def update_model_metadata_auto_import(data: dict, token: str = Header(None, alias="Authorization")):
+    """自动导入配置：enabled / interval_minutes / include_channels（部分更新）。"""
+    await _require_admin(token)
+    import model_metadata_auto_import as _auto
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是对象")
+    merged = await _auto.update_config(data)
+    await _log_operation(token, "update_model_metadata_auto_import", "model_metadata", "auto-import", None, merged)
+    return {"ok": True, **merged}
+
+
+@router.post("/model-metadata/auto-import/run")
+async def run_model_metadata_auto_import(token: str = Header(None, alias="Authorization")):
+    """立即执行一次自动导入（不受开关限制）。
+
+    后台起任务执行、请求立即返回；前端轮询 GET 看 ``running``/``phase``/``last_result``。
+    已在执行时复用当前执行，不重复起。
+    """
+    await _require_admin(token)
+    import model_metadata_auto_import as _auto
+
+    result = _auto.trigger_background_run()
+    await _log_operation(
+        token, "run_model_metadata_auto_import", "model_metadata", "auto-import",
+        None, {"accepted": result.get("accepted")},
+    )
+    return result
+
+
 @router.put("/model-metadata/{model_id}")
 async def upsert_model_metadata_entry(model_id: str, data: dict, token: str = Header(None, alias="Authorization")):
+    """新增/更新单个模型的元数据（只收白名单字段，写后刷新运行时元数据快照）。"""
     await _require_admin(token)
     model_id = model_id.strip()
     if not model_id:
@@ -9297,6 +11072,7 @@ async def update_real_model_routing(model_id: str, data: dict, token: str = Head
 
 @router.delete("/model-metadata/{model_id}")
 async def delete_model_metadata_entry(model_id: str, token: str = Header(None, alias="Authorization")):
+    """删除单个模型的元数据。"""
     await _require_admin(token)
     ok = await _mm.delete_metadata_async(model_id)
     if not ok:
@@ -9613,3 +11389,131 @@ async def test_security_rules(data: dict, token: str = Header(None, alias="Autho
             })
 
     return {"ok": True, "matches": matches}
+
+
+# ── 浏览器代理 Profile 管理（docs/browser-proxy-design.md 出版面）────────────
+# 管理端是「改出网路径」的两大入口之一（另一个是 popup）；Agent 只有只读工具。
+
+@router.get("/browser-proxy/status")
+async def admin_browser_proxy_status(token: str = Header(None, alias="Authorization")):
+    """全部已连代理通道的浏览器当前出网状态（内存态，只读）。"""
+    await _require_admin(token)
+    from mcp_runtime.sse_gateway import list_proxy_status
+    return {"items": list_proxy_status()}
+
+
+@router.get("/browser-proxy/{client_id}/profiles")
+async def admin_browser_proxy_list(client_id: str, token: str = Header(None, alias="Authorization")):
+    """某浏览器的 Profile 列表（服务端真相源）。"""
+    await _require_admin(token)
+    from mcp_builtin import browser_proxy
+    try:
+        return {"client_id": client_id, "profiles": await browser_proxy.list_profiles(client_id)}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+
+@router.post("/browser-proxy/{client_id}/profiles")
+async def admin_browser_proxy_save(client_id: str, profile: dict, token: str = Header(None, alias="Authorization")):
+    """新增/更新一个 Profile。profile.id 必填。保存后同步下行给扩展。"""
+    await _require_admin(token)
+    from mcp_builtin import browser_proxy
+    from mcp_runtime.sse_gateway import push_proxy_sync_profiles
+    try:
+        saved = await browser_proxy.upsert_profile(client_id, profile)
+        # 管理端改动 → 下行全量同步，扩展覆盖本地镜像。
+        await push_proxy_sync_profiles(client_id, await browser_proxy.list_profiles(client_id))
+        return {"ok": True, "profile": saved}
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+
+@router.delete("/browser-proxy/{client_id}/profiles/{profile_id}")
+async def admin_browser_proxy_delete(client_id: str, profile_id: str, token: str = Header(None, alias="Authorization")):
+    """删除某浏览器的一个代理 Profile，并在删除成功后下行全量同步给扩展。"""
+    await _require_admin(token)
+    from mcp_builtin import browser_proxy
+    from mcp_runtime.sse_gateway import push_proxy_sync_profiles
+    deleted = await browser_proxy.delete_profile(client_id, profile_id)
+    if deleted:
+        await push_proxy_sync_profiles(client_id, await browser_proxy.list_profiles(client_id))
+    return {"ok": deleted}
+
+
+@router.post("/browser-proxy/{client_id}/activate/{profile_id}")
+async def admin_browser_proxy_activate(client_id: str, profile_id: str, body: dict = Body(default={}),
+                                       token: str = Header(None, alias="Authorization")):
+    """激活某 Profile：下发完整定义给扩展（实际 chrome.proxy 生效由扩展做）。
+
+    body 可选 leaseMs（管理端下发必带 TTL，默认 30min，上限 24h）。
+    """
+    await _require_admin(token)
+    from mcp_builtin import browser_proxy
+    try:
+        result = await browser_proxy.activate_profile(client_id, profile_id, lease_ms=int(body.get("leaseMs") or 0))
+        return result
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(exc), "delivered": False})
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc), "delivered": False})
+
+
+@router.post("/browser-proxy/{client_id}/restore")
+async def admin_browser_proxy_restore(client_id: str, token: str = Header(None, alias="Authorization")):
+    """还原出网路径。"""
+    await _require_admin(token)
+    from mcp_builtin import browser_proxy
+    return await browser_proxy.restore_proxy(client_id)
+
+
+@router.get("/browser-proxy/{client_id}/import-sources")
+async def admin_browser_proxy_import_sources(client_id: str, token: str = Header(None, alias="Authorization")):
+    """「从另一个浏览器导入」第一步：列出**同 owner 域**内其它浏览器的 Profile。
+
+    跨浏览器读的授权边界：只列该 client 所属 owner 名下的其它 cdp_client，
+    绝不跨 owner 读（否则 admin 能拿任意用户的配置）。
+    """
+    await _require_admin(token)
+    import mcp_plugin_store
+    from mcp_builtin import browser_proxy
+
+    owner = await mcp_plugin_store.get_cdp_client_owner_user_id(client_id)
+    ids = await browser_proxy.list_owner_client_ids(owner) if owner else []
+    ids = [c for c in ids if str(c) != str(client_id)]
+    grouped = await browser_proxy.list_profiles_for_client_ids(ids)
+    return {
+        "client_id": client_id,
+        "owner_user_id": owner or "",
+        "sources": [
+            {"client_id": c, "profiles": grouped.get(c, [])}
+            for c in ids
+        ],
+    }
+
+
+@router.post("/browser-proxy/{client_id}/import")
+async def admin_browser_proxy_import(client_id: str, body: dict = Body(default={}),
+                                     token: str = Header(None, alias="Authorization")):
+    """「从另一个浏览器导入」第二步：把勾选的 Profile 复制到目标 client。
+
+    body: { source_client_id, profile_ids: [...] }。source 必须在同 owner 域内。
+    """
+    await _require_admin(token)
+    import mcp_plugin_store
+    from mcp_builtin import browser_proxy
+
+    source = str(body.get("source_client_id") or "")
+    profile_ids = [str(p) for p in (body.get("profile_ids") or [])]
+    if not source or not profile_ids:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "缺少 source_client_id / profile_ids"})
+    owner = await mcp_plugin_store.get_cdp_client_owner_user_id(client_id)
+    allowed = set(await browser_proxy.list_owner_client_ids(owner)) if owner else set()
+    if source not in allowed:
+        return JSONResponse(status_code=403, content={"ok": False, "error": "源浏览器不在同一 owner 域内"})
+    try:
+        result = await browser_proxy.import_profiles(client_id, profile_ids, source_client_id=source)
+        return {"ok": True, **result}
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})

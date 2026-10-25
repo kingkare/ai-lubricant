@@ -370,8 +370,8 @@ def test_rate_limit_response_failed_surfaces_real_error(outbound):
     """上游回 responses response.failed(error 嵌在 response.error)。
 
     修复前：responses/anthropic/gemini 路径当成正常空完成吞掉；openai 路径误判
-    空响应。四条路径都未暴露「并发超限」。修复后必须抛 HTTPException，429 +
-    原始 message，让上层换账号重试/冻结正确触发。
+    空响应。四条路径都未暴露「并发超限」。修复后必须抛 HTTPException（原始 message
+    不丢），让上层换账号重试正确触发。
     """
     provider = _make_provider(RateLimitFailedProvider, outbound)
     with pytest.raises(HTTPException) as exc_info:
@@ -382,10 +382,12 @@ def test_rate_limit_response_failed_surfaces_real_error(outbound):
                 pass
         asyncio.run(run())
 
-    assert exc_info.value.status_code == 429, (outbound, exc_info.value.status_code)
+    # code "rate_limit_exceeded" 是字符串业务码（供应商没映射 HTTP 状态）→ 统一 400：
+    # 不命中冻结规则（不冻号）、classify_failure 判 retryable → 换候选，候选耗尽由
+    # 终端出口统一 429 retry_exhausted。provider 层不再自己伪造 429。
+    assert exc_info.value.status_code == 400, (outbound, exc_info.value.status_code)
     detail = str(exc_info.value.detail)
     assert "Concurrency limit exceeded" in detail, (outbound, detail)
-    assert "rate_limit_exceeded" in detail or "Concurrency limit" in detail, (outbound, detail)
 
 
 def test_responses_top_level_error_still_raises():
@@ -400,7 +402,8 @@ def test_responses_top_level_error_still_raises():
                 pass
         asyncio.run(run())
 
-    assert exc_info.value.status_code == 429, exc_info.value.status_code
+    # 同上：字符串业务码未映射 → 400（原始 message 保留）。
+    assert exc_info.value.status_code == 400, exc_info.value.status_code
     assert "Concurrency limit exceeded" in str(exc_info.value.detail)
 
 

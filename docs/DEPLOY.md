@@ -292,6 +292,54 @@ docker run --rm -p 7860:7860 \
 - **中间件来源**：PG 16 走 PGDG apt 源、Redis 走 Debian apt（`native_deps.binaries.ensure_dep` 先 `which` 命中系统二进制，跳过 `native_deps` 的下载路径——其 Linux PG 二进制 URL 上游已 404、Redis 默认是源码 tarball）。构建期跑一次 `provision` 完成 initdb + 写 `.env`，容器启动不再下载。若坚持用自备二进制，设 `NATIVE_*_DOWNLOAD_URL` + `SHA256`。
 - **资源**：单容器内 PG + Redis + 3 个 Python 进程共用内存；16G 档充裕（PG `shared_buffers=128MB`、Redis `noeviction`+`save ""`、ClickHouse 默认关）。2 vCPU 下首次构建较慢属正常。
 
+### 形态 H：把节点跑在创空间里（ModelScope Studio）
+
+形态 G 是「把**服务端**放进创空间」；形态 H 是「把**节点**放进创空间」——平台托管的容器当执行节点的宿主机。两者互不依赖，可只用其一。
+
+入口：管理端「节点」页 → 执行节点 → 待审批行的**部署到创空间**按钮。填创空间仓库地址 + ModelScope 访问令牌即可，**全程无需去 ModelScope 网页操作**：服务端会自动建创空间（若不存在）、推 `Dockerfile`/`start.sh`/`health.js`/`README.md`、把凭据写成创空间环境变量、再调 OpenAPI 触发上线。
+
+驱动这一切的是 ModelScope 官方 OpenAPI：
+
+- **spec**：`https://www.modelscope.cn/.well-known/openapi.json`（OpenAPI 3.1.1）
+- **base**：`https://modelscope.cn/openapi/v1`
+- **认证**：`Authorization: Bearer <ModelScope API Token>`（访问令牌，`个人中心 → 访问令牌`）
+- **客户端**：`user_platform/studio_api.py`
+
+> ⚠ **前缀别搞混**：站点前端用的是 `/api/v1/...`，那套**只认浏览器会话 Cookie**，带令牌调永远返回 `user not logged in`。对外 OpenAPI 是 `/openapi/v1/...`，返回 `InvalidAuthentication: invalid token` 才说明「认令牌、但令牌不对」。两者信封也不同：前者 `{Code, Message}`，后者 `{success, code, message}`。
+
+用到的端点：
+
+| 端点 | 用途 |
+| --- | --- |
+| `POST /studios` | 自动建创空间（`sdk_type=docker`、`visibility=private`） |
+| `POST /studios/{owner}/{repo}/deploy` | 上线 / 重新上线 / 唤醒（可重复调） |
+| `POST /studios/{owner}/{repo}/stop` | 停止（释放算力） |
+| `GET /studios/{owner}/{repo}` | 详情，含 `runtime.status` 与 `host` |
+| `GET /studios/{owner}/{repo}/logs/{type}` | 构建/运行日志（排障） |
+| `POST/PUT /studios/{owner}/{repo}/variables` | 写环境变量（凭据的落点） |
+
+平台硬约束（来自 ModelScope 官方文档，决定了实现形状）：
+
+| 约束 | 应对 |
+| --- | --- |
+| 容器**必须**监听 `0.0.0.0:7860`，端口写死不可改；8080 被平台占用 | 镜像里另起 `health.js` 占住 7860（节点本体只拨出、不监听），同时把它做成**节点状态页** |
+| `/mnt/workspace` 是唯一持久卷，**构建期不可用** | runtime（189MB）烘进镜像层 `/opt/agent-compose/state`；会话工作树落 `/mnt/workspace/work` |
+| 环境变量**运行时**注入，构建期不支持 | 凭据走 OpenAPI 的 `variables` 接口写入，`start.sh` 只读环境变量并**缺则报错退出** |
+| 容器内**无 docker.sock** | 只能做 execution 节点；management 角色拉不起子节点 |
+| `RunningInContainer()` 为真 | 自升级（换二进制）与 `env_mode=system` 被自动拒绝，属预期 |
+| 免费档闲置**会休眠** | 后台循环查 `runtime.status`，只在 `Sleeping`/`Stopped` 时调 `deploy` 唤醒（`Building`/`Deploying` 时按兵不动，避免叠加构建） |
+
+要点：
+
+- **基础镜像 `node:20-slim`**：`agent-compose-runtime` 的 `package.json` 要求 `node >= 20`，Ubuntu 22.04 自带的 nodejs 是 12，装不上。
+- **发行产物地址烘进 `ARG` 默认值**：创空间按仓库构建，**不能传 `--build-arg`**，默认值必须自足。地址来自 release catalog 的当前登记版本（与 docker 形态的 install.sh 同源）。
+- **必须预置 runtime + 编辑器 CLI**：审批门禁要求节点注册时上报 `runtime_version` 与至少一个编辑器，而 runtime 平时靠审批后的 `RuntimeUpgrade` 推送——不预置就死锁。
+- **凭据不落仓库**：节点 secret 经 `variables` 写进创空间环境变量，仓库文件里没有任何密钥 → 仓库可公开，轮换凭据不必重新部署。账本 `mc_studio_deployments` 另存一份封存的凭据（入驻时下发的只在 Redis 活 30 分钟，过期后「重新部署」就拿不到）。
+- **启动方式显示为「创空间」**：节点带 `AGENT_COMPOSE_STARTUP_METHOD=studio` 启动，经 capability label 上报，前端 `STARTUP_METHOD_LABEL` 映射。**不走 protobuf 枚举**（加枚举要重新生成 pb2）。
+- **服务端需要 `git`**：根 `Dockerfile` 已 `apt-get install git`；裸跑形态请自行安装。
+- **构建期走国内源**：创空间构建机恒在阿里云国内，`Dockerfile` 默认把 apt 指到 `mirrors.aliyun.com`、npm 指到 `registry.npmmirror.com`（`STUDIO_APT_MIRROR` / `STUDIO_NPM_REGISTRY` 可覆盖为空以走官方源）。
+- **服务端地址**：节点拨号地址在**入驻时**填一次（入驻弹窗的「服务端地址」，默认预填当前主机 + 控制面端口 8003），创空间侧只读展示。公网创空间必须用公网可达地址，否则节点永远连不上——地址是内网段时部署响应会带 warning。
+
 ## 前端产物
 
 数据服务启动时查找 `user-frontend/dist/index.html` 作为用户门户与管理端共用 SPA（挂 `/admin-static`，API 前缀走后端、其余回退 index.html）。没有构建产物时根路径只返回前端构建提示，API 仍可正常运行。

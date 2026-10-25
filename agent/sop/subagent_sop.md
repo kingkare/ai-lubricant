@@ -2,60 +2,91 @@
 
 ## When to delegate
 
-Use a subagent for an independent investigation, a focused verification pass, or a parallel map step over separate files. Do not delegate a tiny edit whose context setup costs more than the work.
+Use `spawn_subagent` for an independent investigation, a focused verification pass, or a
+parallel slice over separate inputs. Do not delegate a tiny edit whose context setup costs
+more than the work, and do not parallelise one coherent task into sub-checks (that is one
+job in several costumes).
 
 **Delegation is omission control, not throughput.** Assume one capable executor can handle
-long files and coherent multi-file edits. Size is not a reason to fan out. Fan out only when
-something would otherwise be *missed*:
+long files and coherent multi-file edits. Fan out only when something would otherwise be
+*missed*. Read `memory/sop/subagent_sop.md` (this file) before the first delegation.
 
-- **Unknown list** — the set of items isn't known yet, so split by genuinely different
-  evidence sources (read the code / run it / check logs / search the web) to surface what a
-  single pass would skip.
-- **Known list** — the items are known, independent and each is agent-sized, so assign
-  ownership and nothing gets forgotten.
+## What a sub-agent is (one-shot, foreground, fresh)
 
-Do **not** parallelise coherent execution. If the work is clear, bounded and interdependent,
-one executor keeps it consistent; splitting it produces seams someone has to sew back up.
+`spawn_subagent(task="...", model="optional")` starts a **fresh** child agent and waits for
+its final answer:
 
-**Fake parallelism to avoid:** splitting one method into sub-checklists. "Check the API",
-"check parity", "check side effects" all read the same files the same way and return
-overlapping findings — that's one job in three costumes. Open a lane only when its *evidence
-source* differs.
+- **Fresh context.** The child does not see this conversation — give it a self-contained
+  task (the goal, the constraints, and absolute file paths). Do not paste the transcript.
+- **Inherits your tools, scene and capability boundaries.** The child shares your bound
+  browser/MCP services and your workspace rules. Its `capability_call` reaches exactly
+  what yours can reach.
+- **Cannot delegate further.** The child's registry does not register `spawn_subagent` or
+  `start_long_term_update`. If it needs either, it reports the need in its result; the
+  parent decides whether to spawn another child or distil memory.
+- **Approval flows through you.** The child's `code_run` and out-of-bounds writes route
+  through your conversation's approval flow: in **auto** mode they are auto-approved; in
+  **interact** mode an approval card surfaces in your stream and the child blocks until it
+  resolves. `ask_user` in the child ends the child's run with a question; you receive it
+  as the result — answer it yourself, or surface it to the human.
 
-**Depth vs width.** Width finds independent items. Depth is for when the next search depends
-on the last one's result: find → dedupe/rank → verify or refute → hunt residuals, until dry.
-A batch of results that needs cross-comparison before the next step is a barrier; if each
-item can proceed alone, don't impose one.
+## When NOT to delegate
 
-**Adversarial verification.** For anything important, tell the verifier to *refute* the
-result, not to confirm it. A verifier asked to agree will agree.
+- A single, coherent multi-file edit: one executor keeps it consistent.
+- A task whose result you could produce faster by `file_read` + one tool call.
+- "Check the API / check parity / check side effects" on the same files — that is one job.
+- Anything where the child would need to see this conversation to make sense.
 
-**Real execution, not smoke tests.** "It imports" is not "it works". Find the existing
-tests, demo scripts or CLI entry points and run the relevant ones; if none cover the change,
-build a minimal test that actually exercises it. Record the exact command and its output.
-Never report pass for behaviour that was not run — mark it blocked, say why, and say what
-would unblock it.
+## The task you pass
 
-**Make your bounds visible.** If you sampled, took the top N, time-boxed, skipped retries or
-excluded a subsystem, say so in the result. A silent bound reads as full coverage.
+Write the task as a self-contained brief:
 
-**Don't repeat a failed prompt unchanged.** Read the failure, then retry with narrower
-scope, a longer timeout, a different tool, or a different decomposition.
+1. The goal in one or two sentences.
+2. The constraints it must respect (a governing SOP path to `file_read` first; a format it
+   must produce; files it must not touch).
+3. Absolute paths for any files it must read or write.
+4. The verification you expect (a command to run, a screenshot to take, a check to perform).
 
-## Isolation and communication
+The child cannot see this conversation, so anything you do not put in the task, it does not
+know. Long context belongs as a file path, not pasted into the task.
 
-`spawn_subagent_async` creates a GenericAgent with an isolated conversation/context and the parent's effective LLM binding. The parent receives `subagent_*` SSE events. A subagent does not silently mutate the parent's working anchor; return conclusions explicitly.
+## Receiving the result
 
-For parent↔child coordination, use the `agent_subagent_messages` mailbox through the platform's subagent messaging path. Include the objective, allowed files, expected output and verification evidence in the task.
+The tool returns the child's final text as `result`. Two terminal shapes:
+
+- `status: "ok"` — the child finished. Read `result`; if it reports something worth
+  remembering, call `start_long_term_update` yourself (the child cannot).
+- `status: "needs_input"` — the child ended on `ask_user`. The question is in `result`.
+  Answer it yourself and continue (you may spawn a new child with the answer), or surface
+  it to the human via your own `ask_user`.
+
+## Stopping a child
+
+A child runs as a foreground coroutine inside this agent's process; the runtime publishes
+its events to `subagent/<child_id>` on the realtime WS as well as to this conversation's
+stream. To stop a runaway child, send `kill` on the `subagent` channel (target = the
+`subagent_id` the tool returned). The child's `asyncio.Task` is cancelled; any in-flight
+approval/question card it raised is cleared. Cancelling a child does not cancel this agent.
+
+## Depth
+
+A child cannot spawn its own children. If a piece of work needs further delegation, the
+child reports it; the parent spawns the next child. There is no recursion and no depth
+counter — the registry-level disable is the boundary.
 
 ## Map-Reduce
 
-1. **Map** — delegate independent slices (one file, provider, or test dimension per child).
-2. **Reduce** — collect child summaries and evidence in the parent; reconcile conflicts before editing.
-3. **Verify** — delegate a fresh reviewer that did not perform the changes to return PASS / FAIL / PARTIAL.
+1. **Map** — spawn one child per independent slice (one file, provider, or dimension per
+   child). Spawn them in one assistant message when independent.
+2. **Reduce** — collect each child's `result`; reconcile conflicts before editing.
+3. **Verify** — spawn a fresh reviewer that did not perform the changes to return
+   PASS / FAIL / PARTIAL.
 
 Parallel children must not edit the same file. The parent owns integration and final writes.
 
 ## Safety
 
-Children inherit the same approval, workspace and MCP boundaries. Do not use delegation to bypass user confirmation or execute unapproved code. If a child is blocked, report the blocker and escalate with `ask_user`.
+Children inherit your approval, workspace and MCP boundaries. Do not use delegation to
+bypass user confirmation: the child's `code_run` still surfaces a card in your stream in
+interact mode. If a child is blocked, it reports the blocker in its result; escalate with
+`ask_user` if needed.

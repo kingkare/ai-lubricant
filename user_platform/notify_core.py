@@ -24,10 +24,14 @@ scan (or the 30s top-up sweep), never lost. A CAS ``pending → pushing`` update
 on consume makes a row safe to enqueue more than once (restart re-scan, top-up
 sweep, in-memory queue) — only one consumer pushes.
 
-Storage is raw SQL over ``db.PostgresClient.pool`` (not Tortoise): this process
-and the node-server process both init ``PostgresClient`` but register different
-Tortoise models, so raw SQL is what lets one dispatcher serve both — same
-reasoning as :mod:`notify_dispatch`.
+Storage split: the **enqueue** side (:func:`emit_notification` writing an
+``mc_notify_outbox`` row) goes over the Tortoise ``user_platform`` connection so
+any process that init'd it — the main service **and** the standalone
+tunnel_server — can emit. The **delivery** side (worker: ``_consume_one`` /
+``_drain_pending`` / :mod:`notify_dispatch`) keeps raw SQL over
+``db.PostgresClient.pool``: it only ever runs in the main service (the worker is
+started from ``main.py``), and node-server enqueues through its own
+``shared_store`` rather than importing this module.
 """
 from __future__ import annotations
 
@@ -78,6 +82,10 @@ _EVENT_TITLES = {
     "task.paused": "任务暂停",
     "task.idle": "任务停留",
     "task.deleted": "任务已删除",
+    "task.scheduled_failed": "定时任务异常",
+    # ddns
+    "ddns.changed": "DDNS 解析变更",
+    "ddns.failed": "DDNS 同步失败",
 }
 
 _MAX_TEXT = 2000
@@ -648,8 +656,6 @@ async def emit_notification(
     the push template variables. Returns the outbox id (or None if the DB is
     unreachable). Never raises.
     """
-    from db import PostgresClient
-
     params = dict(params or {})
     # Severity is part of the event envelope as well as the in-app row. Keeping
     # it in outbox params lets a configured ``trigger_condition.type=severity``
@@ -670,21 +676,36 @@ async def emit_notification(
 
     oid = uuid.uuid4()
     try:
-        if PostgresClient.pool is not None:
-            async with PostgresClient.pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO mc_notify_outbox "
-                    "(id, notification_id, event_type, params, envelope, owner_type, owner_id, status) "
-                    "VALUES ($1, NULL, $2, $3::jsonb, $4::jsonb, $5, $6, 'pending')",
-                    oid,
-                    event_type[:64],
-                    json.dumps(params, ensure_ascii=False),
-                    json.dumps(envelope, ensure_ascii=False),
-                    owner_type[:16],
-                    _maybe_uuid(owner_id),
-                )
-            if _initialized.is_set() and _queue is not None:
-                await _queue.put(str(oid))
+        # The outbox INSERT goes over the *Tortoise* `user_platform` connection
+        # rather than `db.PostgresClient.pool`. Both the main service and the
+        # standalone tunnel_server init that connection (the same one DDNS
+        # tables read/write), so `emit_notification` works in either process —
+        # tunnel_server has no `PostgresClient` pool at all, and the old
+        # `if pool is not None` guard silently dropped its outbox rows.
+        # `$n` placeholders + `::jsonb` are the asyncpg dialect Tortoise
+        # inherits (same style as `tunnel_notify.notify_tunnel_changed`), so the
+        # statement is byte-for-byte what the asyncpg pool executed.
+        # The *delivery* side (`_consume_one` / `_drain_pending` /
+        # `notify_dispatch`) still runs only in the main service worker and
+        # keeps `PostgresClient.pool`.
+        from tortoise import Tortoise
+
+        conn = Tortoise.get_connection("user_platform")
+        await conn.execute_query(
+            "INSERT INTO mc_notify_outbox "
+            "(id, notification_id, event_type, params, envelope, owner_type, owner_id, status) "
+            "VALUES ($1, NULL, $2, $3::jsonb, $4::jsonb, $5, $6, 'pending')",
+            [
+                oid,
+                event_type[:64],
+                json.dumps(params, ensure_ascii=False),
+                json.dumps(envelope, ensure_ascii=False),
+                owner_type[:16],
+                _maybe_uuid(owner_id),
+            ],
+        )
+        if _initialized.is_set() and _queue is not None:
+            await _queue.put(str(oid))
     except Exception:  # noqa: BLE001
         logger.exception("[notify] insert outbox failed for {}", event_type)
     return str(oid)

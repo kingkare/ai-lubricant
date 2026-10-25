@@ -36,6 +36,16 @@ DEFAULT_NON_RETRYABLE_PARAMETER_ERRORS = {
 # 关闭时：既不做超限判定、也不做归一返回，退回普通错误流程（能重试则重试，否则原样透传）。
 DEFAULT_CONTEXT_OVERFLOW_NOT_RETRYABLE_ENABLED = True
 
+# 「超长单条消息切分」默认关闭。部分第三方上游对**单条**消息另设 token 上限（实测
+# bailu ≈40000，与模型上下文窗口无关），超限即 400 "Message N content exceeds
+# maximum length"。开启后出站前把超限的纯文本 user/assistant 消息按自然断点切成
+# 多条连续同角色消息；tool 消息与带 tool_calls 的 assistant 消息不切（配对不可拆）。
+# 默认关：这是特定上游的怪癖，且切分会改变消息边界（影响前缀缓存），应按渠道显式开启。
+DEFAULT_MESSAGE_SPLIT_ENABLED = False
+# 单条切分阈值（token）。取 32000 而非实测的 ~40000，留 20% 余量：估算器与上游
+# tokenizer 可能有偏差，且上游阈值可能随时调整。渠道级可覆盖。
+DEFAULT_MESSAGE_SPLIT_MAX_TOKENS = 32000
+
 # 「允许 token 预占触线放行」默认开启。渠道账号的 token（TPM/TPH/TPD）与模型 TPM 采用
 # 预占式计量：请求开始按估算预占，成功用真实 usage 补差，失败原子回滚。
 # 开启时：预占算出的 projected 超过限额，本次请求仍放行（并写冻结挡住后续请求），
@@ -567,6 +577,43 @@ class Config:
         return whitelist, blacklist
 
     @classmethod
+    async def get_model_group_compress_models(cls, model: str | None, *, snapshot: Any = None) -> list[str]:
+        """这个模型（自定义模型/真实模型/别名）配置的「压缩模型」**有序候选列表**；空 = 未配置。
+
+        与 selection_strategy / backup_group 同族：挂在模型/策略行上而非 api_key 上——因为
+        压缩模型取决于「被压缩的是哪个模型」（窗口/成本），不取决于哪把 key 调用。
+
+        解析顺序：自定义模型组（含别名）走 ``group_index``；真实模型行（kind='real'）直接读
+        快照 ``groups[model]``。两者同表（model_groups），统一从行上的 ``compress_models``
+        jsonb 数组读取。顺序即优先级，去空去重保序。
+        """
+        if not model:
+            return []
+        catalog = snapshot if snapshot is not None else current_snapshot()
+        # 自定义模型组 + 别名（group_index 排除 real 行）。
+        group = await cls._resolve_model_group_compatible(model, catalog)
+        if group is None:
+            # 真实模型行：直接读快照 groups。
+            row = _catalog_field(catalog, "groups").get(model)
+            group = row if isinstance(row, Mapping) else None
+        if not group:
+            return []
+        raw = group.get("compress_models")
+        if isinstance(raw, str):
+            # 兼容单值字符串。
+            raw = [raw] if raw.strip() else []
+        if not isinstance(raw, (list, tuple)):
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in raw:
+            name = str(item).strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
+
+    @classmethod
     async def api_key_allows_model(cls, api_key: str | None, model: str) -> bool:
         """按 API Key 的模型白/黑名单判断是否放行请求的模型名（组主名/别名/真实模型名均按请求名匹配）。"""
         whitelist, blacklist = await cls.get_api_key_model_filter(api_key)
@@ -702,6 +749,36 @@ class Config:
         if value is None:
             return DEFAULT_CONTEXT_OVERFLOW_NOT_RETRYABLE_ENABLED
         return value is not False
+
+    @classmethod
+    def message_split_settings(cls) -> tuple[bool, int]:
+        """超长单条消息切分的 (是否启用, 单条 token 上限)。
+
+        部分第三方上游对单条消息另设 token 上限（实测 bailu ≈40000），超限即 400
+        "Message N content exceeds maximum length"。开启后出站前把超限的纯文本
+        user/assistant 消息切成多条连续同角色消息。
+
+        默认关闭——这是特定上游的怪癖，且切分改变消息边界（影响前缀缓存），
+        应由管理员按渠道显式开启。渠道级配置可覆盖（见 CustomProvider）。
+
+        本方法在**每次出站请求**的热路径上被调用，故对配置读取失败做兜底：读不到
+        配置时返回「不切分」，绝不因配置故障让请求失败（切分是可选优化，不是必需）。
+        """
+        try:
+            cfg = cls._load().get("message_split", {}) or {}
+        except Exception:
+            return DEFAULT_MESSAGE_SPLIT_ENABLED, DEFAULT_MESSAGE_SPLIT_MAX_TOKENS
+        enabled = cfg.get("enabled")
+        if enabled is None:
+            enabled = DEFAULT_MESSAGE_SPLIT_ENABLED
+        max_tokens = cfg.get("max_tokens")
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError):
+            max_tokens = DEFAULT_MESSAGE_SPLIT_MAX_TOKENS
+        if max_tokens <= 0:
+            max_tokens = DEFAULT_MESSAGE_SPLIT_MAX_TOKENS
+        return bool(enabled), max_tokens
 
     @classmethod
     def allow_token_reservation_overflow(cls) -> bool:
@@ -868,6 +945,21 @@ class Config:
     def stream_incomplete_error_enabled(cls) -> bool:
         stream = cls._load().get("stream", {}) or {}
         return stream.get("incomplete_error_enabled", True) is not False
+
+    @classmethod
+    def api_docs_enabled(cls) -> bool:
+        """Swagger / ReDoc / OpenAPI 文档端点是否放行（``/docs``、``/redoc``、
+        ``/openapi.json``）。
+
+        **默认关闭**：FastAPI 把这几个端点挂在根路径上且不带任何鉴权，公网部署
+        （创空间等）时等于把整份接口面——当前约 798 个路径、207 个 schema——
+        原样公开。开关在管理端「系统设置 → 基础配置 → API 文档」，打开才放行。
+
+        关掉不影响离线导出：``scripts/export_openapi.py`` 走 ``app.openapi()``
+        在进程内直接生成，不经过 HTTP 层。
+        """
+        docs = cls._load().get("api_docs", {}) or {}
+        return docs.get("enabled") is True
 
     @classmethod
     def get_global_retry_count(cls) -> int:

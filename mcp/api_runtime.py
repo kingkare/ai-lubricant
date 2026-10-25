@@ -24,18 +24,24 @@ class CreateVersionPayload(BaseModel):
 
 @router.get("/runtime/services")
 async def runtime_list_services(authorization: str | None = Header(None)):
+    """列出所有 MCP 服务记录。仅管理端。"""
     await _require_admin(authorization)
     return await mcp_plugin_store.list_services()
 
 
 @router.get("/runtime/services/{service_id}/versions")
 async def runtime_list_versions(service_id: int, authorization: str | None = Header(None)):
+    """列出某 MCP 服务的全部插件版本。仅管理端。"""
     await _require_admin(authorization)
     return await mcp_plugin_store.list_versions(service_id)
 
 
 @router.post("/runtime/services/{service_id}/versions")
 async def runtime_create_version(service_id: int, payload: CreateVersionPayload, authorization: str | None = Header(None)):
+    """为 MCP 服务新建一个插件版本（代码 + 配置快照）。仅管理端。
+
+    进程内直调 admin_api.create_version_core，不经 HTTP 自代理；服务不存在返回 404。
+    """
     await _require_admin(authorization)
     from mcp_runtime.admin_api import create_version_core
     return await create_version_core(service_id, payload)
@@ -43,6 +49,7 @@ async def runtime_create_version(service_id: int, payload: CreateVersionPayload,
 
 @router.post("/runtime/versions/{version_id}/security-check")
 async def runtime_security_check(version_id: int, authorization: str | None = Header(None)):
+    """对插件版本执行安全审查（静态扫描 verdict/risk_level），通过后才能 activate。仅管理端。"""
     await _require_admin(authorization)
     from mcp_runtime.security_review import run_security_check
     return await run_security_check(version_id)
@@ -50,6 +57,11 @@ async def runtime_security_check(version_id: int, authorization: str | None = He
 
 @router.post("/runtime/versions/{version_id}/activate")
 async def runtime_activate(version_id: int, authorization: str | None = Header(None)):
+    """把指定版本设为 active 并热加载到 runtime（替换当前运行实例）。
+
+    前置：security_status 必须是 passed 且版本带代码，否则 409/400。
+    加载成功会回写 tools_cache。仅管理端。
+    """
     await _require_admin(authorization)
     from mcp_runtime.admin_api import activate_core
     return await activate_core(version_id)

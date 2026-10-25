@@ -204,3 +204,64 @@ def test_stream_dict_arguments_normalized_to_json_string():
     args = flat[0]["function"]["arguments"]
     assert isinstance(args, str), "dict arguments leaked to client unserialized"
     assert json.loads(args) == {"city": "北京"}
+
+
+# ---- GLM-4 chat-template 形态：<tool_calls><invoke name=...> 流式回归 ----
+
+_GLM_TCO = "<" + "tool_calls>"
+_GLM_TCC = "</" + "tool_calls>"
+_GLM_INV = "<" + "invoke name="
+
+
+def _glm_stream_frames(inner: str):
+    """把 GLM-4 形态块拆成逐字符 delta 帧。"""
+    text = _GLM_TCO + "\n" + inner + "\n" + _GLM_TCC
+    return [{"content": ch} for ch in text]
+
+
+def test_stream_glm_xml_becomes_tool_calls_delta():
+    """GLM-4 形态在流式路径必须解析成 tool_calls delta，XML 不得漏成可见文本。
+
+    回归：opencode Zen 免费模型（mimo 等）偶发把工具调用写成 GLM chat-template
+    XML 塞进 content；解析器不认这种形态时 XML 原样下发给客户端——编辑器显示成
+    字符串、工具不执行。本用例锁住「逐字符流 -> tool_calls delta」整条链路。
+    """
+    inner = ('<invoke name="Grep">'
+             '<parameter name="path">main.py</parameter>'
+             '<parameter name="-n">true</parameter></invoke>')
+    frames = _glm_stream_frames(inner) + [{"finish_reason": "tool_calls"}]
+    pieces = _collect(_ToolStreamProvider(frames), tools=_one_tool())
+    deltas = _deltas(pieces)
+    contents = "".join(d.get("content") or "" for d in deltas)
+    flat = [tc for d in deltas if d.get("tool_calls") for tc in d["tool_calls"]]
+
+    assert "tool_calls" not in contents  # 块不泄漏
+    assert "invoke" not in contents
+    assert "parameter" not in contents
+    assert flat, "no tool_calls delta emitted"
+    assert flat[0]["function"]["name"] == "Grep"
+    args = json.loads(flat[0]["function"]["arguments"])
+    assert args["path"] == "main.py"
+    assert args["-n"] is True
+
+
+def test_stream_glm_partial_marker_split_across_chunks():
+    """半截 GLM 开标记（<tool_cal…）跨 delta 时不泄漏，补全后整块解析。"""
+    frames = [
+        {"content": "前置。" + "<tool_cal"},
+        {"content": "ls>"},
+        {"content": '<invoke name="Read">'},
+        {"content": '<parameter name="path">a.py</parameter>'},
+        {"content": "</invoke>" + _GLM_TCC},
+        {"finish_reason": "tool_calls"},
+    ]
+    pieces = _collect(_ToolStreamProvider(frames), tools=_one_tool())
+    deltas = _deltas(pieces)
+    contents = "".join(d.get("content") or "" for d in deltas)
+    flat = [tc for d in deltas if d.get("tool_calls") for tc in d["tool_calls"]]
+
+    assert "前置。" in contents
+    assert "<tool_cal" not in contents, "半截开标记泄漏成正文"
+    assert flat, "no tool_calls delta emitted"
+    assert flat[0]["function"]["name"] == "Read"
+    assert json.loads(flat[0]["function"]["arguments"]) == {"path": "a.py"}

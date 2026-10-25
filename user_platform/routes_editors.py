@@ -330,6 +330,7 @@ async def admin_list_editors(
     offset: int = Query(0, ge=0),
     _: User = Depends(_require_admin),
 ) -> dict:
+    """管理员分页列出全部编辑器，可按项目/供应商/状态/节点筛选。"""
     rows = await PostgresClient.list_all_editors_for_admin(
         project_id=project_id, provider=provider, status=status, node_id=node_id, limit=limit, offset=offset
     )
@@ -338,6 +339,7 @@ async def admin_list_editors(
 
 @admin_router.get("/{editor_id}")
 async def admin_get_editor(editor_id: str, _: User = Depends(_require_admin)) -> dict:
+    """管理员查看单个编辑器详情及其会话列表（脱敏）。不存在返回 404。"""
     editor = await PostgresClient.get_editor_for_admin(editor_id)
     if not editor:
         raise HTTPException(status_code=404, detail="编辑器不存在")
@@ -349,6 +351,7 @@ async def admin_get_editor(editor_id: str, _: User = Depends(_require_admin)) ->
 async def admin_close_editor_session(
     editor_id: str, session_id: str, request: Request, user: User = Depends(_require_admin)
 ) -> dict:
+    """管理员强制关闭编辑器的某会话并清理其节点运行时。会话不存在返回 404。"""
     session = await PostgresClient.get_editor_session(editor_id, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -376,10 +379,12 @@ async def admin_editor_logs(
     offset: int = Query(0, ge=0),
     _: User = Depends(_require_admin),
 ) -> dict:
+    """管理员查询编辑器的请求日志（分页）。"""
     return await PostgresClient.query_editor_request_logs_admin(editor_id, limit=limit, offset=offset)
 
 @router.get("")
 async def list_editors(user: User = Depends(get_current_user)) -> list[dict]:
+    """列出当前用户拥有的全部编辑器（脱敏）。"""
     rows = await PostgresClient.list_editors_for_user(str(user.id))
     return [_redact_editor(row) for row in rows]
 
@@ -388,6 +393,11 @@ async def list_editors(user: User = Depends(get_current_user)) -> list[dict]:
 async def create_editor(
     body: CreateEditorReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """创建编辑器。
+
+    分支模式与参数非法抛 ValueError 映射为 400；MCP 绑定先归一为服务/资源引用
+    再落库（不落 wire spec/token）。成功记 editor.create 审计。
+    """
     try:
         payload = _validated_editor_create_payload(body)
         # 编辑器行落绑定（service_id/resource_id），不落 wire spec / token。
@@ -418,6 +428,7 @@ async def list_user_editor_sessions(
     offset: int = Query(0, ge=0),
     user: User = Depends(get_current_user),
 ) -> dict:
+    """分页列出当前用户的全部编辑器会话（脱敏）。"""
     # 注意：必须声明在 `/{editor_id}` 之前，否则 `/sessions` 会被当作 editor_id 命中 404。
     result = await PostgresClient.list_editor_sessions_for_user(str(user.id), limit=limit, offset=offset)
     return {"total": result["total"], "rows": _redact_sessions(result["rows"]), "limit": limit, "offset": offset}
@@ -425,6 +436,7 @@ async def list_user_editor_sessions(
 
 @router.get("/{editor_id}")
 async def get_editor(editor_id: str, user: User = Depends(get_current_user)) -> dict:
+    """获取单个编辑器详情及其会话列表（脱敏）。不属于当前用户返回 404。"""
     editor = await PostgresClient.get_editor_for_user(editor_id, str(user.id))
     if not editor:
         raise HTTPException(status_code=404, detail="编辑器不存在")
@@ -439,6 +451,13 @@ async def update_editor(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """更新编辑器配置，并把变更热下发给活跃会话 runtime。
+
+    编辑器不存在返回 404；试图改 provider 返回 400（provider 属编辑器身份，
+    须新建）；新引用未授权或配置非法返回 403；编辑器当前不可修改返回 409。
+    MCP/skill/plugin 变更会重下发给 active/pending_first_request 会话（纯磁盘
+    写入，不重启，下一轮生效），结果以 config_resync 上报。记 editor.update 审计。
+    """
     existing = await PostgresClient.get_editor_for_user(editor_id, str(user.id))
     if not existing:
         raise HTTPException(status_code=404, detail="编辑器不存在")
@@ -564,6 +583,12 @@ async def create_editor_session(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """在编辑器下创建会话并派发到节点 runtime。
+
+    Codex 会话必须预注册 installation_id 与首条消息内容（否则 422）；必须选择
+    且有权使用父 API Key；携带 issue_id 时须类型匹配、状态可分配，并自动注入
+    issue-workflow MCP。节点创建失败返回 503。
+    """
     editor = await PostgresClient.get_editor_for_user(editor_id, str(user.id))
     if not editor:
         raise HTTPException(status_code=404, detail="编辑器不存在")
@@ -776,6 +801,7 @@ async def _create_editor_session_core(
 
 @router.get("/{editor_id}/sessions")
 async def list_editor_sessions(editor_id: str, user: User = Depends(get_current_user)) -> list[dict]:
+    """列出编辑器下的全部会话（脱敏），每行附带编辑器 provider。"""
     editor = await PostgresClient.get_editor_for_user(editor_id, str(user.id))
     if not editor:
         raise HTTPException(status_code=404, detail="编辑器不存在")
@@ -792,6 +818,7 @@ async def disable_editor_session_api_key(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """禁用编辑器会话绑定的 API Key，并刷新 Key 缓存。会话或 Key 不存在返回 404。"""
     result = await PostgresClient.disable_editor_session_api_key(
         editor_id, session_id, str(user.id)
     )
@@ -817,6 +844,10 @@ async def rotate_editor_session_api_key(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """轮换编辑器会话的 API Key（生成新 Key 并返回明文），并刷新 Key 缓存。
+
+    会话或 Key 不存在返回 404；返回的 key 明文仅此一次下发。
+    """
     result = await PostgresClient.rotate_editor_session_api_key(
         editor_id, session_id, str(user.id)
     )
@@ -847,6 +878,7 @@ async def disable_editor_api_key(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """禁用编辑器自身的 API Key 并刷新 Key 缓存。编辑器或 Key 不存在返回 404。"""
     result = await PostgresClient.disable_editor_api_key(editor_id, str(user.id))
     if not result:
         raise HTTPException(status_code=404, detail="编辑器不存在或 API Key 不可用")
@@ -868,6 +900,10 @@ async def rotate_editor_api_key(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """轮换编辑器自身的 API Key（生成新 Key 并返回明文），并刷新 Key 缓存。
+
+    编辑器或 Key 不存在返回 404；返回的 key 明文仅此一次下发。
+    """
     result = await PostgresClient.rotate_editor_api_key(editor_id, str(user.id))
     if not result:
         raise HTTPException(status_code=404, detail="编辑器不存在或 API Key 不可用")
@@ -896,6 +932,7 @@ async def list_editor_request_logs(
     offset: int = Query(0, ge=0),
     user: User = Depends(get_current_user),
 ) -> dict:
+    """分页查询编辑器的模型请求日志，可按会话筛选。不属于当前用户返回 404。"""
     if not await PostgresClient.editor_belongs_to_user(editor_id, str(user.id)):
         raise HTTPException(status_code=404, detail="编辑器不存在")
     return await PostgresClient.query_editor_request_logs(
@@ -913,6 +950,7 @@ async def get_editor_request_log(
     log_id: int,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """查询单条请求日志详情。日志不存在或不属于该编辑器返回 404。"""
     log = await PostgresClient.get_editor_request_log_detail(log_id, editor_id, str(user.id))
     if not log:
         raise HTTPException(status_code=404, detail="日志不存在")
@@ -986,6 +1024,12 @@ async def send_editor_session_message(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """向会话运行时发送一条 human_message。
+
+    会话不存在返回 404，内容为空返回 422，会话当前不可发送返回 409。发送前先
+    探测/修复运行时（StartNodeSessionRuntime 幂等），投递失败返回 503，避免
+    「已受理但被节点静默丢弃」。
+    """
     editor = await PostgresClient.get_editor_for_user(editor_id, str(user.id))
     session = await PostgresClient.get_editor_session(editor_id, session_id) if editor else None
     content = (body.content or "").strip()
@@ -1235,6 +1279,10 @@ async def stop_editor_session(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """停止会话：将会话标记为 closed 并删除节点运行时。
+
+    会话不存在返回 404。会话行与其请求历史保留，仅回收节点侧运行时。
+    """
     editor = await PostgresClient.get_editor_for_user(editor_id, str(user.id))
     session = await PostgresClient.get_editor_session(editor_id, session_id) if editor else None
     if not session:
@@ -1257,6 +1305,10 @@ async def delete_editor_session_data(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """彻底删除会话数据（运行时、会话行与配置），仅保留请求日志。
+
+    会话不存在返回 404；若尚未关闭会先停止运行时。
+    """
     editor = await PostgresClient.get_editor_for_user(editor_id, str(user.id))
     session = await PostgresClient.get_editor_session(editor_id, session_id) if editor else None
     if not session:
@@ -1282,6 +1334,7 @@ async def close_editor_session(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """关闭会话：停止节点运行时并标记 closed，会话行与历史保留。不存在返回 404。"""
     editor = await PostgresClient.get_editor_for_user(editor_id, str(user.id))
     session = await PostgresClient.get_editor_session(editor_id, session_id) if editor else None
     if not session:
@@ -1304,6 +1357,11 @@ async def delete_editor(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """删除编辑器（先记录会话，再关账并逐个清理其节点运行时）。
+
+    编辑器不存在返回 404。运行时清理失败不阻断（节点/session reaper 会重试），
+    删除动作记 editor.delete 审计。
+    """
     sessions = await PostgresClient.list_editor_sessions(editor_id)
     ok = await PostgresClient.close_editor(editor_id, str(user.id))
     if not ok:

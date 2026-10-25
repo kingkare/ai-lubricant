@@ -31,10 +31,13 @@ class PluginLoadError(Exception):
 # SSE Gateway 每请求注入的 token，供插件 handler 读取。
 # 对 cdp-bridge，cdp_bridge_plugin 的 _wrap 会把它桥接到 cdp 的 current_token。
 current_request_token: ContextVar[str] = ContextVar("current_request_token", default="")
-# Optional logical holder/session for long-lived CDP tab leases. Empty holder
-# means a per-call lease; empty session falls back to the holder's selected tab.
-current_cdp_holder: ContextVar[str] = ContextVar("current_cdp_holder", default="")
+# 调用方希望操作的 CDP 标签页（session_key）。空则由 cdp 侧回落到该客户端
+# 最近使用/默认的标签页。
 current_cdp_session_id: ContextVar[str] = ContextVar("current_cdp_session_id", default="")
+# 调用方被授权操作的 CDP 客户端集合（会话绑定的那个浏览器，或多个浏览器）。
+# 这是服务端边界：插件据此只允许模型选择域内的浏览器，跨域一律拒绝；模型无法
+# 通过工具参数设置它，只能从授权域里选择。
+current_cdp_client_ids: ContextVar[tuple[str, ...]] = ContextVar("current_cdp_client_ids", default=())
 
 
 @dataclass

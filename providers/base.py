@@ -9,7 +9,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from fastapi import HTTPException
-from typing import AsyncGenerator, Union
+from typing import AsyncGenerator, ClassVar, Union
 
 import aiohttp
 from loguru import logger
@@ -212,7 +212,20 @@ def _coerce_status_code(value, default: int) -> int:
         status_code = int(value)
     except (TypeError, ValueError):
         return default
-    return status_code if 400 <= status_code <= 599 else default
+    if not (400 <= status_code <= 599):
+        return default
+    # 上游/中间网关可能自报非标准 4xx（426 Upgrade Required、私有风控码等）。这类码
+    # 对下游没有可处理的语义，原样当成我方 HTTP 状态会把它一路透传到客户端；收敛为
+    # 上游异常（502），交给重试/换候选/最终 429 的既有收口。标准客户端错误码保留，
+    # 以便真正的参数错（invalid_request_error + param）仍能透传。
+    if 400 <= status_code < 500 and status_code not in _PASSTHROUGH_CLIENT_STATUS_CODES:
+        return default
+    return status_code
+
+
+# 允许从上游透传的 4xx 状态码（与 retry_policy.CLIENT_ERROR_STATUS_CODES 同一口径）。
+# 413 保留：上下文超限靠它触发 canonicalize → 400 + 固定 code，供客户端自动压缩重发。
+_PASSTHROUGH_CLIENT_STATUS_CODES: frozenset[int] = frozenset({400, 401, 403, 404, 409, 413, 422, 429})
 
 
 def _openai_sse_error_exception(payload: dict) -> HTTPException | None:
@@ -318,9 +331,112 @@ class IncompleteStreamError(Exception):
 
 
 class EmptyNonStreamResponseError(Exception):
-    def __init__(self, message: str = "upstream returned empty non-stream response"):
+    def __init__(
+        self,
+        message: str = "upstream returned empty non-stream response",
+        code: str = "upstream_empty_non_stream_response",
+    ):
         super().__init__(message)
-        self.code = "upstream_empty_non_stream_response"
+        self.code = code
+
+
+# ==================== 渠道语义异常（错误 → 账号状态的统一入口） ====================
+# 渠道报错不再靠状态码猜「该不该冻号」：spec 抛这里定义的语义异常，网关收口时按
+# 类型分流——改账号状态（凭证失效/额度耗尽/临时冻结）或本请求特殊处理
+# （上游临时故障/限流/参数错）。
+#
+# 硬约束：全部继承 HTTPException。顶层只注册了 @app.exception_handler(HTTPException)
+# （main.py:1521），重试分类与失败收口也按 isinstance(HTTPException) 读 status_code
+# /detail；裸 Exception 会 500 且误走网络异常分支。继承它 = 客户端协议零变化。
+#
+# 这些类经 providers/code_loader._build_namespace() 注入 spec 命名空间，
+# spec 直接 raise 即可，不需要 import。完整语义见 docs/channel-error-semantics-design.md。
+
+
+class ChannelError(HTTPException):
+    """渠道语义异常基类。kind 供冻结策略按 error_kind 条件匹配与日志归类。"""
+
+    kind: ClassVar[str] = "channel_error"
+
+    def __init__(self, detail: str, *, status_code: int | None = None, freeze: "dict | bool | None" = None):
+        # freeze 参数（供应商显式指定冻结动作，见子类）：
+        #   None → 不指定，按 kind 查渠道冻结策略，策略也没配则用类默认；
+        #   False→ 明确声明「本异常不冻结账号」；
+        #   dict → {"seconds": int|None, "reason": str}，即终态：直接执行，
+        #          不经过渠道策略的时长判断（含 refresh_freeze_on_failure 覆盖逻辑）。
+        super().__init__(status_code=status_code if status_code is not None else 400, detail=detail)
+        self.freeze = freeze
+
+
+class CredentialInvalid(ChannelError):
+    """凭证失效：refresh_token 被消耗 / DPoP 私钥对不上 / token 被吊销——重试无用，
+    只有重新网页授权能救。账号进「凭证失效」态（无到期），授权成功后恢复。"""
+
+    kind = "credential_invalid"
+
+    def __init__(self, detail: str, *, status_code: int | None = None):
+        # 默认冻结时长 None = 无到期（永久冻结态）。兼容期状态码逐渠道对齐现状：
+        # 管理端刷新路径禁用 401/403（见 memory admin-refresh-no-401-403），故默认 400。
+        super().__init__(detail, status_code=status_code if status_code is not None else 400,
+                         freeze={"seconds": None})
+
+
+class QuotaExhausted(ChannelError):
+    """上游额度/积分耗尽：凭证是好的，重试恢复不了。账号进「额度耗尽」态（无到期），
+    每日签到成功（checkin status=ok）后恢复。"""
+
+    kind = "quota_exhausted"
+
+    def __init__(self, detail: str, *, status_code: int | None = None):
+        super().__init__(detail, status_code=status_code if status_code is not None else 403,
+                         freeze={"seconds": None})
+
+
+class TemporaryFreeze(ChannelError):
+    """临时冻结：账号状态进「临时冻结」，时长取自参数（终态，不走渠道策略时长判断）；
+    不传 seconds 则按 kind 查渠道策略，策略没配默认 60 秒。
+    典型场景：上游 WAF/风控窗口（替代手工把 403 改判 502 再猜规则的旧做法）。"""
+
+    kind = "temporary_freeze"
+
+    def __init__(self, detail: str, *, seconds: "int | None" = None, status_code: int | None = None):
+        super().__init__(detail, status_code=status_code if status_code is not None else 429,
+                         freeze={"seconds": seconds} if seconds is not None else None)
+
+
+class UpstreamTransient(ChannelError):
+    """上游临时故障（超时/Backend timeout/网关抖动）：**不改账号状态**，本请求按
+    上游故障重试或换号。抛它即声明「这不是账号的问题」。"""
+
+    kind = "upstream_transient"
+    # freeze=False：显式声明不冻结——即使渠道策略按状态码命中了冻结规则也不冻
+    def __init__(self, detail: str, *, status_code: int | None = None):
+        super().__init__(detail, status_code=status_code if status_code is not None else 502, freeze=False)
+
+
+class RateLimited(ChannelError):
+    """限流（可带 retry_after）：**不改账号状态**，本请求退避重试。"""
+
+    kind = "rate_limited"
+
+    def __init__(self, detail: str, *, retry_after: "int | None" = None, status_code: int | None = None):
+        super().__init__(detail, status_code=status_code if status_code is not None else 429, freeze=False)
+        self.retry_after = retry_after
+
+
+class InvalidRequest(ChannelError):
+    """参数/上下文错误：账号是好的，**不改账号状态**，直接回客户端、不重试不冻。"""
+
+    kind = "invalid_request"
+
+    def __init__(self, detail: str, *, status_code: int | None = None):
+        super().__init__(detail, status_code=status_code if status_code is not None else 400, freeze=False)
+
+
+def is_output_intercepted_error(error: Exception) -> bool:
+    """命中「异常输出拦截」规则抛出的失败（流式 IncompleteStreamError / 非流式
+    EmptyNonStreamResponseError），两者都带 ``code="output_intercepted"``。"""
+    return getattr(error, "code", None) == "output_intercepted"
 
 
 class BaseProvider(ABC):
@@ -500,6 +616,18 @@ class BaseProvider(ABC):
     async def check_message(self, model_id: str, messages: list[dict] | None = None) -> bool:
         return True
 
+    async def check_message_with_reason(self, model_id: str,
+                                        messages: list[dict] | None = None) -> tuple[bool, str]:
+        """同 :meth:`check_message`，但允许渠道带出拒绝原因 ``(False, reason)``。
+
+        reason 非空时由选路收口按 ``_REASON_TO_BUSINESS_CODE`` 映射业务码——例如渠道在
+        选路阶段复现出站请求体、判定「超出本渠道能吃下的输入体量」时传
+        ``"context_window_exceeded"``，客户端拿到 ``context_too_large``(400) 而不是误导性
+        的 ``quota_exhausted``(429)；reason 留空则调用点回退 ``provider_message_quota_exceeded``，
+        与旧 ``check_message`` 语义逐字节一致。默认实现委托 :meth:`check_message`。
+        """
+        return (bool(await self.check_message(model_id, messages)), "")
+
     async def record_message(self, model_id: str, messages: list[dict] | None = None) -> None:
         pass
 
@@ -609,8 +737,47 @@ class BaseProvider(ABC):
             return str(getattr(self, "protocol", None) or self.channel_protocol or "openai").lower()
         return str(self.channel_protocol or "openai").lower()
 
+    def resolve_chat_protocol_row(self, model_id: str | None = None,
+                                  kwargs: dict | None = None) -> dict | None:
+        """本次请求生效的对话协议行（唯一真相源）。
+
+        多协议行渠道里，"渠道级 protocol" 只等于**第一条 enabled 行**，不代表本次请求：
+        模型 `bailu-2.9-preview` 未绑定首行（anthropic）时会路由到后面的 chat 行，
+        此时 path/鉴权都已按 chat 行走，任何仍读渠道级 protocol 的判定都会分裂。
+        这里返回路由层钉住的那一行（`_endpoint_config`），没有时按模型重选。
+
+        单协议渠道 / 内置渠道返回 None —— 调用方回退 ``get_channel_protocol()``，
+        与改动前行为完全一致。
+        """
+        return None
+
+    def get_effective_channel_protocol(self, model_id: str | None = None,
+                                       kwargs: dict | None = None) -> str:
+        """本次请求生效的协议字符串：优先协议行，否则回退渠道级 protocol。
+
+        所有决定线格式（body 形态 / 响应解析器 / 直通判定）的地方都必须走这里，
+        不能再直接读 ``get_channel_protocol()``——那在多协议行渠道下会被首行污染。
+        """
+        row = self.resolve_chat_protocol_row(model_id, kwargs)
+        if isinstance(row, dict) and row.get("protocol"):
+            return str(row["protocol"]).lower()
+        return self.get_channel_protocol()
+
     def same_channel_protocol(self, protocol: str, raw_body: dict | None, marker: str) -> bool:
         return self.get_channel_protocol() == protocol and isinstance(raw_body, dict) and raw_body.get(marker) is not None
+
+    def same_protocol_for_request(self, protocol: str, raw_body: dict | None, marker: str,
+                                  model_id: str | None = None,
+                                  kwargs: dict | None = None) -> bool:
+        """按**本次生效的协议行**判定是否同协议直通。
+
+        与 ``same_channel_protocol`` 的区别只在协议来源：那个读渠道级首行，多协议行
+        渠道下会把「客户端 anthropic + 本次选中 chat 行」误判成同协议，于是原始
+        anthropic body 被直发到 chat 端点、OpenAI 回帧按 anthropic 事件名解析 →
+        满屏真实输出被判空流（IncompleteStreamError）并冻结账号。
+        """
+        return (self.get_effective_channel_protocol(model_id, kwargs) == protocol
+                and isinstance(raw_body, dict) and raw_body.get(marker) is not None)
 
     def format_channel_usage(self, usage: dict | None) -> dict | None:
         if self.get_channel_protocol() == "openai":
@@ -964,7 +1131,7 @@ class BaseProvider(ABC):
                             yield role_chunk
 
                         if thinking:
-                            if "<tool_call>" in thinking or "<function" in thinking or "function=" in thinking or ("```" in thinking and "name" in thinking):
+                            if "<tool_call>" in thinking or "<function" in thinking or "function=" in thinking or ("<" + "tool_calls") in thinking or ("```" in thinking and "name" in thinking):
                                 content = thinking + content
                             else:
                                 tc = make_openai_chunk(completion_id, model_id,
@@ -1205,7 +1372,12 @@ class BaseProvider(ABC):
             - 单个 ``{"_passthrough_anthropic": True, "body": {...}, "usage": {...}, "message_id": "..."}``
         """
         raw_body = kwargs.get("_raw_anthropic_body")
-        same_protocol = self.same_channel_protocol("anthropic", raw_body, "messages")
+        # 直通判定必须按「本次选中的协议行」，不能读渠道级首行协议：
+        # 模型未绑定首行时路由会落到后面的 openai/chat 行，直通即把 anthropic
+        # body 发到 OpenAI 端点，回帧按 anthropic 事件名解析 → 满屏输出被判空流。
+        same_protocol = self.same_protocol_for_request(
+            "anthropic", raw_body, "messages", model_id, kwargs
+        )
 
         # 渠道可配「随客户端」(auto)：auto 时上游 stream 跟随客户端，直通判定恒成立。
         upstream_stream = resolve_upstream_stream(getattr(self, "upstream_stream", stream), stream)
@@ -1289,7 +1461,10 @@ class BaseProvider(ABC):
         **kwargs
     ):
         raw_body = kwargs.get("_raw_responses_body")
-        same_protocol = self.same_channel_protocol("responses", raw_body, "input")
+        # 同 chat_anthropic：直通判定按本次协议行，不读渠道级首行。
+        same_protocol = self.same_protocol_for_request(
+            "responses", raw_body, "input", model_id, kwargs
+        )
 
         # 渠道可配「随客户端」(auto)：auto 时上游 stream 跟随客户端，直通判定恒成立。
         upstream_stream = resolve_upstream_stream(getattr(self, "upstream_stream", stream), stream)
@@ -1445,7 +1620,11 @@ class BaseProvider(ABC):
                         idx = buffer.find(b'\n\n')
                         event = buffer[:idx + 2].decode('utf-8')
                         # 只有非纯注释事件才算「有进展」；keep-alive 注释不重置计时。
-                        if stall_timeout > 0 and not self.is_sse_comment_only(event):
+                        # 心跳类 SSE 事件（event: HEARTBEAT data: {} 等）同样不算——
+                        # 2026-10-12 实证：IMA 每 ~6s 发一次 HEARTBEAT（带 event 行，
+                        # is_sse_comment_only 认不出），把停滞看门狗无限重置，联网搜索/
+                        # 思考期 200s+ 客户端只能干等（渠道配置的 timeout 形同虚设）。
+                        if stall_timeout > 0 and not self._is_progress_event(event):
                             last_event_at = time.monotonic()
                         yield event
                         buffer = buffer[idx + 2:]
@@ -1477,6 +1656,30 @@ class BaseProvider(ABC):
             if not stripped.startswith(":"):
                 return False
         return has_line
+
+    # 心跳/保活类 SSE 事件名（各渠道通用；渠道可覆写 _heartbeat_event_names 扩充）。
+    _HEARTBEAT_EVENTS = ("HEARTBEAT", "HEART_BEAT", "PING", "KEEPALIVE", "KEEP_ALIVE")
+
+    @classmethod
+    def _heartbeat_event_names(cls) -> tuple:
+        return cls._HEARTBEAT_EVENTS
+
+    @classmethod
+    def _is_progress_event(cls, event_str: str) -> bool:
+        """该 SSE 事件是否代表「上游真的在产出」。
+
+        纯注释（``: ping``）与心跳事件（``event: HEARTBEAT data: {}``）都算无进展——
+        它们只能证明连接活着，不能证明模型在出内容。停滞看门狗按本方法计时，
+        这样渠道配置的 timeout 才能真正约束「搜索/思考期干等」（心跳刷不掉）。
+        """
+        if cls.is_sse_comment_only(event_str):
+            return False
+        for line in event_str.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("event:"):
+                name = stripped[6:].strip().upper()
+                return name not in cls._heartbeat_event_names()
+        return True  # 没有 event 行的非注释帧（裸 data）按有进展算
 
     @staticmethod
     def openai_sse_completed(event_str: str) -> bool:

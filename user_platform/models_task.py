@@ -46,8 +46,6 @@ class Task(Model):
     # pending（未派发）→ dispatching（公开创建已受理、后台派发中；DTO 投影为
     # 「准备中 · 正在连接执行节点」）→ ready（runtime 已就绪）→ dispatch_failed。
     workspace_state = fields.CharField(max_length=32, default="pending")
-    workspace_source_task_id = fields.CharField(max_length=255, null=True)
-    workspace_metadata = fields.JSONField(null=True)
     # Which bring-up step the node last reported for this task, e.g.
     # ``workspace_prepare`` / ``git_clone`` / ``runtime_preflight`` /
     # ``runtime_start`` / ``running``. Empty until the first stage frame arrives.
@@ -69,16 +67,27 @@ class Task(Model):
     # without re-deriving it from status + snapshot.
     runtime_stage_ok = fields.BooleanField(default=True)
     models_snapshot = fields.JSONField(null=True)
+    # 模型映射（用户在创建/同步弹框里配的「编辑器模型 → 平台模型」表）。统一形状
+    # {main, slots}（读取时 _migrate_model_mapping 兼容旧 roles/fallback/catalog 形状）：
+    #   main  = 主模型。claude 是档名别名（如 "opus"），下发成 ANTHROPIC_MODEL；
+    #           其余 provider 是平台模型 id。
+    #   slots = 编辑器原生用途槽 {<槽名>: {model, fallback_models[]}}：
+    #     claude   = 档名 opus/sonnet/haiku/fable → ANTHROPIC_DEFAULT_{档}_MODEL
+    #     codex    = 目录条目名 → CODEX_MODEL_CATALOG
+    #     opencode = OMO agent/category 名 → OPENCODE_MODELS
+    #     dsh      = 模型条目名 → DSH_MODELS
+    #     gemini / cursor = 无槽，只有 main
+    # NULL = 未配映射，派发回落到老的 active_model 解析。值全部是平台模型 id（claude
+    # 的 main 除外，它是档名）；只描述编辑器侧的模型菜单/角色，不再当子 Key 白名单用
+    # （见 _task_llm_config）。
+    model_mapping = fields.JSONField(null=True)
     config_snapshot = fields.JSONField(null=True)
-    # Task-owned resource snapshots. These are the authoritative base config
-    # for create, restart, and runtime hot-resync; secrets are never rendered
-    # back through task DTOs.
-    mcp_config = fields.JSONField(default=list)
-    skill_config = fields.JSONField(default=list)
-    plugin_config = fields.JSONField(default=list)
+    # Task-owned resource config is retired: skills/plugins are installed by the
+    # ENVIRONMENT (mc_task_environment_resources + node sync), not carried by the
+    # task. MCP service authorization is projected from the environment onto the
+    # task principal's grants at dispatch (the mcp_config column is gone too).
     # Per-task overlays (currently issue-workflow MCP) survive base updates.
     mcp_overlay_json = fields.JSONField(default=list)
-    environment_snapshot = fields.JSONField(null=True)
     # Task-owned MCP principal. The principal itself remains a normal mcp_users row;
     # this foreign key is owned by the task side, not the MCP module.
     mcp_user_id = fields.IntField(null=True)
@@ -98,12 +107,10 @@ class Task(Model):
     # Provider-defined permission/approval mode.
     mode = fields.CharField(max_length=128, null=True)
     mode_label = fields.CharField(max_length=255, null=True)
-    mode_capability_snapshot = fields.JSONField(null=True)
     content = fields.TextField()
     title = fields.TextField(null=True)
     summary = fields.TextField(null=True)
     status = fields.CharField(max_length=32, default="pending")
-    log_store = fields.CharField(max_length=32, null=True)
     created_at = fields.DatetimeField(auto_now_add=True)
     last_active_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
@@ -136,44 +143,6 @@ class ProjectTask(Model):
     class Meta:
         table = "mc_project_tasks"
         indexes = (("task_id",), ("project_id",))
-
-
-class TaskModelSwitch(Model):
-    """Record of switching model mid-task (running switch)."""
-
-    id = fields.UUIDField(pk=True)
-    task_id = fields.UUIDField()
-    user_id = fields.UUIDField()
-    from_model_id = fields.UUIDField(null=True)
-    to_model_id = fields.UUIDField()
-    request_id = fields.TextField(default="")
-    load_session = fields.BooleanField(default=True)
-    success = fields.BooleanField(null=True)
-    message = fields.TextField(default="")
-    session_id = fields.TextField(default="")
-    created_at = fields.DatetimeField(auto_now_add=True)
-    updated_at = fields.DatetimeField(auto_now=True)
-
-    class Meta:
-        table = "mc_task_model_switches"
-        indexes = (("task_id", "created_at"), ("user_id", "created_at"))
-
-
-class TaskUsageStat(Model):
-    """Per-task token usage accounting (captured by the model gateway)."""
-
-    id = fields.UUIDField(pk=True)
-    task_id = fields.UUIDField()
-    user_id = fields.UUIDField()
-    model = fields.CharField(max_length=255, default="")
-    input_tokens = fields.BigIntField(default=0)
-    output_tokens = fields.BigIntField(default=0)
-    total_tokens = fields.BigIntField(default=0)
-    created_at = fields.DatetimeField(auto_now_add=True)
-
-    class Meta:
-        table = "mc_task_usage_stats"
-        indexes = (("task_id",), ("user_id",))
 
 
 class TaskEvent(Model):
@@ -289,43 +258,32 @@ class TaskStatusHistory(Model):
         indexes = (("task_id", "created_at"), ("task_id", "field"))
 
 
-class TaskVirtualMachine(Model):
-    """Task <-> VM association (VM lifecycle owned by agent-compose)."""
+class TaskCreateDefaults(Model):
+    '''「创建任务」的上次配置缓存，按 (用户, 项目, 编辑器) 各存一份。
+
+    存在的理由：创建任务要选的父 Key / 模型映射 / 思考等级 / 权限方式 / API Key
+    限制，对同一个人在同一个项目上用同一个编辑器基本是**不变**的；每建一个任务
+    都重填一遍是纯折磨。创建成功后写一次，下次打开弹框自动带入。
+
+    存的是**表单态**而不是任务字段本身，所以整包用一个 JSON 列（形状跟着弹框走，
+    加字段不用改表）；唯一键 (user_id, project_id, provider) 让 upsert 有落点。
+    ``provider`` 进键是因为模型映射的形状、权限方式、思考等级的取值都按编辑器不同。
+    '''
 
     id = fields.UUIDField(pk=True)
-    task_id = fields.UUIDField()
-    virtualmachine_id = fields.CharField(max_length=64)
-    created_at = fields.DatetimeField(auto_now_add=True)
-
-    class Meta:
-        table = "mc_task_virtual_machines"
-        indexes = (("task_id",),)
-
-
-class TaskNodeBinding(Model):
-    """Exclusive binding of an agent-compose node to a single task.
-
-    A node is a scarce, occupiable resource — unlike images, a user cannot
-    freely pick any node; they select one from the nodes their group has been
-    granted, and while a task holds it no other task may use it. Exclusivity is
-    enforced by the ``node_id`` unique constraint (agent-compose itself does NOT
-    enforce occupancy — it happily runs concurrent sessions on one node), so the
-    single-column unique index is the lock: a ``get_or_create`` conflict means
-    "already occupied". The row is created when a task grabs the node and deleted
-    at every terminal exit (stop / delete / orchestration-error) to release it.
-
-    ``group_id`` records which grant the occupation came through (ownership
-    check); ``session_id`` is backfilled from the agent-compose dispatch reply.
-    """
-
-    id = fields.UUIDField(pk=True)
-    task_id = fields.UUIDField()
-    node_id = fields.CharField(max_length=128, unique=True)  # ← 独占核心：一节点一任务
-    group_id = fields.UUIDField()
     user_id = fields.UUIDField()
-    session_id = fields.CharField(max_length=128, null=True)  # dispatch 回填
+    # 空项目（未绑项目）用零 UUID 占位：Postgres 的 UNIQUE 不把 NULL 视为相等，
+    # 用 NULL 会让「无项目」这份缓存每次都插新行、永不命中。
+    project_id = fields.UUIDField()
+    provider = fields.CharField(max_length=32)
+    # 表单态整包：{intent, branch_mode, branch, parent_api_key_id, model_mapping,
+    # mode, reasoning_effort, editor_mode, selected_editors, rate_limit,
+    # usage_limit, expires_at, selection_strategy}
+    payload = fields.JSONField(default=dict)
     created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
 
     class Meta:
-        table = "mc_task_node_bindings"
-        indexes = (("task_id",), ("group_id",))
+        table = 'mc_task_create_defaults'
+        indexes = (('user_id',),)
+        unique_together = (('user_id', 'project_id', 'provider'),)

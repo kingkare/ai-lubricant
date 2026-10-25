@@ -194,6 +194,7 @@ async def list_metadata_from_db_async() -> dict:
             item["provider_blacklist"] = list(group.get("provider_blacklist") or [])
             item["schemes"] = [dict(s) for s in (group.get("schemes") or [])]
             item["active_scheme"] = str(group.get("active_scheme") or "")
+            item["compress_models"] = list(group.get("compress_models") or [])
         else:
             item.setdefault("provider_whitelist", [])
             item.setdefault("provider_blacklist", [])
@@ -214,8 +215,8 @@ async def upsert_metadata_async(model_id: str, data: dict) -> dict:
         saved = await PostgresClient.upsert_real_model_metadata(model_id, data or {})
     merged = dict(saved.get("metadata") or {})
     merged["model_id"] = model_id
-    # 行顶层列（渠道标签过滤）一并返回，供管理端保存后回显。
-    for fld in ("provider_whitelist", "provider_blacklist"):
+    # 行顶层列（渠道标签过滤 + 压缩模型候选）一并返回，供管理端保存后回显。
+    for fld in ("provider_whitelist", "provider_blacklist", "compress_models"):
         merged[fld] = list(saved.get(fld) or [])
     return merged
 

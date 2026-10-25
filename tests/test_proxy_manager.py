@@ -44,6 +44,132 @@ def _fake_response():
     return OutboundResponse(status=200, headers={}, body_iter=iter_bytes())
 
 
+# ─── 流式 API 忠实替身（readany / iter_any）──────────────────────────────────
+# 回归：autoclaw relay 事件流用 `resp.content.readany()` 做「单次读等 N 秒」，
+# 旧 OutboundResponse 只实现了 iter_any/read/text/json，缺 readany → 502
+# "'OutboundResponse' object has no attribute 'readany'"。
+
+@pytest.mark.asyncio
+async def test_outbound_response_readany_yields_chunks_then_eof():
+    """readany 一次给一块，读完返回 b""（对齐 aiohttp StreamReader.readany）。"""
+    async def iter_bytes():
+        yield b"chunk-1"
+        yield b"chunk-2"
+
+    resp = OutboundResponse(status=200, headers={}, body_iter=iter_bytes())
+    assert await resp.content.readany() == b"chunk-1"
+    assert await resp.content.readany() == b"chunk-2"
+    assert await resp.content.readany() == b""       # EOF
+    assert await resp.content.readany() == b""       # 幂等
+
+
+@pytest.mark.asyncio
+async def test_outbound_response_readany_after_read_returns_eof():
+    """read() 已把流读到底后 readany 只能给 b""（两者互斥，不重复吐数据）。"""
+    async def iter_bytes():
+        yield b"all"
+
+    resp = OutboundResponse(status=200, headers={}, body_iter=iter_bytes())
+    assert await resp.read() == b"all"
+    assert await resp.content.readany() == b""
+
+
+@pytest.mark.asyncio
+async def test_outbound_response_readany_survives_wait_for_cancel():
+    """回归（生产「无归属事件」，事件流总在最后一字节后恰好一个轮询周期报 EOF）：
+
+    spec 用 ``asyncio.wait_for(resp.content.readany(), N)`` 做「单次读等 N 秒、超了继续等」。
+    旧实现里 readany 是 ``await self._body_iter.__anext__()``——**取消它会终结底层异步
+    生成器**（CancelledError 注入生成器帧、finally 执行完，生成器关闭），之后每次读
+    直接 StopAsyncIteration → 恒返回 b"" → 调用方误判「上游 EOF」，把正常的长静默
+    （agent 规划/跑工具）打成断流。
+
+    现在 readany 走常驻读泵：超时取消的只是「等队列」，生成器不受影响。
+    """
+    closed = {"finally_ran": False}
+
+    async def slow_sse():
+        try:
+            yield b"chunk-1"
+            await asyncio.sleep(0.5)     # 上游静默一段（比下面的等待时间长）
+            yield b"chunk-2"
+            await asyncio.sleep(0.5)
+            yield b"chunk-3"
+        finally:
+            closed["finally_ran"] = True
+
+    resp = OutboundResponse(status=200, headers={}, body_iter=slow_sse())
+    assert await resp.content.readany() == b"chunk-1"
+
+    # 静默期间：wait_for 超时 → 取消这次读 → 绝不能把流打死
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(resp.content.readany(), timeout=0.1)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(resp.content.readany(), timeout=0.1)
+
+    assert await resp.content.readany() == b"chunk-2"
+    assert await resp.content.readany() == b"chunk-3"
+    assert await resp.content.readany() == b""       # 真 EOF（此时生成器已自然耗尽）
+
+
+@pytest.mark.asyncio
+async def test_outbound_response_read_still_works_after_pump():
+    """read()/text()/json() 与 readany 共用同一个读泵（对齐 aiohttp：read 拿的是剩余部分）。"""
+    async def body():
+        yield b"a"
+        yield b"b"
+
+    resp = OutboundResponse(status=200, headers={}, body_iter=body())
+    assert await resp.content.readany() == b"a"
+    assert await resp.read() == b"b"            # 剩余部分（readany 已取走 a）
+    assert await resp.read() == b"b"            # 幂等
+    assert await resp.content.readany() == b""
+
+
+@pytest.mark.asyncio
+async def test_outbound_response_iter_any_survives_cancel():
+    """iter_any 中途取消同样不能毁掉流（其它 spec 的 SSE 读法也依赖这点）。"""
+    async def body():
+        yield b"one"
+        await asyncio.sleep(0.5)
+        yield b"two"
+
+    resp = OutboundResponse(status=200, headers={}, body_iter=body())
+    it = resp.content.iter_any()
+    assert await it.__anext__() == b"one"
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(it.__anext__(), timeout=0.1)
+    assert await it.__anext__() == b"two"
+    with pytest.raises(StopAsyncIteration):
+        await it.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_response_content_is_native_stream():
+    """_AiohttpOutboundResponse.content 必须交出原生 aiohttp StreamReader——
+    StreamReader 自带 readany/readline/readexactly 全部原生 API，spec 才不用逐个补。"""
+    import aiohttp
+    from providers.proxy_manager import _AiohttpOutboundResponse
+
+    class _FakeRawResp:
+        status = 200
+        headers = {}
+        cookies = {}
+
+        def __init__(self):
+            self.content = aiohttp.StreamReader(object(), 2 ** 16)
+
+    class _FakeCtx:
+        async def __aexit__(self, *a):
+            return False
+
+    resp = _AiohttpOutboundResponse(_FakeRawResp(), _FakeCtx())
+    # 关键断言：content 不是包装器本身，而是底层原生流（有 readany）
+    assert resp.content is not resp
+    assert hasattr(resp.content, "readany")
+    await resp._close()
+
+
 # ─── 状态机单测 ──────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

@@ -38,7 +38,19 @@ def init_driver(clients: list[dict] | None = None, external_ws: bool = True) -> 
     global driver
     if driver is None:
         driver = TMWebDriver(clients=clients, external_ws=True)
+        _inject_browser_manager()
     return driver
+
+
+def _inject_browser_manager() -> None:
+    """把浏览器出口管理器注入 ProxyManager（browser 模式经代理通道 WS 转发）。"""
+    try:
+        from mcp_builtin.browser_proxy import get_browser_manager
+        from providers.proxy_manager import set_browser_manager
+        set_browser_manager(get_browser_manager())
+    except Exception:
+        # 注入失败不阻断 CDP bridge 初始化——browser 模式在真正出站时才报错。
+        pass
 
 
 def apply_config(clients: list[dict] | None = None) -> TMWebDriver:
@@ -52,11 +64,6 @@ def get_driver():
     if driver is None:
         raise RuntimeError("CDP bridge is not initialized by MCP runtime")
     return driver
-
-
-def release_holder(holder: str) -> int:
-    """Release all CDP tab leases held by ``holder`` (conversation/agent teardown)."""
-    return get_driver().release_holder(holder)
 
 
 def _get_token() -> str | None:
@@ -267,6 +274,31 @@ async def browser_open_tab(url: str = "", new_window: bool = False, active: bool
 
 
 @mcp.tool()
+async def browser_close_tab(tab_id: str) -> str:
+    """Close a tab by its ID.
+
+    Used by the site runner to evict a stuck or logged-out pooled tab before
+    opening a replacement. Closing the last tab of a window closes the window.
+
+    Args:
+        tab_id: Tab ID to close (from browser_get_tabs).
+    """
+    token = _get_token()
+    def _run():
+        d = get_driver()
+        _ensure_sessions(d, token=token)
+        result = _extension_command(
+            d,
+            {"cmd": "tabs", "method": "close"},
+            tab_id=tab_id,
+            timeout=10,
+            token=token,
+        )
+        return json.dumps({"status": "success", "result": result}, ensure_ascii=False, default=str)
+    return await asyncio.to_thread(_run)
+
+
+@mcp.tool()
 async def browser_batch(commands: list[dict[str, Any]], tab_id: str = "", timeout: float = 20) -> str:
     """Run multiple extension/CDP commands in one request.
 
@@ -351,19 +383,29 @@ async def browser_navigate(url: str) -> str:
 
 
 @mcp.tool()
-async def browser_network_start(tab_id: str = "", url_pattern: str = "") -> str:
-    """Start capturing network requests on a tab (persistent CDP Network listener).
+async def browser_network_start(tab_id: str = "", url_pattern: str = "", push: bool = False, capture_id: str = "") -> str:
+    """Start watching a tab's network traffic (persistent CDP Network listener).
 
-    Attaches the debugger and keeps it attached, streaming requests/responses
-    (including response bodies) into an in-browser buffer until stopped. While
-    capturing, a red "正在监听网络请求" banner is pinned to the top of the page;
+    Advertised to the Agent as ``browser_watch_network`` (the plugin's _TOOLS maps
+    the public name to this function). Attaches the debugger and keeps it attached,
+    buffering every HTTP request (URL, method, headers, status, timing, body) AND
+    every WebSocket frame and SSE message into an in-browser buffer until stopped.
+    While watching, a red "正在监听网络请求" banner is pinned to the top of the page;
     the user can stop it from there too.
 
     Args:
-        tab_id: Tab ID to capture (from browser_get_tabs). Uses active tab if empty.
-        url_pattern: Optional substring filter; only requests whose URL contains
-            this string are captured. Empty captures all requests.
+        tab_id: Tab ID to watch (from browser_get_tabs). Uses active tab if empty.
+        url_pattern: Optional substring filter; only requests/frames whose URL contains
+            this string are kept. Empty watches everything.
+        push: Also stream each matching request/frame to the server as a ``net_event``
+            WebSocket frame, tagged with capture_id. Used by the site runner to
+            await a specific response without polling; default off (pull via
+            browser_network_get) keeps the existing behaviour unchanged.
+        capture_id: Correlation id echoed back on every pushed ``net_event``.
+            Required when push is true.
     """
+    if push and not capture_id:
+        return json.dumps({"status": "error", "msg": "capture_id is required when push is enabled."}, ensure_ascii=False)
     token = _get_token()
     def _run():
         d = get_driver()
@@ -372,17 +414,31 @@ async def browser_network_start(tab_id: str = "", url_pattern: str = "") -> str:
             return json.dumps({"status": "error", "msg": "No browser tabs connected."}, ensure_ascii=False)
         target = tab_id or ctx.default_session_id
         cmd = {"cmd": "net_start", "urlPattern": url_pattern}
+        if push:
+            cmd["push"] = True
+            cmd["captureId"] = capture_id
         result = _extension_command(d, cmd, tab_id=target, timeout=15, token=token)
         return json.dumps({"status": "success", "capture": result}, ensure_ascii=False, default=str)
     return await asyncio.to_thread(_run)
 
 
 @mcp.tool()
-async def browser_network_get(tab_id: str = "") -> str:
-    """Fetch requests captured so far on a tab. Capture keeps running.
+async def browser_network_get(
+    tab_id: str = "",
+    search: str = "",
+    request_id: str = "",
+    frame_index: int = -1,
+) -> str:
+    """Read captured network traffic. Capture keeps running.
+
+    默认只回**概要**：每条请求一行（requestId / method / url / status / mime /
+    大小），不灌 body/headers——先看有哪些请求，需要哪条再深入。
 
     Args:
         tab_id: Tab ID to read (from browser_get_tabs). Uses active tab if empty.
+        search: 只回 URL 含该子串的请求概要（概要级过滤）。
+        request_id: 精确取该请求的全量（headers + response body），只回一条。
+        frame_index: 取第 N 个 WS/SSE 帧的完整 payload（概要里只给了长度）。
     """
     token = _get_token()
     def _run():
@@ -390,7 +446,14 @@ async def browser_network_get(tab_id: str = "") -> str:
         ctx = d.get_context(token)
         _ensure_sessions(d, token=token)
         target = tab_id or ctx.default_session_id
-        result = _extension_command(d, {"cmd": "net_get"}, tab_id=target, timeout=15, token=token)
+        cmd: dict[str, Any] = {"cmd": "net_get"}
+        if search:
+            cmd["search"] = search
+        if request_id:
+            cmd["requestId"] = request_id
+        if frame_index is not None and frame_index >= 0:
+            cmd["frameIndex"] = frame_index
+        result = _extension_command(d, cmd, tab_id=target, timeout=15, token=token)
         return json.dumps({"status": "success", "capture": result}, ensure_ascii=False, default=str)
     return await asyncio.to_thread(_run)
 
@@ -436,6 +499,266 @@ async def browser_screenshot(tab_id: str = "") -> str:
             return json.dumps({"status": "success", "format": "png", "base64": data['data']}, ensure_ascii=False)
         return json.dumps({"status": "success", "data": data}, ensure_ascii=False, default=str)
     return await asyncio.to_thread(_run)
+
+
+@mcp.tool()
+async def browser_totp_code(url: str = "", domain: str = "") -> str:
+    """Get the current TOTP 2FA verification code(s) for a site (Google Authenticator style).
+
+    Looks up the caller's authenticator entries whose linked domains (关联网站) match
+    the given site, computes the current code server-side, and returns it with the
+    seconds remaining before it rotates. Use this when a login flow asks for a
+    two-factor / verification code, then fill it into the page — the secret itself
+    is never exposed, only the ephemeral code.
+
+    Args:
+        url: Page URL (preferred) — the hostname (+port) is matched against linked domains.
+        domain: Bare domain to match when no URL is at hand (e.g. "github.com").
+    """
+    from urllib.parse import urlparse
+
+    token = _get_token()
+    host = ""
+    if url:
+        try:
+            parsed = urlparse(url if "://" in url else f"https://{url}")
+            host = (parsed.hostname or "") + (f":{parsed.port}" if parsed.port else "")
+        except (ValueError, AttributeError):
+            host = ""
+    host = (host or domain or "").strip().lower()
+    if not host:
+        return json.dumps(
+            {"status": "error", "msg": "Provide url or domain to match against linked sites."},
+            ensure_ascii=False,
+        )
+
+    import mcp_plugin_store
+
+    owner = await mcp_plugin_store.get_cdp_client_owner_user_id(token or "")
+    if not owner:
+        return json.dumps(
+            {"status": "error", "msg": "This browser client is not bound to a user; no authenticator available."},
+            ensure_ascii=False,
+        )
+
+    import totp_store
+
+    try:
+        entries = await totp_store.find_by_domain(owner, host)
+    except RuntimeError:
+        return json.dumps({"status": "error", "msg": "Authenticator storage unavailable."}, ensure_ascii=False)
+    if not entries:
+        return json.dumps(
+            {"status": "success", "entries": [],
+             "msg": f"No TOTP authenticator is linked to '{host}'. The user can add one in the extension popup (🛡 icon) or the web console."},
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "status": "success",
+            "entries": [
+                {
+                    "id": e["id"],
+                    "issuer": e["issuer"],
+                    "account": e["account"],
+                    "code": e["code"],
+                    # 绝对失效时刻（epoch 秒）——不是剩余秒数（客户端自己算 now 差）。
+                    "expiresAt": e["expiresAt"],
+                }
+                for e in entries
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+_FILL_RECEIPT_SECRET_KEYS = ("code", "password", "secret", "value", "secret_enc")
+
+
+def _scrub_secrets(node: Any) -> Any:
+    """Recursively drop every secret-shaped key from a value.
+
+    The receipt is built from a whitelist, but ``field`` is copied verbatim from the
+    extension response — a buggy or hostile extension could nest a value there. This
+    is the belt to the whitelist's braces: whatever the shape, a ``code``/``password``
+    key cannot survive to the model."""
+    if isinstance(node, dict):
+        return {k: _scrub_secrets(v) for k, v in node.items() if k not in _FILL_RECEIPT_SECRET_KEYS}
+    if isinstance(node, list):
+        return [_scrub_secrets(v) for v in node]
+    return node
+
+
+def build_fill_receipt(kind: str, entry_meta: dict | None, ext_result: Any) -> dict:
+    """Assemble the model-facing receipt for a fill_credential call.
+
+    **No credential ever leaves here.** Whatever the extension reports back (it may
+    echo the value it typed), this whitelist drops every secret-shaped key so a code
+    or password can never reach the model, the conversation log, or an upstream LLM.
+    """
+    ext = ext_result if isinstance(ext_result, dict) else {}
+    receipt: dict[str, Any] = {
+        "status": "ok" if ext.get("ok", True) else "error",
+        "operation": "fill_credential",
+        "kind": kind,
+        "filled": bool(ext.get("filled")),
+    }
+    if ext.get("field"):
+        receipt["field"] = ext["field"]
+    if ext.get("reason"):
+        receipt["reason"] = ext["reason"]
+    if kind == "otp":
+        if entry_meta:
+            receipt["entry"] = {"issuer": entry_meta.get("issuer"), "account": entry_meta.get("account")}
+        if entry_meta and entry_meta.get("expiresAt") is not None:
+            receipt["expiresAt"] = entry_meta.get("expiresAt")
+    else:  # password
+        if entry_meta:
+            receipt["entry"] = {"username": entry_meta.get("username"), "domain": entry_meta.get("domain")}
+    if not receipt["filled"] and "reason" not in receipt:
+        receipt["reason"] = ext.get("error") or "fill_failed"
+    return _scrub_secrets(receipt)
+
+
+@mcp.tool()
+async def browser_fill_credential(
+    kind: str,
+    url: str = "",
+    domain: str = "",
+    account: str = "",
+    selector: str = "",
+    tab_id: str = "",
+) -> str:
+    """Type a saved credential (2FA code or password) INTO the page — never return it.
+
+    The value travels server → extension → DOM. It is **never** sent back to you: the
+    result is a receipt (what was filled, which entry matched), with no code and no
+    password. Use this whenever a login form asks for a password or a 2FA / verification
+    code and you do not need to read the value yourself. To *read* a code instead, use
+    browser_totp_code.
+
+    Args:
+        kind: "otp" for a TOTP/2FA code, "password" for a saved password (+ username).
+        url: Page URL — its hostname is matched against the entry's linked domains.
+        domain: Bare domain to match when no URL is at hand (e.g. "github.com").
+        account: Which entry to use when several match (username / TOTP account label).
+            Omit it and, if more than one entry matches, nothing is filled and the
+            candidates are returned (labels only, no codes/passwords) for you to retry.
+        selector: Optional explicit CSS selector for the field to fill.
+        tab_id: Tab to act on (from browser_get_tabs). Uses the active tab if empty.
+    """
+    from urllib.parse import urlparse
+
+    kind = str(kind or "").strip().lower()
+    if kind not in ("otp", "password"):
+        return json.dumps({"status": "error", "msg": "kind must be 'otp' or 'password'."}, ensure_ascii=False)
+
+    token = _get_token()
+    host = ""
+    if url:
+        try:
+            parsed = urlparse(url if "://" in url else f"https://{url}")
+            host = (parsed.hostname or "") + (f":{parsed.port}" if parsed.port else "")
+        except (ValueError, AttributeError):
+            host = ""
+    host = (host or domain or "").strip().lower()
+    if not host:
+        return json.dumps({"status": "error", "msg": "Provide url or domain to match the site."}, ensure_ascii=False)
+
+    import mcp_plugin_store
+
+    owner = await mcp_plugin_store.get_cdp_client_owner_user_id(token or "")
+    if not owner:
+        return json.dumps(
+            {"status": "error", "msg": "This browser client is not bound to a user; no credential available."},
+            ensure_ascii=False,
+        )
+
+    account = str(account or "").strip()
+
+    if kind == "otp":
+        import totp_store
+
+        try:
+            entries = await totp_store.find_by_domain(owner, host)
+        except RuntimeError:
+            return json.dumps({"status": "error", "msg": "Authenticator storage unavailable."}, ensure_ascii=False)
+        if not entries:
+            return json.dumps(
+                {"status": "error", "filled": False,
+                 "msg": f"No TOTP authenticator is linked to '{host}'. Ask the user to add it in the extension popup (🛡 icon) or the web console."},
+                ensure_ascii=False,
+            )
+        if account:
+            picked = next((e for e in entries if str(e.get("account") or "") == account), None)
+        else:
+            picked = entries[0] if len(entries) == 1 else None
+        if picked is None:
+            # Disambiguation only — labels, never codes.
+            return json.dumps(
+                {"status": "ok", "operation": "fill_credential", "kind": "otp", "filled": False,
+                 "reason": "multiple_entries",
+                 "entries": [{"issuer": e.get("issuer"), "account": e.get("account")} for e in entries],
+                 "msg": "Several authenticator entries match; retry with `account`."},
+                ensure_ascii=False,
+            )
+        entry_meta = {"issuer": picked.get("issuer"), "account": picked.get("account"),
+                      "expiresAt": picked.get("expiresAt")}
+        fill_value = str(picked.get("code") or "")
+        if not fill_value:
+            return json.dumps({"status": "error", "filled": False, "msg": "Empty TOTP code."}, ensure_ascii=False)
+    else:  # password
+        import browser_password_store as pwd_store
+
+        try:
+            metas = await pwd_store.list_passwords(owner, host)
+        except RuntimeError:
+            return json.dumps({"status": "error", "msg": "Password storage unavailable."}, ensure_ascii=False)
+        if not metas:
+            return json.dumps(
+                {"status": "error", "filled": False,
+                 "msg": f"No saved password for '{host}'. Ask the user to save it in the extension (🔑 icon) or the web console."},
+                ensure_ascii=False,
+            )
+        if account:
+            picked = next((m for m in metas if str(m.get("username") or "") == account), None)
+        else:
+            picked = metas[0] if len(metas) == 1 else None
+        if picked is None:
+            return json.dumps(
+                {"status": "ok", "operation": "fill_credential", "kind": "password", "filled": False,
+                 "reason": "multiple_entries",
+                 "entries": [{"username": m.get("username"), "domain": m.get("domain")} for m in metas],
+                 "msg": "Several saved passwords match; retry with `account`."},
+                ensure_ascii=False,
+            )
+        entry_meta = {"username": picked.get("username"), "domain": picked.get("domain")}
+        # Password value is resolved INSIDE the extension from its own store — the
+        # server never even sees the plaintext on this path.
+        fill_value = ""
+        entry_id = picked.get("id")
+
+    cmd: dict[str, Any] = {"cmd": "fill_credential", "kind": kind, "account": account,
+                           "selector": selector, "domain": host}
+    if kind == "otp":
+        cmd["value"] = fill_value
+    if kind == "password":
+        cmd["username"] = entry_meta.get("username") or ""
+        if entry_id is not None:
+            cmd["entryId"] = entry_id
+
+    def _run():
+        d = get_driver()
+        _ensure_sessions(d, token=token)
+        target = tab_id or d.get_context(token).default_session_id
+        return _extension_command(d, cmd, tab_id=target, timeout=15, token=token)
+
+    try:
+        ext_result = await asyncio.to_thread(_run)
+    except Exception as exc:
+        return json.dumps({"status": "error", "filled": False, "msg": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False)
+
+    return json.dumps(build_fill_receipt(kind, entry_meta, ext_result), ensure_ascii=False)
 
 
 if __name__ == "__main__":

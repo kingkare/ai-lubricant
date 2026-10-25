@@ -41,6 +41,11 @@ async def _bounded_body(request: Request) -> bytes:
 
 @router.post("/projects/{project_id}", status_code=status.HTTP_202_ACCEPTED)
 async def receive_project_webhook(project_id: str, request: Request, response: Response) -> dict:
+    """接收 Git 平台推送的项目评审 webhook（公开入口，凭签名鉴权）。
+
+    校验签名失败 401、body 超限 413、payload 非法 400、webhook 不存在 404；
+    按 delivery_id 幂等去重。评审关闭或事件被忽略时仍以 202 受理并落库。
+    """
     try:
         pid = uuid.UUID(project_id)
     except (TypeError, ValueError):

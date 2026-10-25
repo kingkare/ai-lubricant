@@ -249,6 +249,9 @@ class UserPlatformSettings:
     # does not stall on python:3.11-slim / postgres / redis / npmjs.org.
     # Resolved into concrete addresses by ``mirror_settings()``.
     mirror_mode: str
+    # 环境会话后台同步的间隔（秒）。0 = 禁用——纯网关部署不开这个 worker。
+    # 固定间隔（非 cron）：会话副本只要追上节点即可，精度不需要 cron 语义。
+    env_session_sync_interval: int
 
     def mirror_settings(self) -> dict[str, str]:
         """Concrete domestic mirror addresses when ``MIRROR_MODE=cn``, else ``{}``.
@@ -310,20 +313,23 @@ def _derive_main_database_url() -> str:
 
     The Tortoise/asyncpg pool defaults to ``maxsize=5`` when the DSN carries no
     ``maxsize`` query param — a silent cap independent of
-    ``POSTGRES_POOL_MAX_SIZE``. The main service's asyncpg pool reads that env
-    via ``get_postgres_pool_limits()``; without forwarding it here, every
-    ``mc_*`` query routed through Tortoise contends for 5 connections while the
-    raw ``PostgresClient`` pool sits at 20–100. Forward the same limits onto the
-    DSN so both pools share one configured ceiling (caveat: Tortoise parses these
+    ``POSTGRES_POOL_MAX_SIZE``. The main service's raw ``PostgresClient`` pool
+    reads that env via ``get_postgres_pool_limits()``. This compat layer gets its
+    OWN limits (``get_compat_pool_limits``) instead of forwarding the main pool
+    verbatim: the historical behaviour (``?maxsize=<main>``) meant one env knob
+    silently opened two same-ceiling pools per process and doubled the PG
+    footprint. The compat layer only serves low-frequency ``mc_*`` reads/writes,
+    so its floor defaults to 1 and its ceiling follows the main pool unless
+    ``COMPAT_POOL_MAX_SIZE`` is set. (Caveat: Tortoise parses these query params
     only when ``AI_LUBRICANT_DATABASE_URL`` is not explicitly set — an explicit
-    URL still wins and must carry its own ``?maxsize=`` if a larger pool is
-    intended).
+    URL still wins and must carry its own ``?maxsize=`` if a different pool is
+    intended.)
     """
     try:
-        from bootstrap_config import get_postgres_config, get_postgres_pool_limits
+        from bootstrap_config import get_compat_pool_limits, get_postgres_config
 
         pg = get_postgres_config()
-        limits = get_postgres_pool_limits()
+        limits = get_compat_pool_limits()
     except Exception:
         return ""
     user = quote(str(pg["user"]), safe="")
@@ -334,6 +340,8 @@ def _derive_main_database_url() -> str:
     base = f"asyncpg://{user}:{password}@{host}:{port}/{database}"
     # Tortoise reads ?maxsize=/?minsize= (see AsyncpgDBClient.__init__); without
     # these it falls back to maxsize=5/minsize=1 regardless of the main pool.
+    # minsize may be 0 here (compat layer connects lazily); asyncpg accepts that,
+    # but keep the query param well-formed either way.
     return f"{base}?maxsize={limits['max_size']}&minsize={limits['min_size']}"
 
 
@@ -379,6 +387,7 @@ def load_settings() -> UserPlatformSettings:
         webhook_public_origin=_resolve("AI_LUBRICANT_WEBHOOK_PUBLIC_ORIGIN", "", legacy_name="MONKEYCODE_WEBHOOK_PUBLIC_ORIGIN"),
         review_project_max_concurrency=max(1, _resolve_int("AI_LUBRICANT_REVIEW_PROJECT_MAX_CONCURRENCY", 2, legacy_name="MONKEYCODE_REVIEW_PROJECT_MAX_CONCURRENCY")),
         mirror_mode=_resolve("MIRROR_MODE", ""),
+        env_session_sync_interval=max(0, _resolve_int("AI_LUBRICANT_ENV_SESSION_SYNC_INTERVAL", 300, legacy_name="MONKEYCODE_ENV_SESSION_SYNC_INTERVAL")),
     )
 
 

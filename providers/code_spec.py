@@ -53,7 +53,7 @@ HOOK_ALIASES: dict[str, str] = {
     # 响应 / 配额回调
     "on_response_headers": "响应头回调 (p, headers, model_id, ctx)",
     "update_quota": "从响应头更新配额 (p, headers, model_id)",
-    "check_message": "请求前放行判定 (p, model_id, messages) -> bool",
+    "check_message": "请求前放行判定 (p, model_id, messages[, request_ctx]) -> bool | (bool, reason)；带 request_ctx 时可复现出站体做体量判定，拒绝带 reason（context_window_exceeded→400）",
     "record_message": "请求记账 (p, model_id, messages)",
     # 账号授权
     "account_schema": "声明前端字段/授权入口 () -> dict",
@@ -62,6 +62,21 @@ HOOK_ALIASES: dict[str, str] = {
     "handle_loopback_callback": "本机回调处理 (p, params, poll_params, callback_url='') -> dict|None",
     "begin_device_flow": "设备码授权启动 (p, auth_context=None) -> dict",
     "poll_device_flow": "设备码授权轮询 (p, poll_params, auth_context=None) -> dict",
+    # 账号动作（account actions）：签到 / 同步额度 / 领积分等「作用于账号但不属于聊天」的动作。
+    # 与 refresh_auth（token 续期）并列，由 admin 统一调度（默认值写在 account_schema()["account_actions"]
+    # 的 default 里，用户在渠道「账号动作」面板改频率/开关/账号范围）+ 手动触发。
+    # 每个 action_id 一个独立动作：独立调度、独立手动按钮、独立结果字段，互不牵连。
+    "perform_action": "执行账号动作 (p, action_id, account, cfg) -> dict 要窄写回账号的字段",
+    # 签到条件判断：签到类动作执行前的门（逻辑在 spec，可查 Redis / 账号字段 / 上游）。
+    # 返回 {"ok": bool, "reason": str}：ok=True 具备签到条件（框架继续执行 perform_action）；
+    # ok=False 不具备（框架跳过本次签到，记 skipped + reason，不解冻账号）。
+    # 可选钩子：不声明则框架不做条件门，直接执行（与现有 spec 完全兼容）。
+    "checkin_condition": "签到条件判断 (p, action_id, account, cfg) -> {ok: bool, reason: str}",
+    # 步骤认证（step auth）：spec 完全自定义步骤序列，框架只负责状态存储 + UI 渲染 + 提交分发
+    "begin_step_auth": "步骤认证启动 (p, auth_context=None) -> {task_type:'steps', step:StepDescriptor, step_state:dict, expires_in?:int}",
+    "submit_step_auth": "提交步骤输入 (p, step_id, values, step_state, action=None, auth_context=None) -> {status:'next'|'pending'|'authorized'|'error', ...}",
+    # 凭据文件导入识别
+    "parse_credential_file": "解析上传的凭据文件 (p, filename, content_bytes, cfg=None) -> {fields:{...}, extras:{...}, notes:[...]}",
     # 杂项生命周期
     "on_channel_attached": "渠道配置注入后钩子 (p)",
     "clear_conversations": "清理会话 (p, max_age_hours) -> int",
@@ -101,6 +116,14 @@ CLASS_FLAGS = (
     # 框架只发认证头，spec 再用 headers 钩子补自己的。注意 client_preset="none" 不等于
     # 不套——_effective_client_preset 会按协议兜到默认 preset，只有这个开关能真正关掉。
     "APPLY_CLIENT_PRESET",
+    # 渠道定时任务（原站点服务 register_task 的移植）：spec 声明 SCHEDULED_TASKS = [
+    #   {"id": "keepalive", "frequency_unit": "minutes", "frequency_value": 10},
+    #   {"id": "sync", "frequency_unit": "daily", "daily_time": "10:30", "enabled": False},
+    # ]，每个 id 对应 spec 里一个 @staticmethod def keepalive(p)。
+    # 由 admin 的账号动作调度循环（_account_action_loop）统一驱动——同一调度引擎、
+    # 同一调度词汇（_account_action_due 的 daily/minutes/hours），零新调度器。
+    # 不声明则无渠道任务。声明了任务但没写对应方法的 spec 在加载时即报错（防静默不跑）。
+    "SCHEDULED_TASKS",
 )
 
 
@@ -129,8 +152,88 @@ def _unknown_public_methods(spec: type) -> list[str]:
     return out
 
 
+def validate_scheduled_tasks(name: str, spec: type) -> list[dict]:
+    """校验 spec 声明的渠道定时任务（SCHEDULED_TASKS），返回规范化后的任务表。
+
+    - 每项必须有字符串 ``id``（对应 spec 里同名 ``@staticmethod def id(p)``）与合法调度
+      词汇（``frequency_unit``: daily 需要 ``daily_time`` "HH:MM"；minutes/hours 需要
+      正整数 ``frequency_value``——与 admin ``_account_action_due`` 的取值口径一致）。
+    - id 与合法钩子/类旗标/下划线冲突时报错（防止任务方法名遮蔽钩子）。
+    - ``enabled`` 缺省 True。声明了但方法不存在 → 报错（防静默不跑）。
+    """
+    raw = getattr(spec, "SCHEDULED_TASKS", None)
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise CodeSpecError(
+            f"代码渠道 {name!r} 的 SCHEDULED_TASKS 必须是任务对象列表，得到 {type(raw).__name__}"
+        )
+    out: list[dict] = []
+    seen: set[str] = set()
+    for i, task in enumerate(raw):
+        if not isinstance(task, dict):
+            raise CodeSpecError(f"代码渠道 {name!r} 的 SCHEDULED_TASKS[{i}] 必须是对象")
+        task_id = str(task.get("id") or "").strip()
+        if not task_id or not task_id.replace("_", "").isalnum():
+            raise CodeSpecError(
+                f"代码渠道 {name!r} 的 SCHEDULED_TASKS[{i}].id 非法：{task_id!r}（应为方法名字面量）"
+            )
+        if task_id in seen:
+            raise CodeSpecError(f"代码渠道 {name!r} 的 SCHEDULED_TASKS 里 id 重复：{task_id!r}")
+        seen.add(task_id)
+        if task_id in HOOK_ALIASES or task_id in CLASS_FLAGS or task_id.startswith("_"):
+            raise CodeSpecError(
+                f"代码渠道 {name!r} 的任务 id {task_id!r} 与框架钩子/旗标冲突，请换名"
+            )
+        fn = _resolve_hook(spec, task_id)
+        if fn is None:
+            raise CodeSpecError(
+                f"代码渠道 {name!r} 声明了定时任务 {task_id!r} 但 spec 里没有同名方法"
+                f"（应写 @staticmethod def {task_id}(p)）"
+            )
+        unit = str(task.get("frequency_unit") or "daily").lower()
+        if unit == "daily":
+            hhmm = str(task.get("daily_time") or "10:00")
+            try:
+                hh, mm = hhmm.split(":", 1)
+                if not (0 <= int(hh) < 24 and 0 <= int(mm) < 60):
+                    raise ValueError
+            except (ValueError, AttributeError):
+                raise CodeSpecError(
+                    f"代码渠道 {name!r} 任务 {task_id!r} 的 daily_time 非法：{hhmm!r}（应为 \"HH:MM\"）"
+                ) from None
+        elif unit in ("minutes", "hours"):
+            try:
+                value = int(task.get("frequency_value") or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value <= 0:
+                raise CodeSpecError(
+                    f"代码渠道 {name!r} 任务 {task_id!r} 的 frequency_value 必须是正整数"
+                    f"（unit={unit}）"
+                )
+        else:
+            raise CodeSpecError(
+                f"代码渠道 {name!r} 任务 {task_id!r} 的 frequency_unit 非法：{unit!r}"
+                f"（daily / minutes / hours）"
+            )
+        normalized = {"id": task_id, "frequency_unit": unit}
+        if unit == "daily":
+            normalized["daily_time"] = str(task.get("daily_time") or "10:00")
+        else:
+            normalized["frequency_value"] = int(task.get("frequency_value") or 1)
+        if "enabled" in task:
+            normalized["enabled"] = bool(task["enabled"])
+        out.append(normalized)
+    return out
+
+
 def validate_spec(name: str, spec: type) -> dict[str, Callable]:
-    """校验 spec 类，返回钩子表。误继承基类 / 无可识别钩子都抛 CodeSpecError。"""
+    """校验 spec 类，返回钩子表。误继承基类 / 无可识别钩子都抛 CodeSpecError。
+
+    例外：一个钩子都没写、但 SCHEDULED_TASKS 声明合法的 spec 放行（纯保活型渠道，
+    例如只做浏览器池保温、不打上游 HTTP 的渠道）。
+    """
     if issubclass(spec, BaseProvider):
         raise CodeSpecError(
             f"代码渠道 {name!r} 的类 {spec.__name__} 不应继承 BaseProvider / CustomProvider。"
@@ -139,12 +242,18 @@ def validate_spec(name: str, spec: type) -> dict[str, Callable]:
         )
     hooks = collect_hooks(spec)
     if not hooks:
+        if getattr(spec, "SCHEDULED_TASKS", None):
+            validate_scheduled_tasks(name, spec)  # 合法则放行，非法把报错抛上去
+            return hooks
         unknown = _unknown_public_methods(spec)
         hint = f"（发现未识别方法：{', '.join(unknown)}，是否拼错？）" if unknown else ""
         raise CodeSpecError(
             f"代码渠道 {name!r} 的类 {spec.__name__} 未定义任何可识别钩子{hint}。"
             f"合法钩子：{', '.join(sorted(HOOK_ALIASES))}"
         )
+    # 有钩子的 spec 也校验任务声明（防 id 拼错 / 方法缺失静默不跑）。
+    if getattr(spec, "SCHEDULED_TASKS", None):
+        validate_scheduled_tasks(name, spec)
     return hooks
 
 
@@ -482,11 +591,33 @@ async def _adapter_update_quota_from_headers(self, headers, model_id=None) -> No
     await CustomProvider.update_quota_from_headers(self, headers, model_id)
 
 
-async def _adapter_check_message(self, model_id, messages=None) -> bool:
+async def _adapter_check_message_with_reason(self, model_id, messages=None) -> tuple[bool, str]:
+    """check_message 的「带原因」版本：钩子可返回 bool 或 ``(bool, reason)``。
+
+    钩子签名容得下第 4 个尾参（``request_ctx``）时才多传——选路前由编排层塞进任务级
+    ContextVar 的出站上下文（messages/tools/tool_choice），足够 spec 复现「自己实际发给
+    供应商的请求体」做体量/形态判定（例：IMA 按 build_question 字节数卡 120KB 上游硬闸）。
+    拿不到（admin 只读预检、单测）或老 spec 三参签名 → 按老签名调。绝不「先多传撞
+    TypeError 再重放」——钩子体内的 TypeError 会被误判成签名不符而重跑一次副作用
+    （复用 _call_with_optional_context 的事先探测签名先例，base_count=3：4 参钩子
+    slots=4>3 才多传，3 参钩子 slots=3>3 为假）。
+    """
     hook = self._spec_hooks.get("check_message")
-    if hook is not None:
-        return bool(await _maybe_await(hook(self, model_id, messages)))
-    return await CustomProvider.check_message(self, model_id, messages)
+    if hook is None:
+        return (bool(await CustomProvider.check_message(self, model_id, messages)), "")
+    from rate_limiter import current_routing_request_ctx
+    result = await _call_with_optional_context(
+        hook, (self, model_id, messages), current_routing_request_ctx())
+    if isinstance(result, tuple) and len(result) == 2:
+        return (bool(result[0]), str(result[1] or ""))
+    return (bool(result), "")
+
+
+async def _adapter_check_message(self, model_id, messages=None) -> bool:
+    # 恒等返回 bool：保住 `p.check_message(...) is True/False` 的身份断言（现役 spec 测试）
+    # 与 limits/provider_state 的 check() 把返回值直接当 allowed 的用法。
+    allowed, _reason = await _adapter_check_message_with_reason(self, model_id, messages)
+    return allowed
 
 
 async def _adapter_record_message(self, model_id, messages=None) -> None:
@@ -531,6 +662,72 @@ async def _adapter_refresh_account_auth(self, account: dict, cfg: dict | None = 
     return await _maybe_await(hook(self, account, cfg))
 
 
+async def _adapter_perform_account_action(self, action_id: str, account: dict,
+                                           cfg: dict | None = None) -> dict:
+    """执行一个账号动作（签到 / 同步额度 / 领积分…）。仅在 spec 声明时注入。
+
+    与 ``refresh_account_auth`` 平行：admin 的调度器和手动触发都通过
+    ``provider.perform_account_action(action_id, account, cfg)`` 分发；返回值窄写回
+    该账号（与 refresh_auth 同语义——只写返回里出现的字段，不整份重写）。
+    未声明该钩子的渠道走不了非 refresh_auth 的动作（admin 会报「该渠道未声明此动作」）。
+    """
+    hook = self._spec_hooks["perform_action"]  # 仅在声明时注入
+    return await _maybe_await(hook(self, action_id, account, cfg))
+
+
+async def _adapter_checkin_condition(self, action_id: str, account: dict,
+                                      cfg: dict | None = None) -> dict:
+    """签到条件门：执行签到类动作前问一句「这个账号现在具备签到条件吗」。仅在声明时注入。
+
+    逻辑归 spec（可查 Redis、账号字段、上游活动状态），框架只按返回值决定要不要真的签到：
+    ``{"ok": True}`` → 具备条件，继续跑 perform_action；
+    ``{"ok": False, "reason": "今日已签到"}`` → 不具备，框架记 skipped、**不解冻账号**。
+
+    这是可选钩子：不声明就没有门（框架直接执行，老 spec 行为不变）。
+    """
+    hook = self._spec_hooks["checkin_condition"]  # 仅在声明时注入
+    return await _maybe_await(hook(self, action_id, account, cfg))
+
+
+# ---- 账号授权：步骤认证（同步多步交互）+ 凭据文件导入 ----
+
+async def _adapter_begin_step_auth(self, auth_context: dict | None = None) -> dict:
+    """步骤认证启动：返回第一步 + opaque step_state。仅在 spec 声明时注入。
+
+    与 ``begin_device_flow`` 不同，步骤认证是**同步交互**：不轮询、不进扫描器，
+    用户每提交一步服务端立刻执行该步动作并返回下一步。
+    """
+    hook = self._spec_hooks["begin_step_auth"]  # 仅在声明时注入
+    return await _call_with_optional_context(hook, (self,), auth_context)
+
+
+async def _adapter_submit_step_auth(self, step_id: str, values: dict, step_state: dict,
+                                    action: str | None = None,
+                                    auth_context: dict | None = None) -> dict:
+    """提交一步的输入；返回 next / pending / authorized / error。仅在 spec 声明时注入。
+
+    ``action`` 是可选的动作 id（如「重新发送验证码」），spec 按签名决定是否接收。
+    """
+    hook = self._spec_hooks["submit_step_auth"]  # 仅在声明时注入
+    args: tuple = (self, step_id, values, step_state)
+    if _accepts_extra_positional(hook, len(args)):
+        args = args + (action,)
+    return await _call_with_optional_context(hook, args, auth_context)
+
+
+async def _adapter_parse_credential_file(self, filename: str, content_bytes: bytes,
+                                         cfg: dict | None = None) -> dict:
+    """解析上传的凭据文件（JSON / HAR / cookies.txt 或渠道自定义格式）。仅在声明时注入。
+
+    返回 ``{"fields": {...}, "extras": {...}, "notes": [...]}``；框架把它并入账号表单。
+    """
+    hook = self._spec_hooks["parse_credential_file"]  # 仅在声明时注入
+    args: tuple = (self, filename, content_bytes)
+    if cfg is not None and _accepts_extra_positional(hook, len(args)):
+        args = args + (cfg,)
+    return await _maybe_await(hook(*args))
+
+
 # ---- 杂项生命周期 ----
 
 def _adapter_on_channel_attached(self) -> None:
@@ -555,6 +752,93 @@ async def _adapter_close(self):
     await CustomProvider.close(self)
 
 
+# ---- 浏览器操作门（原站点服务 SiteRuntimeBase 的能力面，现常驻在渠道实例 p 上）----
+#
+# spec 直接驱动 CDP（开 tab / 跑 JS / 抓包），不再绕站点资源 + 回环 HTTP + token。
+# 全部薄委托 ``mcp_builtin.site_server.SiteServer`` 静态方法（无状态公共操作层，与站点
+# 无关）；延迟 import——providers 层不硬依赖 mcp_builtin，对齐 site_runner 的延迟风格。
+# ``p.list_clients()`` 按**渠道归属者**收窄（owner 语义 = 原 site owner：站点/渠道的
+# creator），不认渠道归属就无法枚举别人的浏览器。
+#
+# 约定：渠道自己的常驻 tab（如 duck.ai 池）由 spec 模块级状态自管（namespace 单例，
+# 跨账号存活）；这里的门是一次性/指定 tab 操作，池内 tab 的归属约定在 spec 文档。
+
+def _channel_owner_user_id(p) -> str:
+    """渠道归属者 user id（Channel 原始 cfg 的 owner_user_id；无渠道时空串=管理员视图）。"""
+    channel = getattr(p, "_channel", None)
+    if channel is None:
+        return ""
+    try:
+        return str(channel.get("owner_user_id", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _adapter_site_list_clients(self) -> list[dict]:
+    from mcp_builtin.site_server import SiteServer
+    return await SiteServer.list_clients(_channel_owner_user_id(self))
+
+
+async def _adapter_site_run_js(self, client_id: str, code: str, *, tab_id: str = ""):
+    from mcp_builtin.site_server import SiteServer
+    return await SiteServer.run_js(client_id, code, tab_id=tab_id)
+
+
+async def _adapter_site_open_tab(self, client_id: str, url: str = "", *, active: bool = False) -> str:
+    from mcp_builtin.site_server import SiteServer
+    return await SiteServer.open_tab(client_id, url, active=active)
+
+
+async def _adapter_site_find_tab(self, client_id: str, url_contains: str = "") -> str:
+    from mcp_builtin.site_server import SiteServer
+    return await SiteServer.find_tab(client_id, url_contains)
+
+
+async def _adapter_site_set_default_tab(self, client_id: str, session_key: str) -> None:
+    from mcp_builtin.site_server import SiteServer
+    await SiteServer.set_default_tab(client_id, session_key)
+
+
+async def _adapter_site_navigate(self, client_id: str, url: str, *, tab_id: str = "") -> None:
+    from mcp_builtin.site_server import SiteServer
+    await SiteServer.navigate(client_id, url, tab_id=tab_id)
+
+
+async def _adapter_site_capture_start(self, client_id: str, url_pattern: str = "") -> str:
+    from mcp_builtin.site_server import SiteServer
+    return await SiteServer.capture_start(client_id, url_pattern)
+
+
+async def _adapter_site_wait_capture(self, client_id: str, capture_id: str, *, timeout: float = 30) -> list[dict]:
+    from mcp_builtin.site_server import SiteServer
+    return await SiteServer.wait_capture(client_id, capture_id, timeout=timeout)
+
+
+async def _adapter_site_capture_stop(self, client_id: str, capture_id: str) -> None:
+    from mcp_builtin.site_server import SiteServer
+    await SiteServer.capture_stop(client_id, capture_id)
+
+
+async def _adapter_site_close_tab(self, client_id: str, tab_id: str = "") -> None:
+    from mcp_builtin.site_server import SiteServer
+    await SiteServer.close_tab(client_id, tab_id)
+
+
+# 渠道实例上的浏览器门：方法名 -> 适配器函数。挂载进 namespace，无条件常驻。
+_BROWSER_DOORS = {
+    "run_js": _adapter_site_run_js,
+    "open_tab": _adapter_site_open_tab,
+    "find_tab": _adapter_site_find_tab,
+    "set_default_tab": _adapter_site_set_default_tab,
+    "navigate": _adapter_site_navigate,
+    "capture_start": _adapter_site_capture_start,
+    "wait_capture": _adapter_site_wait_capture,
+    "capture_stop": _adapter_site_capture_stop,
+    "close_tab": _adapter_site_close_tab,
+    "list_clients": _adapter_site_list_clients,
+}
+
+
 # 别名钩子 -> 适配器方法名 + 挂载点（实例方法名）。
 # always=True 常驻（回落 CustomProvider）；always=False 仅在 spec 声明对应钩子时才注入
 # （admin 靠 getattr/501 探测能力，无脑常驻会让探测误判）。
@@ -574,6 +858,7 @@ _INSTANCE_BINDINGS = (
     (_adapter_on_response_headers, "on_response_headers", True),
     (_adapter_update_quota_from_headers, "update_quota_from_headers", True),
     (_adapter_check_message, "check_message", True),
+    (_adapter_check_message_with_reason, "check_message_with_reason", True),
     (_adapter_record_message, "record_message", True),
     (_adapter_on_channel_attached, "_on_channel_attached", True),
     (_adapter_clear_conversations, "clear_conversations", True),
@@ -583,6 +868,11 @@ _INSTANCE_BINDINGS = (
     (_adapter_poll_device_flow, "poll_device_flow", False),
     (_adapter_handle_loopback_callback, "handle_loopback_callback", False),
     (_adapter_refresh_account_auth, "refresh_account_auth", False),
+    (_adapter_perform_account_action, "perform_account_action", False),
+    (_adapter_checkin_condition, "checkin_condition", False),
+    (_adapter_begin_step_auth, "begin_step_auth", False),
+    (_adapter_submit_step_auth, "submit_step_auth", False),
+    (_adapter_parse_credential_file, "parse_credential_file", False),
     (_adapter_generate_image, "generate_image", False),
     (_adapter_generate_video, "generate_video", False),
     (_adapter_generate_speech, "generate_speech", False),
@@ -594,6 +884,11 @@ _PRESENCE_TRIGGER = {
     "poll_device_flow": "poll_device_flow",
     "handle_loopback_callback": "handle_loopback_callback",
     "refresh_account_auth": "refresh_auth",
+    "perform_account_action": "perform_action",
+    "checkin_condition": "checkin_condition",
+    "begin_step_auth": "begin_step_auth",
+    "submit_step_auth": "submit_step_auth",
+    "parse_credential_file": "parse_credential_file",
     "generate_image": "generate_image",
     "generate_video": "generate_video",
     "generate_speech": "generate_speech",
@@ -632,6 +927,10 @@ def build_adapter_class(name: str, spec: type) -> type:
     # 仅在声明时注入，未声明就继承 CustomProvider 原 property。
     if "base_url" in hooks:
         namespace["base_url"] = property(_adapter_base_url)
+
+    # 浏览器操作门：无条件常驻（spec 随时可 p.run_js / p.open_tab / p.capture_* 驱动 CDP）。
+    for door_name, door_fn in _BROWSER_DOORS.items():
+        namespace[door_name] = door_fn
 
     # 类级开关：spec 上写了就复制到适配器类。
     for flag in CLASS_FLAGS:

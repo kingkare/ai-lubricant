@@ -18,7 +18,14 @@ from user_platform.notify_core import _filter_matches, emit_notification
 
 
 class _FakeConn:
-    """Records every SQL call and returns scripted results per method."""
+    """Records every SQL call and returns scripted results per method.
+
+    Doubles as the Tortoise connection returned by ``Tortoise.get_connection``
+    (so it serves the emit-side ``execute_query`` call) and the asyncpg
+    connection handed out by ``PostgresClient.pool.acquire()`` (``execute`` /
+    ``fetch`` / ``fetchrow`` / ``fetchval``). Both reach the same recorder, so a
+    test observes every outbox write regardless of which path produced it.
+    """
 
     def __init__(self):
         self.fetches: list[tuple[str, tuple[Any, ...]]] = []
@@ -46,6 +53,12 @@ class _FakeConn:
         self.executes.append((sql, params))
         return "INSERT 0 1"
 
+    # Tortoise asyncpg backend: ``execute_query(sql, values)`` with the params
+    # as a single list. emit_notification writes the outbox row through this.
+    async def execute_query(self, sql: str, values: list[Any] | None = None):
+        self.executes.append((sql, tuple(values or ())))
+        return (1,)
+
 
 class _FakePool:
     def __init__(self, conn: _FakeConn):
@@ -68,6 +81,12 @@ def _install(monkeypatch, conn: _FakeConn) -> _FakeConn:
     import db
 
     monkeypatch.setattr(db.PostgresClient, "pool", _FakePool(conn))
+    # emit_notification now writes through the Tortoise ``user_platform``
+    # connection instead of PostgresClient.pool. Point it at the same fake so a
+    # test's recorder sees outbox writes from either path.
+    from tortoise import Tortoise
+
+    monkeypatch.setattr(Tortoise, "get_connection", lambda _name: conn)
     return conn
 
 

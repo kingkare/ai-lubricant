@@ -373,6 +373,10 @@ async def list_skills(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> list[dict]:
+    """获取当前用户可见的技能列表。
+
+    ``manage=True`` 时额外包含自己名下未启用的项（管理视图）。
+    """
     return await skill_service.list_skills(
         str(user.id), team_id=team_id, role=user.role, include_disabled_owned=manage,
     )
@@ -385,6 +389,10 @@ async def import_skill_upload(
     skill_md_path: str | None = Form(None),
     user: User = Depends(get_current_user),
 ) -> dict:
+    """从上传文件导入技能（zip / SKILL.md / Markdown），生成新版本。
+
+    上传文件超 20MB 返回 400；zip 内可按 ``skill_md_path`` 指定使用的 SKILL.md 路径。
+    """
     filename = _safe_filename(file.filename or "SKILL.md", "SKILL.md")
     data = await file.read(_MAX_IMPORT_BYTES + 1)
     if len(data) > _MAX_IMPORT_BYTES:
@@ -398,6 +406,11 @@ async def import_skill_upload(
 
 @skill_router.post("/import/url")
 async def import_skill_url(payload: ImportUrlPayload, user: User = Depends(get_current_user)) -> dict:
+    """从公网 URL 下载并导入技能，生成新版本。
+
+    服务端下载：仅 http(s)、禁止内网/本机地址与重定向超限，上限 20MB；
+    ``skill_md_path`` 可覆盖 zip 内默认选中的 SKILL.md。
+    """
     data, filename = _download_remote(payload.url)
     # 技能包场景：前端按 install_spec.skill.entries[i].path+entry 拼出完整路径传入，
     # 服务端用该路径覆盖默认 finder（最短 SKILL.md），确保装的是用户选中的那个。
@@ -449,6 +462,10 @@ async def parse_skill_source(
 
 @skill_router.get("/{skill_id}/experience")
 async def list_skill_experience(skill_id: str, user: User = Depends(get_current_user)) -> dict:
+    """获取技能包内的经验（SOP）文件列表。
+
+    技能不存在或无权访问返回 404。
+    """
     from .skill_domain import skill_domain
     try:
         return {"files": await skill_domain.list_experience(skill_id, user_id=str(user.id))}
@@ -461,6 +478,11 @@ async def write_skill_experience(
     skill_id: str, ref: str, payload: ExperienceWriteRequest,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """写入技能包内的一份经验（SOP）文件，并重新发布该包。
+
+    ``ref`` 为 ``experience/`` 下的 .md 文件名；``create=True`` 允许新建，否则
+    仅覆盖已存在的文件。技能不存在返回 404，ref 非法或文件过大返回 400。
+    """
     from .skill_domain import skill_domain
     try:
         return await skill_domain.write_experience(
@@ -478,6 +500,10 @@ async def write_skill_experience(
 async def delete_skill_experience(
     skill_id: str, ref: str, user: User = Depends(get_current_user),
 ) -> dict:
+    """删除技能包内的一份经验（SOP）文件，并重新发布该包。
+
+    技能不存在或 SOP 不存在返回 404，ref 非法返回 400。
+    """
     from .skill_domain import skill_domain
     try:
         deleted = await skill_domain.delete_experience(skill_id, ref, user_id=str(user.id))
@@ -512,6 +538,10 @@ async def download_skill(skill_id: str, user: User = Depends(get_current_user)):
 
 @skill_router.patch("/{skill_id}")
 async def update_skill(skill_id: str, payload: ResourcePatch, user: User = Depends(get_current_user)) -> dict:
+    """更新技能元数据（名称/描述/启用/强制下发，部分字段）。
+
+    技能不存在或无权访问返回 404。
+    """
     from .skill_domain import skill_domain
 
     try:
@@ -526,6 +556,10 @@ async def update_skill(skill_id: str, payload: ResourcePatch, user: User = Depen
 
 @skill_router.delete("/{skill_id}")
 async def delete_skill(skill_id: str, user: User = Depends(get_current_user)) -> dict:
+    """删除技能（软删除）。
+
+    技能不存在或无权访问返回 404。
+    """
     from .skill_domain import skill_domain
 
     try:
@@ -541,6 +575,10 @@ async def list_plugins(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> list[dict]:
+    """获取当前用户可见的插件列表。
+
+    ``manage=True`` 时额外包含自己名下未启用的项（管理视图）。
+    """
     return await skill_service.list_plugins(
         str(user.id), team_id=team_id, role=user.role, include_disabled_owned=manage,
     )
@@ -551,6 +589,11 @@ async def import_plugin_upload(
     file: UploadFile = File(...), name: str | None = Form(None), description: str | None = Form(None),
     enabled: bool = Form(True), is_force_delivery: bool = Form(False), user: User = Depends(get_current_user),
 ) -> dict:
+    """从上传的 .zip 插件包导入插件，生成新版本。
+
+    包内须含 package.json 与可用的 main/module/exports entry；解析失败或
+    上传超 20MB 返回 400。导入失败时不会留下空壳资源行。
+    """
     filename = _safe_filename(file.filename or "plugin.zip", "plugin.zip")
     data = await file.read(_MAX_IMPORT_BYTES + 1)
     if len(data) > _MAX_IMPORT_BYTES:
@@ -563,6 +606,10 @@ async def import_plugin_upload(
 
 @plugin_router.post("/import/url")
 async def import_plugin_url(payload: ImportUrlPayload, user: User = Depends(get_current_user)) -> dict:
+    """从公网 URL 下载 .zip 插件包并导入，生成新版本。
+
+    仅 http(s)、禁止内网/本机地址，上限 20MB；包内须含 package.json 与 entry。
+    """
     data, filename = _download_remote(payload.url)
     return await _create_plugin_import(
         user=user, data=data, filename=filename, source_type="github", source_url=payload.url,
@@ -609,6 +656,10 @@ async def parse_plugin_source(
 
 @plugin_router.patch("/{plugin_id}")
 async def update_plugin(plugin_id: str, payload: ResourcePatch, user: User = Depends(get_current_user)) -> dict:
+    """更新插件元数据（名称/描述/启用/强制下发，部分字段）。
+
+    插件不存在或无权访问返回 404。
+    """
     row = await _get_owned_plugin(plugin_id, user)
     for key, value in payload.model_dump(exclude_none=True).items():
         setattr(row, key, value)
@@ -619,6 +670,10 @@ async def update_plugin(plugin_id: str, payload: ResourcePatch, user: User = Dep
 
 @plugin_router.delete("/{plugin_id}")
 async def delete_plugin(plugin_id: str, user: User = Depends(get_current_user)) -> dict:
+    """删除插件（软删除）。
+
+    插件不存在或无权访问返回 404。
+    """
     row = await _get_owned_plugin(plugin_id, user)
     row.is_deleted = True
     await row.save(update_fields=["is_deleted", "updated_at"])

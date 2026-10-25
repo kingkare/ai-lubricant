@@ -89,6 +89,7 @@ async def list_resource_references(
     _: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """列团队的资源引用（旧表）。``resource_type`` 非法时返回 400。"""
     if resource_type and resource_type not in references.RESOURCE_TYPES:
         raise HTTPException(400, "unsupported resource type")
     return _envelope(await references.list_references(team_id, resource_type))
@@ -100,6 +101,12 @@ async def create_resource_reference(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """引用一个市场资源给团队（按 module 分流落实体）。
+
+    Body: ``{"module": "prompts|mcp|skills|plugins", "market_id": ...}``。
+    prompts 落 project_prompt、mcp 要求先完成安装配置（409）、skills/plugins
+    留 manifest 引用本体。市场 manifest 拉取失败 502、校验失败 422。
+    """
     module = str(body.get("module") or "")
     market_id = str(body.get("market_id") or "")
     manifest = await _market_manifest(module, market_id)
@@ -129,6 +136,7 @@ async def delete_resource_reference(
     _: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """删除团队的资源引用（旧表）。仍有分组授权时 409，需先撤销分配。"""
     try:
         deleted = await references.delete_reference(team_id, resource_id)
     except ValueError as exc:
@@ -556,6 +564,7 @@ async def list_group_resource_grants(
     _: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """列分组被授权的旧表资源。分组不存在时 404。"""
     try:
         rows = await references.list_group_resources(team_id, group_id, resource_type)
     except ValueError as exc:
@@ -572,6 +581,11 @@ async def set_group_resource_grants(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """整组替换分组的旧表资源授权。
+
+    Body: ``{"resource_ids": [...]}``。分组不存在 404、资源未被团队引用 409、
+    其余校验失败 400。
+    """
     resource_ids = body.get("resource_ids") if isinstance(body.get("resource_ids"), list) else []
     try:
         rows = await references.set_group_resources(
@@ -594,6 +608,7 @@ async def list_effective_resources(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """列调用者可见的生效资源（管理员全量、成员按分组授权）。"""
     if resource_type not in references.RESOURCE_TYPES:
         raise HTTPException(400, "unsupported resource type")
     rows = await references.visible_references(str(user.id), team_id, resource_type)

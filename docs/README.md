@@ -39,3 +39,4 @@
 - [Codex 工作提示词](./codex-prompt.md)：目录结构、计划编写、改动规范和搜索规则。
 - [新对话交接指南](./guides/new-chat-handoff.md)：开启新对话时如何让 AI 继续使用本项目的约定和模式。
 - [指南索引](./guides/README.md)：跨模块工作指南和交接说明。
+- [device-control 能力对齐与诚实性契约](./device-control-capability-alignment.md)：设备远程控制（`device-control/` 子模块）在无特权前提下相对 mobile-mcp 的能力边界、已修的「假成功」类缺陷、扩展命令与「扩一条命令改五处」的坐标。规范性文本在 [`device-control/spec/protocol-v0.md`](../device-control/spec/protocol-v0.md) 的 §8.0 与 Appendix A。

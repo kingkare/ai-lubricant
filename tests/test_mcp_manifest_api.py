@@ -52,11 +52,11 @@ def test_cdp_manifest_uses_uniform_resources_and_runtime_view():
     assert resources["clients"]["schema"]["properties"]["client_id"]["readOnly"] is True
     assert resources["clients"]["storage"]["configType"] == "cdp_client"
     assert resources["clients"]["storage"]["handler"] == "cdp-client"
-    # 方向翻转：可操作用户（多选）+ 可操作 agent 列表。
+    # 方向翻转：可操作用户（多选）。agent 授权已单轨化到 agent 侧 grants，
+    # cdp_client schema 不再携带 agent_ids 字段。
     assert resources["clients"]["schema"]["properties"]["user_ids"]["type"] == "array"
     assert resources["clients"]["schema"]["properties"]["user_ids"]["x-reference"] == "mcp_users"
-    assert resources["clients"]["schema"]["properties"]["agent_ids"]["type"] == "array"
-    assert resources["clients"]["schema"]["properties"]["agent_ids"]["x-reference"] == "agents"
+    assert "agent_ids" not in resources["clients"]["schema"]["properties"]
     assert "session_grants" not in resources
     assert m["config"]["actions"]["rotate_client_token"]["operation"] == "rotate-token"
     assert m["config"]["actions"]["revoke_client"]["operation"] == "revoke"

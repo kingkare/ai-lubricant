@@ -1,7 +1,11 @@
-"""程序发行独立仓库配置（nodes, mobile, device-control）。
+"""程序发行独立仓库配置（nodes, mobile, device-control, server）。
 
 三类程序的二进制资产存放在各自的独立仓库 GitHub Releases 中，
 与 marketplace 仓库（插件资源）分离。本模块负责解析这些独立仓库的配置。
+
+服务端（server）是第四类：它的「发行物」是自包含升级包（主仓 + 两个子模块 +
+VERSION），**直接放主仓 ai-lubricant 自己的 Release**——不另建发行仓，因为包就是
+主仓的产物，放主仓语义最顺、也省一个仓要维护。
 """
 from __future__ import annotations
 
@@ -15,7 +19,7 @@ from .config import parse_repo_url
 class ReleaseRepoSettings:
     """程序发行仓库配置（独立于 marketplace 仓库）。
 
-    用于节点程序、移动端 App、设备控制 App 的二进制资产存储。
+    用于节点程序、移动端 App、设备控制 App、服务端的二进制资产存储。
     """
 
     repo_url: str
@@ -75,6 +79,26 @@ def load_device_control_release_repo() -> ReleaseRepoSettings:
     )
     owner, repo, _ = parse_repo_url(repo_url)
     token = _resolve("DEVICE_CONTROL_RELEASE_GITHUB_TOKEN", "") or _resolve("MARKETPLACE_GITHUB_TOKEN", "")
+    return ReleaseRepoSettings(
+        repo_url=repo_url,
+        github_owner=owner,
+        github_repo=repo,
+        github_token=token,
+    )
+
+
+def load_server_release_repo() -> ReleaseRepoSettings:
+    """加载服务端升级包发行仓库配置。
+
+    **默认就是主仓 ai-lubricant 自己**：升级包是主仓的产物（主仓代码 + 两个
+    子模块 + VERSION），放主仓 Release 语义最顺，不必另建发行仓。
+
+    优先级：SERVER_RELEASE_REPO_URL > 默认主仓 ai-lubricant
+    token 优先级：SERVER_RELEASE_GITHUB_TOKEN > MARKETPLACE_GITHUB_TOKEN
+    """
+    repo_url = _resolve("SERVER_RELEASE_REPO_URL", "https://github.com/wuxin-gh/ai-lubricant")
+    owner, repo, _ = parse_repo_url(repo_url)
+    token = _resolve("SERVER_RELEASE_GITHUB_TOKEN", "") or _resolve("MARKETPLACE_GITHUB_TOKEN", "")
     return ReleaseRepoSettings(
         repo_url=repo_url,
         github_owner=owner,

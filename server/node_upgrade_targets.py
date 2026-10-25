@@ -21,6 +21,18 @@ import aiohttp
 
 _PROBE_TIMEOUT_SECONDS = 20
 
+# Sentinel a client sends as ``proxy_config_id`` when the operator explicitly
+# chose "直连（不使用代理）". It must be distinguishable from an empty string:
+# empty means "not specified, fall back to the node's persistent binding",
+# while this means "force direct, ignore that binding". Resolved to an
+# explicit ``proxy_mode="direct"`` rather than three empty proxy fields,
+# because the node treats an all-empty triple as "the frame carried no proxy"
+# and silently falls back to its persisted egress-proxy snapshot
+# (nodes/common/agent/runtimeupgrade.go) — the same reason the Xcode install
+# job stamps an explicit direct (see nodes_service.start_xcode_install_job).
+# Keep in sync with the frontend's ``DIRECT = "__direct__"``.
+DIRECT_PROXY_ID = "__direct__"
+
 
 class UpgradeTargetError(Exception):
     """A target could not be resolved or is not reachable. Message is user-facing."""
@@ -36,6 +48,12 @@ async def resolve_proxy(proxy_config_id: str | None) -> dict:
     wanted = (proxy_config_id or "").strip()
     if not wanted:
         return {}
+    # The explicit "force direct" sentinel is not a pool entry. Callers that
+    # accept it (upgrade_node) handle it themselves; reaching here means a
+    # caller forwarded it unhandled, which would otherwise resolve to a
+    # nonexistent id error and confuse the operator.
+    if wanted == DIRECT_PROXY_ID:
+        return {"proxy_mode": "direct"}
     from config import CONFIG_STORE
     from proxy_utils import (
         canonical_url_prefix,

@@ -58,7 +58,6 @@ def _task(status="pending", node_session_id=None, content="hello world"):
         kind="develop",
         sub_type=None,
         workspace_key=None,
-        workspace_source_task_id=None,
         source_editor_id=None,
         source_editor_session_id=None,
         runtime_stage="",
@@ -262,10 +261,9 @@ async def test_deferred_dispatch_completes_and_pushes_first_turn(monkeypatch):
     assert task.workspace_state == "ready"
     assert task.status == "processing"  # first turn delivered
     assert client.sent and client.sent[0][1] == "human_message"
-    # Every delivered turn is prefixed with the git-credential policy note; the
-    # user's own text follows it verbatim.
-    assert client.sent[0][2] == task_service_module._with_git_credential_note("hello world")
-    assert client.sent[0][2].endswith("hello world")
+    # Delivered turn content is the user's own text verbatim (the per-turn
+    # git-credential note prefix was removed by user request).
+    assert client.sent[0][2] == "hello world"
     # task.created is emitted exactly once (by the create response, not again
     # when the background dispatch finishes).
     assert len(emitted) == 1

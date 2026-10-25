@@ -148,3 +148,50 @@ async def test_code_run_zero_timeout_never_expires(tmp_path):
         assert action.resolved is None
     finally:
         approval_registry.remove(action.confirmation_id)
+
+
+@pytest.mark.asyncio
+async def test_code_run_auto_approve_runs_without_prompt(tmp_path):
+    """auto 执行模式：code_run 预扫直接记 allow，不发审批卡也不等裁决。
+
+    与「没挂协调器 → denied」的 fail-closed 行为相对：auto 是用户显式选择的
+    高权限模式，但只对本轮、且必须挂上协调器（自动放行的入口是交互式对话）。
+    """
+    registry = _registry(tmp_path)
+    events: list[dict] = []
+
+    async def emit(event: dict) -> None:
+        events.append(event)
+
+    batch = CodeRunApprovalBatch(
+        conversation_id="c1", agent_id=7, caller="u1", emit=emit, auto_approve=True,
+    )
+    registry.set_code_run_approval(batch)
+
+    await batch.prepare(_call("print('auto')"))
+    result = await registry.execute("code_run", {"code": "print('auto')", "type": "python"})
+
+    assert events == []  # 没有任何 confirmation_required
+    assert result["status"] == "ok"
+    # 一次性语义不变：第二次调用拿不到预扫决策 → fail closed。
+    second = await registry.execute("code_run", {"code": "print('auto')", "type": "python"})
+    assert second["status"] == "denied"
+
+
+@pytest.mark.asyncio
+async def test_code_run_auto_approve_without_event_sink_still_denies(tmp_path):
+    """auto_approve 不覆盖 fail-closed：没有事件出口（无人值守）依旧 deny。
+
+    auto_approve 只由交互入口在 mode=auto 时传入（emit 恒非空）；本例直接构造
+    batch 而 emit=None，证明无人值守不会因为这个开关静默获得服务端代码执行。
+    """
+    registry = _registry(tmp_path)
+    batch = CodeRunApprovalBatch(
+        conversation_id="c1", agent_id=7, caller="u1", emit=None, auto_approve=True,
+    )
+    registry.set_code_run_approval(batch)
+
+    await batch.prepare(_call())
+    result = await registry.execute("code_run", {"code": "print(1)", "type": "python"})
+
+    assert result["status"] == "denied"

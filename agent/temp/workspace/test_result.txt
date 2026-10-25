@@ -1,0 +1,5 @@
+('list_models', 'FAIL', "'list' object has no attribute 'get'")
+('get_user_resource', 'FAIL', "'InkStoneClient' object has no attribute 'get_user_resource'")
+('list_dev_machines', 'FAIL', "'InkStoneClient' object has no attribute 'list_dev_machines'")
+('get_disk_quota', 'FAIL', "'InkStoneClient' object has no attribute 'get_disk_quota'")
+('list_disk_files', 'FAIL', "'InkStoneClient' object has no attribute 'list_disk_files'")

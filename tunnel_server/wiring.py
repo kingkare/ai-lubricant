@@ -30,6 +30,8 @@ class RuntimeWorker:
             configure_lease,
             tunnel_runtime_reconciler,
         )
+        from user_platform.tunnel_panel_scheduler import tunnel_panel_scheduler
+        from user_platform.ddns_scheduler import ddns_scheduler
 
         configure_lease(
             owner=settings.instance_id,
@@ -37,6 +39,10 @@ class RuntimeWorker:
         )
         await tunnel_supervisor.start()
         await tunnel_runtime_reconciler.start()
+        # Panel scheduler: 定时签到 / 同步积分 for account-backed kinds (ChmlFrp).
+        await tunnel_panel_scheduler.start()
+        # DDNS: 定时公网 IP 探测 + DNS 同步（记录存 mc_ddns_records）。
+        await ddns_scheduler.start()
         self._task = asyncio.create_task(self._run(), name="tunnel-runtime-worker")
 
     async def stop(self) -> None:
@@ -50,7 +56,11 @@ class RuntimeWorker:
                 await task
         from user_platform.tunnel_runtime_manager import tunnel_runtime_reconciler
         from user_platform.tunnel_supervisor import tunnel_supervisor
+        from user_platform.tunnel_panel_scheduler import tunnel_panel_scheduler
+        from user_platform.ddns_scheduler import ddns_scheduler
 
+        await ddns_scheduler.stop()
+        await tunnel_panel_scheduler.stop()
         await tunnel_runtime_reconciler.stop()
         await tunnel_supervisor.stop()
 

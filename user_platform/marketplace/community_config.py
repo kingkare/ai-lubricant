@@ -38,6 +38,13 @@ MAX_LABEL_CHARS = 64
 # 群类型白名单：前端下拉与其保持一致；不在名单里的类型兜底为 other。
 GROUP_TYPES = ("wechat", "feishu", "dingtalk", "qq", "other")
 
+# 升级检测逻辑（社区配置内的一个配置项）：
+#   ignore  = 直接忽略：检测到新版本也不提示，完全静默
+#   ask     = 每次询问：检测到就弹框问管理员（默认）
+#   once    = 不再提醒：提示过一次后不再弹（升级与否由管理员自己去点）
+UPGRADE_CHECK_MODES = ("ignore", "ask", "once")
+DEFAULT_UPGRADE_CHECK_MODE = "ask"
+
 _CONFIG_KEY = "community"
 
 
@@ -110,7 +117,19 @@ def _normalize(data: dict[str, Any] | None) -> dict[str, Any]:
         ][:MAX_NOTICE_ENTRIES]
         # 开关开着但一条内容都没有 = 没东西可展示，直接视为关闭。
         notice = {"enabled": bool(notice_raw.get("enabled")) and bool(entries), "entries": entries}
-    return {"groups": groups, "notice": notice}
+    # 升级检测逻辑：不在白名单里的值兜底默认（ask），保证老配置/脏值不会让
+    # 前端拿到一个它不认识的值。
+    mode = str(raw.get("upgrade_check_mode") or "").strip()
+    if mode not in UPGRADE_CHECK_MODES:
+        mode = DEFAULT_UPGRADE_CHECK_MODE
+    # 「不再提醒」需要记住提醒过哪个版本，否则每次轮询都会再弹一次。
+    acked = _clean_text(raw.get("upgrade_acked_version"), 64)
+    return {
+        "groups": groups,
+        "notice": notice,
+        "upgrade_check_mode": mode,
+        "upgrade_acked_version": acked,
+    }
 
 
 async def _read_config_blob_async_impl() -> dict[str, Any]:
@@ -143,6 +162,13 @@ async def update_community_config(patch: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(patch.get("notice_enabled"), bool):
         # 便捷字段：只翻开关不动内容（管理端若只想改开关可用）。
         merged["notice"]["enabled"] = patch["notice_enabled"] and bool(merged["notice"]["entries"])
+    if "upgrade_check_mode" in patch:
+        mode = str(patch.get("upgrade_check_mode") or "").strip()
+        merged["upgrade_check_mode"] = (
+            mode if mode in UPGRADE_CHECK_MODES else DEFAULT_UPGRADE_CHECK_MODE
+        )
+    if "upgrade_acked_version" in patch:
+        merged["upgrade_acked_version"] = _clean_text(patch.get("upgrade_acked_version"), 64)
 
     blob = await _read_config_blob_async_impl()
     blob[_CONFIG_KEY] = merged
@@ -158,4 +184,15 @@ async def update_community_config(patch: dict[str, Any]) -> dict[str, Any]:
 
 def public_view(config: dict[str, Any]) -> dict[str, Any]:
     """用户侧/管理端共用的公开视图：只有 groups + notice，无任何内部字段。"""
-    return deepcopy({"groups": config.get("groups") or [], "notice": config.get("notice") or {"enabled": False, "entries": []}})
+    return deepcopy({
+        "groups": config.get("groups") or [],
+        "notice": config.get("notice") or {"enabled": False, "entries": []},
+    })
+
+
+def admin_view(config: dict[str, Any]) -> dict[str, Any]:
+    """管理端视图：公开视图 + 升级检测配置（用户侧不该看到这些运维开关）。"""
+    view = public_view(config)
+    view["upgrade_check_mode"] = config.get("upgrade_check_mode") or DEFAULT_UPGRADE_CHECK_MODE
+    view["upgrade_acked_version"] = config.get("upgrade_acked_version") or ""
+    return view

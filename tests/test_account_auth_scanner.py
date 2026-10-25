@@ -69,9 +69,14 @@ def test_poll_one_auth_task_keeps_timeout_retryable(monkeypatch):
     async def set_state(auth_state, data):
         persisted.append((auth_state, dict(data)))
 
+    async def still_pending(_state):
+        """竞态兜底：本会话仍 pending（未跑到终态），超时应当可重试。"""
+        return None
+
     monkeypatch.setattr(admin, "_read_provider_config", read_config)
     monkeypatch.setattr(admin, "_build_scanner_instance", lambda *args, **kwargs: provider)
     monkeypatch.setattr(admin, "_set_account_auth_state", set_state)
+    monkeypatch.setattr(admin, "_auth_state_raced_to_terminal", still_pending)
 
     before = time.time()
     asyncio.run(admin._poll_one_auth_task(state, record))

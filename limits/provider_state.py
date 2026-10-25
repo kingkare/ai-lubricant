@@ -77,8 +77,17 @@ class ProviderLimitState:
         account_client = self._account_client(context)
         if account_client is None:
             from .rules import LimitLease, LimitReservation, LimitSubject
-            if not await self.provider.check_message(model_id, messages):
-                return LimitReservation(None, LimitDecision(False, "provider_message_quota_exceeded"))
+            # 带 reason 的渠道放行判定：渠道带出 context_window_exceeded 时，
+            # 上层按 _REASON_TO_BUSINESS_CODE 收口成 context_too_large(400) 而非 quota(429)。
+            # getattr 兜底：不继承 BaseProvider 的 provider（测试桩）没有新方法时退回 check_message。
+            checker = getattr(self.provider, "check_message_with_reason", None)
+            if checker is not None:
+                allowed, reason = await checker(model_id, messages)
+            else:
+                allowed, reason = bool(await self.provider.check_message(model_id, messages)), ""
+            if not allowed:
+                return LimitReservation(None, LimitDecision(
+                    False, reason or "provider_message_quota_exceeded"))
             await self.provider.record_message(model_id, messages)
             return LimitReservation(LimitLease(LimitSubject(model=model_id), "provider-only"), LimitDecision(True))
         return await LimitManager.acquire_account(

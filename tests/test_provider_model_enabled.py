@@ -102,8 +102,8 @@ def test_reload_channel_models_keeps_enabled_flag(monkeypatch):
 
 
 def test_refresh_models_update_preserves_extra_config(monkeypatch):
-    """定时同步改名（to_update）沿用原行 extra_config：行级 enabled 开关与
-    max_tokens 等逐模型配置不再被 ON CONFLICT 整覆盖清空。"""
+    """定时同步不碰已入库行：规则不追溯改名，行级 enabled 开关与 max_tokens
+    等逐模型配置原样留着，不会被任何写库动作清空。"""
 
     class _Provider:
         auto_update_models = True
@@ -114,7 +114,8 @@ def test_refresh_models_update_preserves_extra_config(monkeypatch):
 
     pool = _make_pool([], provider=_Provider())
     pool.channel.apply({"model_id_rewrite_rules": [{"pattern": r"[-:]free$", "replacement": ""}]})
-    # 规则把 glm-5.2:free 改名为 glm-5.2；库内仍是旧名且带着行内配置 → 触发 to_update。
+    # 规则本会把 glm-5.2:free 改名为 glm-5.2；但这行已入库 → 名字保留原样，
+    # 同步整轮不写它。
     provider_rows = [{
         "provider": "prov",
         "upstream_model_id": "glm-5.2:free",
@@ -128,7 +129,7 @@ def test_refresh_models_update_preserves_extra_config(monkeypatch):
     async def list_provider_models(cls, provider=None):
         return list(provider_rows)
 
-    async def upsert_provider_model(cls, provider, upstream_model_id, model_id, extra_config=None):
+    async def upsert_provider_model(cls, provider, upstream_model_id, model_id, extra_config=None, **kwargs):
         upserts.append({"provider": provider, "upstream_model_id": upstream_model_id, "model_id": model_id, "extra_config": extra_config})
         provider_rows.append({"provider": provider, "upstream_model_id": upstream_model_id, "model_id": model_id})
 
@@ -148,9 +149,5 @@ def test_refresh_models_update_preserves_extra_config(monkeypatch):
 
     asyncio.run(ModelClientPool.refresh_models())
 
-    assert len(upserts) == 1
-    call = upserts[0]
-    assert call["upstream_model_id"] == "glm-5.2:free"
-    assert call["model_id"] == "glm-5.2"
-    # 行内配置原样保留（含行级 enabled 开关），不再被清成 {}。
-    assert call["extra_config"] == {"max_tokens": 1024, "enabled": False}
+    # 已入库行既没被改名，也没被写库——行内配置与行级开关自然原样保留。
+    assert upserts == []

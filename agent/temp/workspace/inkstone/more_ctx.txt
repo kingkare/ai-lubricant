@@ -1,0 +1,60 @@
+======================================================================
+PATH: /api/ml/v1/mirrors
+--- occ 1 @ 250061 ---
+,use_scene:e.category,install_method:e.installation_method,build_time:e.build_time,logs:e.logs}),_a=async e=>{try{const t=await S.http.get("<<URL>>",{params:{page:e.page,size:e.size,keyword:e.keyword||void 0,building_status:e.building_status||void 0,category:e.category||void 0,sort_type:e.sort_type||"update_time_desc"}});if(t&&t.code===0&&t.data){const{data:n}=t;re
+--- occ 2 @ 250553 ---
+n?.max_count??0}}throw new Error("Invalid response")}catch{return{list:[],total:0,max_count:0}}},xa=async()=>{try{const e=await S.http.get("<<URL>>/limit");return e&&e.code===0&&e.data?typeof e.data=="number"?e.data:e.data.limit||0:10}catch(e){return console.warn("获取镜像个数限制失败，使用默认值:",e),10}},qf=async e=>{try{const t=await S.http.get(`/api/ml/v1/mirrors/${e}`);if(t&&
+--- occ 3 @ 250759 ---
+ata=="number"?e.data:e.data.limit||0:10}catch(e){return console.warn("获取镜像个数限制失败，使用默认值:",e),10}},qf=async e=>{try{const t=await S.http.get(`<<URL>>/${e}`);if(t&&t.code===0&&t.data)return t.data}catch(t){console.warn("获取镜像详情失败，尝试从模拟数据查找:",t)}return null},Wf=async e=>{try{return await S.http.delete(`/api/ml/v1/mirrors/${e}`)}catch(t){return console.error("删除镜像失败:",t)
+--- occ 4 @ 250929 ---
+&&t.code===0&&t.data)return t.data}catch(t){console.warn("获取镜像详情失败，尝试从模拟数据查找:",t)}return null},Wf=async e=>{try{return await S.http.delete(`<<URL>>/${e}`)}catch(t){return console.error("删除镜像失败:",t),{code:-1,msg:"删除失败",data:null}}},$f=async e=>{const t={category:e.use_scene,name:e.name,basic_mirror_id:e.base_image_id,resource_id:e.resource_config_id,build_config_met
+======================================================================
+PATH: /api/ml/v1/mirrors/limit
+--- occ 1 @ 250553 ---
+n?.max_count??0}}throw new Error("Invalid response")}catch{return{list:[],total:0,max_count:0}}},xa=async()=>{try{const e=await S.http.get("<<URL>>");return e&&e.code===0&&e.data?typeof e.data=="number"?e.data:e.data.limit||0:10}catch(e){return console.warn("获取镜像个数限制失败，使用默认值:",e),10}},qf=async e=>{try{const t=await S.http.get(`/api/ml/v1/mirrors/${e}`);if(t&&t.code
+======================================================================
+PATH: /api/ml/v1/inference
+--- occ 1 @ 252556 ---
+{return await S.http.put(`/api/ml/v1/mirrors/${e}`,{data:n})}catch(a){return console.error("编辑镜像失败:",a),{code:-1,msg:"编辑失败",data:null}}},O="<<URL>>",Ea=async e=>{const{page:t=1,size:n=16}=e;try{const a=await S.http.get(`${O}/list`,{params:{...e,page:t,size:n}});if(a?.code===0&&a?.data)return{list:a.data.list||[],total:a.data.total||0,next_token:a.data.next_token};t
+======================================================================
+PATH: /api/ml/v1/resource/capacity-cfg
+--- occ 1 @ 246276 ---
+名称失败",data:{}}}catch(t){return console.error("获取文件名称失败:",t),{code:9999,msg:"获取文件名称失败",data:{}}}},Ff=async()=>{try{const e=await S.http.get("<<URL>>");return e.code===0&&e.data?{code:e.code||0,msg:e.msg||"获取云盘资源申请选项配置失败",data:e.data||{}}:{code:9999,msg:"获取云盘资源申请选项配置失败",data:{}}}catch(e){return console.error("获取云盘资源申请选项配置失败:",e),{code:9999,msg:"获取云盘资源申请选项配置失败",data:{
+======================================================================
+PATH: /api/ml/v1/resource/computility-cfg
+--- occ 1 @ 240213 ---
+d:10,computility_point_remaining:1990,notebook_total:10,notebook_used:2,notebook_remaining:8}}}},Sf=async()=>{try{const e=await S.http.get("<<URL>>");return e.code===0&&e.data?{code:e.code,msg:e.msg||"获取配置成功",data:{total:e.data.total||0,items:e.data.items||[]}}:{code:e?.code||9999,msg:e?.msg||"获取配置失败",data:{total:0,items:[]}}}catch(e){return console.error("获取算力点配置失
+======================================================================
+PATH: /api/ml/v1/resource/capacity-apply
+--- occ 1 @ 246656 ---
+配置失败",data:{}}}},Nf=async(e={})=>{try{const t={inc_quota_amount:e.inc_quota_amount||0,apply_reason:e.apply_reason||""},n=await S.http.post("<<URL>>",{data:t});return{code:n.code||0,msg:n.msg||"云盘容量申请成功",data:n.data??{}}}catch(t){return console.error("云盘容量申请失败:",t),{code:9999,msg:"云盘容量申请失败",data:{}}}},lu=e=>e.showInProd!==!1,du=[{key:"devMachine",label:"我的开发机",icon:
+======================================================================
+PATH: /api/ml/v1/resource/computility-apply
+--- occ 1 @ 240570 ---
+atch(e){return console.error("获取算力点配置失败:",e),{code:9999,msg:"获取配置失败",data:{total:0,items:[]}}}},kf=async e=>{try{const t=await S.http.post("<<URL>>",{data:e});return t.code===0?{code:t.code,msg:t.msg||"申请成功",data:t.data}:{code:t?.code||9999,msg:t?.msg||"申请失败",data:null}}catch(t){return console.error("申请算力点失败:",t),{code:9999,msg:"申请失败",data:null}}},nu=()=>{const{bas
+======================================================================
+PATH: /api/ml/v1/dev-machine/user_resource
+--- occ 1 @ 239226 ---
+nsole.error("获取开发机进入链接失败:",t),{code:500,msg:"获取链接失败，请稍后重试",data:{codeserver:"",jupyterlab:""}}}},Ta=async()=>{try{const e=await S.http.get("<<URL>>");return e.code===0&&e.data?{code:e.code,msg:e.msg||"获取资源信息成功",data:{user_ssoid:e.data.user_ssoid,computility_point_total:e.data.computility_point_total||0,computility_point_used:e.data.computility_point_used||0,computi
+======================================================================
+PATH: /api/ml/v1/training/code_upload_url
+--- occ 1 @ 249718 ---
+ning/extend_duration",{data:e})}catch(t){return console.error("续时长失败:",t),{code:500,msg:"续时长失败，请稍后重试",data:{status:""}}}},zf=e=>S.http.get("<<URL>>",{params:{file_name:e}}),mu=e=>({id:String(e.id),name:e.name,status:e.building_status,base_image:e.basic_mirror,base_image_id:e.basic_mirror_id,model_type:e.model_type,use_scene:e.category,install_method:e.installation_
+======================================================================
+PATH: /api/ml/v1/training/list-monitor
+--- occ 1 @ 248990 ---
+delete",{data:e})}catch(t){return console.error("训练任务失败:",t),{code:500,msg:"删除失败，请稍后重试",data:null}}},Uf=async e=>{const t=await S.http.get(`<<URL>>?ids=${e?.join("&ids=")}`||"",{});return t.code===0?t.data?.list||[]:[]},Bf=async e=>{try{const t=await S.http.get("/api/ml/v1/dataset/mount-list",{params:e});if(t&&t.code===0&&t.data)return t;throw new Error("Invalid re
+======================================================================
+USERS VARS USAGE:
+--- xc @ 181162 ---
+=t&&r(e.lang)},[e.lang]),{lang:t,locale:He[t],setLocale:r}},xc="/api/v1/users/auth",Ec="/api/v1/users/getUserInfo",Pc="/api/v1/users/logout";function Tr(e,t){return function(){retu
+--- xc @ 223548 ---
+e"),bd=async()=>{const e=$r(),{code:t,data:n}=await Rt.post(xc,{data:{code:e},forbidCheckLogin:!0});return t===0&&!!n?.token},wd=async()=>{const{code:e,data:t}=await Rt.post(Ec,{da
+--- Ec @ 181186 ---
+,{lang:t,locale:He[t],setLocale:r}},xc="/api/v1/users/auth",Ec="/api/v1/users/getUserInfo",Pc="/api/v1/users/logout";function Tr(e,t){return function(){return e.apply(t,arguments)}
+--- Ec @ 223662 ---
+!!n?.token},wd=async()=>{const{code:e,data:t}=await Rt.post(Ec,{data:{jwt:te.get(ie)||""}});return e===0&&t?t:null},Sd=async()=>{const{code:e}=await Rt.post(Pc,{data:{jwt:te.get(ie
+--- Pc @ 181217 ---
+:r}},xc="/api/v1/users/auth",Ec="/api/v1/users/getUserInfo",Pc="/api/v1/users/logout";function Tr(e,t){return function(){return e.apply(t,arguments)}}const{toString:Rc}=Object.prot
+--- Pc @ 223759 ---
+n e===0&&t?t:null},Sd=async()=>{const{code:e}=await Rt.post(Pc,{data:{jwt:te.get(ie)||""}});return e===0},kd=()=>{const[e,t]=ve(!1),[n,a]=ve({}),[r,i]=ve(!0);return{goLogin:Me,doLo

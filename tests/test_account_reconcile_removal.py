@@ -50,6 +50,11 @@ class _AccountClientStub:
         self.rpm_limit = 0
         self.tpm_limit = 0
         self.concurrent_limit = 0
+        # 到量冻结维度：rph/tph/rpd/tpd 就地更新也会写（与建池同口径）。
+        self.rph_limit = 0
+        self.tph_limit = 0
+        self.rpd_limit = 0
+        self.tpd_limit = 0
         self.balance = None
         self.balance_threshold = 0.0
         self.disabled = False
@@ -287,3 +292,144 @@ def test_spec_account_field_unchanged_does_not_reauth(monkeypatch):
     )
 
     assert reauthed is False
+
+
+# ── 限流策略经热加载/对账后不得被抹零（「并发设了 1 却不拦」的根因回归）──────────
+
+
+def _apply_in_place_with_policy(monkeypatch, client, runtime_acc: dict,
+                                rate_limit_extra: dict, limit_policy: dict | None):
+    """带 limit_policy 就地更新（不触发重认证的账号字段集）。"""
+    async def _fake_refresh(provider, acc_client):
+        return None
+
+    monkeypatch.setattr(admin, "_refresh_models_after_account_init", _fake_refresh)
+
+    async def run():
+        admin._apply_account_update_in_place(
+            _PoolStub([]), client, runtime_acc,
+            rpm=0, rate_limit_extra=rate_limit_extra, is_disabled=False,
+            limit_policy=limit_policy,
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_policy_concurrency_survives_inplace_reload(monkeypatch):
+    """限流策略 account_concurrent=1 → 就地重载（60s 对账走的就是它）后仍是 1。
+
+    修复前兜底链只读「账号级 → 渠道 rate_limit」，不含策略，账号 config 不带并发键时
+    直接落 0——保存策略一分钟后并发闸静默失效，请求照常打进同一账号。
+    """
+    client = _AccountClientStub("u1")
+    client.concurrent_limit = 1  # 保存策略那一刻 _apply_policy_to_runtime 写的值
+
+    _apply_in_place_with_policy(
+        monkeypatch, client, {"username": "u1"},
+        rate_limit_extra={}, limit_policy={"enabled": True, "account_concurrent": 1},
+    )
+
+    assert client.concurrent_limit == 1
+
+
+def test_policy_tpm_rpm_survive_inplace_reload(monkeypatch):
+    """同一兜底链覆盖 account_tpm/account_rpm（与建池口径一致，不止并发）。"""
+    client = _AccountClientStub("u1")
+
+    _apply_in_place_with_policy(
+        monkeypatch, client, {"username": "u1"},
+        rate_limit_extra={"rpm_per_account": 7},
+        limit_policy={"enabled": True, "account_tpm": 5000, "account_rpm": 3},
+    )
+
+    assert client.tpm_limit == 5000
+    # 策略缺 account_rpm 才落渠道 rpm_per_account；这里策略有值 → 策略优先。
+    assert client.rpm_limit == 3
+
+
+def test_account_level_concurrency_overrides_policy(monkeypatch):
+    """账号级显式并发优先于渠道策略（与建池的账号覆盖顺序一致）。"""
+    client = _AccountClientStub("u1")
+
+    _apply_in_place_with_policy(
+        monkeypatch, client, {"username": "u1", "concurrent_limit": 4},
+        rate_limit_extra={}, limit_policy={"enabled": True, "account_concurrent": 1},
+    )
+
+    assert client.concurrent_limit == 4
+
+
+def test_disabled_policy_falls_to_channel_and_keeps_account_override(monkeypatch):
+    """策略停用：策略档与渠道档都归 0，但账号级显式覆盖仍生效（建池同款语义）。"""
+    client = _AccountClientStub("u1")
+
+    _apply_in_place_with_policy(
+        monkeypatch, client, {"username": "u1", "concurrent_per_account": 2},
+        rate_limit_extra={"concurrent_per_account": 9},
+        limit_policy={"enabled": False, "account_concurrent": 1},
+    )
+
+    assert client.concurrent_limit == 2
+
+    client2 = _AccountClientStub("u2")
+    _apply_in_place_with_policy(
+        monkeypatch, client2, {"username": "u2"},
+        rate_limit_extra={"concurrent_per_account": 9},
+        limit_policy={"enabled": False},
+    )
+    assert client2.concurrent_limit == 0
+
+
+def test_no_policy_uses_channel_rate_limit(monkeypatch):
+    """无权威策略（冷缓存/未配置）→ 落渠道 rate_limit 档，不受策略档影响。"""
+    client = _AccountClientStub("u1")
+
+    _apply_in_place_with_policy(
+        monkeypatch, client, {"username": "u1"},
+        rate_limit_extra={"concurrent_per_account": 5}, limit_policy=None,
+    )
+
+    assert client.concurrent_limit == 5
+
+
+def test_provider_extra_omits_cold_policy(monkeypatch):
+    """冷缓存不得挂全零策略模板，否则限额兜底链会把渠道档反向抹成 0。
+
+    这是「设了并发却不生效」的另一半：60s 对账走同步读取器，而它冷缓存兜底一份
+    account_* 全零的 dict——下游按权威读就归零。修复后只挂确实读到的策略。
+    """
+    import limit_policy_store
+
+    limit_policy_store._policy_cache.pop("p-cold", None)
+    extra = admin._provider_extra("p-cold", {"rate_limit": {"concurrent_per_account": 3}})
+    assert "limit_policy" not in extra
+
+    limit_policy_store._policy_cache["p-warm"] = (0.0, {"account_concurrent": 1, "enabled": True})
+    try:
+        extra = admin._provider_extra("p-warm", {"rate_limit": {}})
+        assert extra.get("limit_policy") == {"account_concurrent": 1, "enabled": True}
+    finally:
+        limit_policy_store._policy_cache.pop("p-warm", None)
+
+
+def test_reconcile_keeps_policy_concurrency_end_to_end(reconcile_env, monkeypatch):
+    """端到端：策略设并发 1，跑一次 60s 对账，运行对象仍是 1（不是被重算成 0）。"""
+    import limit_policy_store
+
+    pool, _removed = reconcile_env(
+        snapshot_accounts=[{"username": "u1"}],
+        pool_usernames=["u1"],
+        db_accounts=[{"username": "u1"}],
+    )
+    client = pool.clients[0]
+    client.concurrent_limit = 1
+    limit_policy_store._policy_cache["p1"] = (
+        0.0, {"enabled": True, "account_concurrent": 1},
+    )
+    try:
+        asyncio.run(runtime_handlers._reconcile_providers())
+    finally:
+        limit_policy_store._policy_cache.pop("p1", None)
+
+    assert client.concurrent_limit == 1

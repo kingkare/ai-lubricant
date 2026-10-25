@@ -1,0 +1,356 @@
+{
+  "total_calls": 29,
+  "unique_endpoints": 29,
+  "endpoint_counts": [
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/create",
+      "count": 1
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/dev-machine/list",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/delete",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/stop",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/rename",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/start",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/enter",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/resource/computility-apply",
+      "count": 1
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/cloud-disk/list",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/mkdir",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/delete",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/rename",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/move",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/copy",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/upload-url",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/download-url",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/check",
+      "count": 1
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/cloud-disk/default-name-list",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/resource/capacity-apply",
+      "count": 1
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/training/list",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/create",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/stop",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/delete",
+      "count": 1
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/dataset/mount-list",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/update_name",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/extend_duration",
+      "count": 1
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/training/code_upload_url",
+      "count": 1
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/mirrors",
+      "count": 1
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/mirrors",
+      "count": 1
+    }
+  ],
+  "calls": [
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/create",
+      "before": "},typeof window>\"u\"&&e({loadRemote:function(){return Promise.resolve(void 0)},loadShare:function(){return Promise.resolve(void 0)}})}const ni=hn.initPromise,tu=ni.then(e=>e.loadRemote(\"discovery_host/PlatformSDK\")),$t=await ni.then(e=>tu),S=$t.__esModule?$t.default:$t,pf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/dev-machine/create\",{data:e})}catch(t){return console.error(\"创建开发机失败:\",t),{code:500,msg:\"创建开发机失败，请稍后重试\",data:null}}},ka=async e=>{try{const t=await S.http.get(\"/api/ml/v1/dev-machine/list\",{params:e}),{code:n,data:a}=t;if(n===0&&a){const r=a;return{list:r.list||[],total:r.total||0}}return{list:[],total:0}}catch(t){return console.error(\"获取开发机列表失败:\",t),{list:[],total:0}}},gf=a",
+      "pos": 237887
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/dev-machine/list",
+      "before": ".loadRemote(\"discovery_host/PlatformSDK\")),$t=await ni.then(e=>tu),S=$t.__esModule?$t.default:$t,pf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/create\",{data:e})}catch(t){return console.error(\"创建开发机失败:\",t),{code:500,msg:\"创建开发机失败，请稍后重试\",data:null}}},ka=async e=>{try{const t=await S",
+      "after": ".http.get(\"/api/ml/v1/dev-machine/list\",{params:e}),{code:n,data:a}=t;if(n===0&&a){const r=a;return{list:r.list||[],total:r.total||0}}return{list:[],total:0}}catch(t){return console.error(\"获取开发机列表失败:\",t),{list:[],total:0}}},gf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/delete\",{data:e})}catch(t){return console.error(\"删除开发机失败:\",t),{code:500,msg:\"删除失败，请稍后重试\",data:{status:\"\"}}}},v",
+      "pos": 238059
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/delete",
+      "before": "data:null}}},ka=async e=>{try{const t=await S.http.get(\"/api/ml/v1/dev-machine/list\",{params:e}),{code:n,data:a}=t;if(n===0&&a){const r=a;return{list:r.list||[],total:r.total||0}}return{list:[],total:0}}catch(t){return console.error(\"获取开发机列表失败:\",t),{list:[],total:0}}},gf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/dev-machine/delete\",{data:e})}catch(t){return console.error(\"删除开发机失败:\",t),{code:500,msg:\"删除失败，请稍后重试\",data:{status:\"\"}}}},vf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/stop\",{data:e})}catch(t){return console.error(\"停止开发机失败:\",t),{code:500,msg:\"停止失败，请稍后重试\",data:{status:\"\"}}}},yf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/rename\",{data:e})",
+      "pos": 238314
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/stop",
+      "before": "|0}}return{list:[],total:0}}catch(t){return console.error(\"获取开发机列表失败:\",t),{list:[],total:0}}},gf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/delete\",{data:e})}catch(t){return console.error(\"删除开发机失败:\",t),{code:500,msg:\"删除失败，请稍后重试\",data:{status:\"\"}}}},vf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/dev-machine/stop\",{data:e})}catch(t){return console.error(\"停止开发机失败:\",t),{code:500,msg:\"停止失败，请稍后重试\",data:{status:\"\"}}}},yf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/rename\",{data:e})}catch(t){return console.error(\"重命名开发机失败:\",t),{code:500,msg:\"重命名失败，请稍后重试\",data:{id:0,name:\"\"}}}},bf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/start\",{data",
+      "pos": 238489
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/rename",
+      "before": ":e})}catch(t){return console.error(\"删除开发机失败:\",t),{code:500,msg:\"删除失败，请稍后重试\",data:{status:\"\"}}}},vf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/stop\",{data:e})}catch(t){return console.error(\"停止开发机失败:\",t),{code:500,msg:\"停止失败，请稍后重试\",data:{status:\"\"}}}},yf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/dev-machine/rename\",{data:e})}catch(t){return console.error(\"重命名开发机失败:\",t),{code:500,msg:\"重命名失败，请稍后重试\",data:{id:0,name:\"\"}}}},bf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/start\",{data:e})}catch(t){return console.error(\"启动开发机失败:\",t),{code:500,msg:\"启动失败，请稍后重试\",data:{status:\"\"}}}},wf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/enter\",{dat",
+      "pos": 238662
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/start",
+      "before": "tch(t){return console.error(\"停止开发机失败:\",t),{code:500,msg:\"停止失败，请稍后重试\",data:{status:\"\"}}}},yf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/rename\",{data:e})}catch(t){return console.error(\"重命名开发机失败:\",t),{code:500,msg:\"重命名失败，请稍后重试\",data:{id:0,name:\"\"}}}},bf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/dev-machine/start\",{data:e})}catch(t){return console.error(\"启动开发机失败:\",t),{code:500,msg:\"启动失败，请稍后重试\",data:{status:\"\"}}}},wf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/enter\",{data:e})}catch(t){return console.error(\"获取开发机进入链接失败:\",t),{code:500,msg:\"获取链接失败，请稍后重试\",data:{codeserver:\"\",jupyterlab:\"\"}}}},Ta=async()=>{try{const e=await S.http.get(\"/api/ml/v1/dev-m",
+      "pos": 238842
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/dev-machine/enter",
+      "before": "atch(t){return console.error(\"重命名开发机失败:\",t),{code:500,msg:\"重命名失败，请稍后重试\",data:{id:0,name:\"\"}}}},bf=async e=>{try{return await S.http.post(\"/api/ml/v1/dev-machine/start\",{data:e})}catch(t){return console.error(\"启动开发机失败:\",t),{code:500,msg:\"启动失败，请稍后重试\",data:{status:\"\"}}}},wf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/dev-machine/enter\",{data:e})}catch(t){return console.error(\"获取开发机进入链接失败:\",t),{code:500,msg:\"获取链接失败，请稍后重试\",data:{codeserver:\"\",jupyterlab:\"\"}}}},Ta=async()=>{try{const e=await S.http.get(\"/api/ml/v1/dev-machine/user_resource\");return e.code===0&&e.data?{code:e.code,msg:e.msg||\"获取资源信息成功\",data:{user_ssoid:e.data.user_ssoid,computility_point_total:e.data.computility_point_total|",
+      "pos": 239016
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/resource/computility-apply",
+      "before": "e.code===0&&e.data?{code:e.code,msg:e.msg||\"获取配置成功\",data:{total:e.data.total||0,items:e.data.items||[]}}:{code:e?.code||9999,msg:e?.msg||\"获取配置失败\",data:{total:0,items:[]}}}catch(e){return console.error(\"获取算力点配置失败:\",e),{code:9999,msg:\"获取配置失败\",data:{total:0,items:[]}}}},kf=async e=>{try{const t=await S",
+      "after": ".http.post(\"/api/ml/v1/resource/computility-apply\",{data:e});return t.code===0?{code:t.code,msg:t.msg||\"申请成功\",data:t.data}:{code:t?.code||9999,msg:t?.msg||\"申请失败\",data:null}}catch(t){return console.error(\"申请算力点失败:\",t),{code:9999,msg:\"申请失败\",data:null}}},nu=()=>{const{basename:e}=oe(be),t=({route:o=\"\",self:s=!0,state:l={},options:d={}})=>{const c=s?`${e}${o||\"\"}`:o||\"\";S.navigate(c,l,d)},n=({route:o=",
+      "pos": 240558
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/cloud-disk/list",
+      "before": "息失败:\",e),{code:9999,msg:\"获取配额信息失败\",data:{}}}},Tf=async(e={})=>{try{const t={page_size:e.page_size,page_token:e.page_token||\"\",dir_path:e.dir_path||\"/\",keyword:e.keyword||\"\",sort_by:e.sort_by||\"modified_at\",sort_order:e.sort_order||\"desc\",dirs_only:e.dirs_only||!1,recursive:e.recursive||!1},n=await S",
+      "after": ".http.get(\"/api/ml/v1/cloud-disk/list\",{params:t});return n.code===0&&n.data?{code:n.code||0,msg:n.msg||\"获取我的云盘列表失败\",data:n.data||{}}:{code:9999,msg:\"获取我的云盘列表失败\",data:{}}}catch(t){return console.error(\"获取我的云盘列表失败:\",t),{code:9999,msg:\"获取我的云盘列表失败\",data:{}}}},Cf=async(e={})=>{try{const t={dir_path:e.dir_path||\"\",dir_name:e.dir_name||\"\"},n=await S.http.post(\"/api/ml/v1/cloud-disk/mkdir\",{data:t});retu",
+      "pos": 242790
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/mkdir",
+      "before": "s:t});return n.code===0&&n.data?{code:n.code||0,msg:n.msg||\"获取我的云盘列表失败\",data:n.data||{}}:{code:9999,msg:\"获取我的云盘列表失败\",data:{}}}catch(t){return console.error(\"获取我的云盘列表失败:\",t),{code:9999,msg:\"获取我的云盘列表失败\",data:{}}}},Cf=async(e={})=>{try{const t={dir_path:e.dir_path||\"\",dir_name:e.dir_name||\"\"},n=await S",
+      "after": ".http.post(\"/api/ml/v1/cloud-disk/mkdir\",{data:t});return{code:n.code||0,msg:n.msg||\"创建文件夹成功\",data:n.data??{}}}catch(t){return console.error(\"创建文件夹失败:\",t),{code:9999,msg:\"创建文件夹失败\",data:{}}}},_f=async(e={})=>{try{const t={file_keys:e.file_keys||[]},n=await S.http.post(\"/api/ml/v1/cloud-disk/delete\",{data:t});return{code:n.code||0,msg:n.msg||\"删除成功\",data:n.data??{}}}catch(t){return console.error(\"删除失",
+      "pos": 243135
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/delete",
+      "before": "path||\"\",dir_name:e.dir_name||\"\"},n=await S.http.post(\"/api/ml/v1/cloud-disk/mkdir\",{data:t});return{code:n.code||0,msg:n.msg||\"创建文件夹成功\",data:n.data??{}}}catch(t){return console.error(\"创建文件夹失败:\",t),{code:9999,msg:\"创建文件夹失败\",data:{}}}},_f=async(e={})=>{try{const t={file_keys:e.file_keys||[]},n=await S",
+      "after": ".http.post(\"/api/ml/v1/cloud-disk/delete\",{data:t});return{code:n.code||0,msg:n.msg||\"删除成功\",data:n.data??{}}}catch(t){return console.error(\"删除失败:\",t),{code:9999,msg:\"删除失败\",data:{}}}},xf=async(e={})=>{try{const t={src_key:e.src_key||\"\",new_name:e.new_name||\"\",conflict_strategy:e.conflict_strategy||\"overwrite\"},n=await S.http.post(\"/api/ml/v1/cloud-disk/rename\",{data:t});return{code:n.code||0,msg:n.",
+      "pos": 243392
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/rename",
+      "before": "v1/cloud-disk/delete\",{data:t});return{code:n.code||0,msg:n.msg||\"删除成功\",data:n.data??{}}}catch(t){return console.error(\"删除失败:\",t),{code:9999,msg:\"删除失败\",data:{}}}},xf=async(e={})=>{try{const t={src_key:e.src_key||\"\",new_name:e.new_name||\"\",conflict_strategy:e.conflict_strategy||\"overwrite\"},n=await S",
+      "after": ".http.post(\"/api/ml/v1/cloud-disk/rename\",{data:t});return{code:n.code||0,msg:n.msg||\"操作成功\",data:n.data??{}}}catch(t){return console.error(\"操作失败:\",t),{code:9999,msg:\"操作失败\",data:{}}}},Ef=async(e={})=>{try{const t={src_keys:e.src_keys||[],dst_dir:e.dst_dir||\"\",conflict_strategy:e.conflict_strategy||\"overwrite\"},n=await S.http.post(\"/api/ml/v1/cloud-disk/move\",{data:t});return{code:n.code||0,msg:n.ms",
+      "pos": 243712
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/move",
+      "before": "v1/cloud-disk/rename\",{data:t});return{code:n.code||0,msg:n.msg||\"操作成功\",data:n.data??{}}}catch(t){return console.error(\"操作失败:\",t),{code:9999,msg:\"操作失败\",data:{}}}},Ef=async(e={})=>{try{const t={src_keys:e.src_keys||[],dst_dir:e.dst_dir||\"\",conflict_strategy:e.conflict_strategy||\"overwrite\"},n=await S",
+      "after": ".http.post(\"/api/ml/v1/cloud-disk/move\",{data:t});return{code:n.code||0,msg:n.msg||\"操作成功\",data:n.data??{}}}catch(t){return console.error(\"操作失败:\",t),{code:9999,msg:\"操作失败\",data:{}}}},Pf=async(e={})=>{try{const t={src_keys:e.src_keys||[],dst_dir:e.dst_dir||\"\",conflict_strategy:e.conflict_strategy||\"\"},n=await S.http.post(\"/api/ml/v1/cloud-disk/copy\",{data:t});return{code:n.code||0,msg:n.msg||\"复制成功\",d",
+      "pos": 244032
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/copy",
+      "before": "t(\"/api/ml/v1/cloud-disk/move\",{data:t});return{code:n.code||0,msg:n.msg||\"操作成功\",data:n.data??{}}}catch(t){return console.error(\"操作失败:\",t),{code:9999,msg:\"操作失败\",data:{}}}},Pf=async(e={})=>{try{const t={src_keys:e.src_keys||[],dst_dir:e.dst_dir||\"\",conflict_strategy:e.conflict_strategy||\"\"},n=await S",
+      "after": ".http.post(\"/api/ml/v1/cloud-disk/copy\",{data:t});return{code:n.code||0,msg:n.msg||\"复制成功\",data:n.data??{}}}catch(t){return console.error(\"复制失败:\",t),{code:9999,msg:\"复制失败\",data:{}}}},Rf=async(e={},t)=>{const n=e.files||[],a=e.dir_path||\"/\";n.forEach(r=>Gt(\"started\",{size:r.file_size,dirPath:a},t));try{const r={dir_path:e.dir_path||\"\",files:e.files||[]},o=(await S.http.post(\"/api/ml/v1/cloud-disk/upl",
+      "pos": 244341
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/upload-url",
+      "before": ".code||0,msg:n.msg||\"复制成功\",data:n.data??{}}}catch(t){return console.error(\"复制失败:\",t),{code:9999,msg:\"复制失败\",data:{}}}},Rf=async(e={},t)=>{const n=e.files||[],a=e.dir_path||\"/\";n.forEach(r=>Gt(\"started\",{size:r.file_size,dirPath:a},t));try{const r={dir_path:e.dir_path||\"\",files:e.files||[]},o=(await S",
+      "after": ".http.post(\"/api/ml/v1/cloud-disk/upload-url\",{data:r})).urls||[];return n.forEach((s,l)=>{const d=o[l];!d?.skipped&&!d?.upload_url&&Gt(\"failed\",{size:s.file_size,dirPath:a},t)}),{urls:o}}catch(r){return console.error(\"获取上传云盘文件地址失败:\",r),n.forEach(i=>Gt(\"failed\",{size:i.file_size,dirPath:a,error:r},t)),{urls:[]}}},Lf=async(e={})=>{try{const t={file_keys:e.file_keys||[]},n=await S.http.post(\"/api/ml",
+      "pos": 244704
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/download-url",
+      "before": "h((s,l)=>{const d=o[l];!d?.skipped&&!d?.upload_url&&Gt(\"failed\",{size:s.file_size,dirPath:a},t)}),{urls:o}}catch(r){return console.error(\"获取上传云盘文件地址失败:\",r),n.forEach(i=>Gt(\"failed\",{size:i.file_size,dirPath:a,error:r},t)),{urls:[]}}},Lf=async(e={})=>{try{const t={file_keys:e.file_keys||[]},n=await S",
+      "after": ".http.post(\"/api/ml/v1/cloud-disk/download-url\",{data:t});return{code:n.code||0,msg:n.msg||\"获取文件下载链接失败\",data:n.data??{}}}catch(t){return console.error(\"获取文件下载链接失败:\",t),{code:9999,msg:\"获取文件下载链接失败\",data:{}}}},Mf=async(e={})=>{try{const t={dst_dir:e.dst_dir||\"\",file_names:e.file_names||[]},n=await S.http.post(\"/api/ml/v1/cloud-disk/check\",{data:t});return{code:n.code||0,msg:n.msg||\"获取文件下载链接失败\",data:n",
+      "pos": 245085
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/cloud-disk/check",
+      "before": "t S.http.post(\"/api/ml/v1/cloud-disk/download-url\",{data:t});return{code:n.code||0,msg:n.msg||\"获取文件下载链接失败\",data:n.data??{}}}catch(t){return console.error(\"获取文件下载链接失败:\",t),{code:9999,msg:\"获取文件下载链接失败\",data:{}}}},Mf=async(e={})=>{try{const t={dst_dir:e.dst_dir||\"\",file_names:e.file_names||[]},n=await S",
+      "after": ".http.post(\"/api/ml/v1/cloud-disk/check\",{data:t});return{code:n.code||0,msg:n.msg||\"获取文件下载链接失败\",data:n.data??{}}}catch(t){return console.error(\"获取文件下载链接失败:\",t),{code:9999,msg:\"获取文件下载链接失败\",data:{}}}},Df=async(e,t,n,a,r)=>{try{const i=await Rt.uploadRaw(e,t,{headers:{\"Content-Type\":n||\"application/octet-stream\"},signal:a,onUploadProgress:o=>{if(r&&o.total){const s=Math.round(o.loaded*100/o.total);r",
+      "pos": 245382
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/cloud-disk/default-name-list",
+      "before": "lication/octet-stream\"},signal:a,onUploadProgress:o=>{if(r&&o.total){const s=Math.round(o.loaded*100/o.total);r(s)}},timeout:0});return i.status===200||i.status===204}catch(i){return console.error(\"上传文件失败:\",i),!1}},If=async(e={})=>{try{const t={dir_path:e.dir_path||\"/\",is_dir:e.is_dir||!1},n=await S",
+      "after": ".http.get(\"/api/ml/v1/cloud-disk/default-name-list\",{params:t});return n.code===0&&n.data?{code:n.code||0,msg:n.msg||\"获取文件名称失败\",data:n.data||{}}:{code:9999,msg:\"获取文件名称失败\",data:{}}}catch(t){return console.error(\"获取文件名称失败:\",t),{code:9999,msg:\"获取文件名称失败\",data:{}}}},Ff=async()=>{try{const e=await S.http.get(\"/api/ml/v1/resource/capacity-cfg\");return e.code===0&&e.data?{code:e.code||0,msg:e.msg||\"获取云盘资源",
+      "pos": 245971
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/resource/capacity-apply",
+      "before": ".code||0,msg:e.msg||\"获取云盘资源申请选项配置失败\",data:e.data||{}}:{code:9999,msg:\"获取云盘资源申请选项配置失败\",data:{}}}catch(e){return console.error(\"获取云盘资源申请选项配置失败:\",e),{code:9999,msg:\"获取云盘资源申请选项配置失败\",data:{}}}},Nf=async(e={})=>{try{const t={inc_quota_amount:e.inc_quota_amount||0,apply_reason:e.apply_reason||\"\"},n=await S",
+      "after": ".http.post(\"/api/ml/v1/resource/capacity-apply\",{data:t});return{code:n.code||0,msg:n.msg||\"云盘容量申请成功\",data:n.data??{}}}catch(t){return console.error(\"云盘容量申请失败:\",t),{code:9999,msg:\"云盘容量申请失败\",data:{}}}},lu=e=>e.showInProd!==!1,du=[{key:\"devMachine\",label:\"我的开发机\",icon:\"icon-kexueScience\",iconSize:16,order:1,path:\"dev-machine\",showInDev:!0,showInStaging:!0,showInProd:!0},{key:\"cloud\",label:\"全部文件\",icon",
+      "pos": 246644
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/training/list",
+      "before": "_time:\"2024-01-15\"}]},{id:2,did:\"dataset-002\",name:\"COCO 2017\",description:\"目标检测和分割数据集\",size:\"25GB\",file_count:123287,source:\"my-dataset\",version_list:[{id:1,name:\"v1.0\",created_time:\"2024-01-01\"}]}],Ca=async e=>{const{page:t=1,size:n=16}=e;await new Promise(a=>setTimeout(a,800));try{const a=await S",
+      "after": ".http.get(\"/api/ml/v1/training/list\",{params:{...e,page:t,size:n}});if(a&&a.code===0&&a.data)return{list:a.data.list||[],total:a.data.total||0,size:a.data.size,next_token:a.data.next_token};throw new Error(\"Invalid response format\")}catch(a){console.warn(\"获取训练任务列表失败，使用模拟数据:\",a)}},Af=async e=>{try{return await S.http.post(\"/api/ml/v1/training/create\",{data:e})}catch(t){return console.error(\"创建训练任务失",
+      "pos": 248165
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/create",
+      "before": "api/ml/v1/training/list\",{params:{...e,page:t,size:n}});if(a&&a.code===0&&a.data)return{list:a.data.list||[],total:a.data.total||0,size:a.data.size,next_token:a.data.next_token};throw new Error(\"Invalid response format\")}catch(a){console.warn(\"获取训练任务列表失败，使用模拟数据:\",a)}},Af=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/training/create\",{data:e})}catch(t){return console.error(\"创建训练任务失败:\",t),{code:500,msg:\"创建训练任务失败，请稍后重试\",data:null}}},Of=async e=>{try{return await S.http.post(\"/api/ml/v1/training/stop\",{data:e})}catch(t){return console.error(\"停止训练任务失败:\",t),{code:500,msg:\"停止失败，请稍后重试\",data:{status:\"\"}}}},jf=async e=>{try{return await S.http.post(\"/api/ml/v1/training/delete\",{data:e})}catch(t){",
+      "pos": 248477
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/stop",
+      "before": "_token};throw new Error(\"Invalid response format\")}catch(a){console.warn(\"获取训练任务列表失败，使用模拟数据:\",a)}},Af=async e=>{try{return await S.http.post(\"/api/ml/v1/training/create\",{data:e})}catch(t){return console.error(\"创建训练任务失败:\",t),{code:500,msg:\"创建训练任务失败，请稍后重试\",data:null}}},Of=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/training/stop\",{data:e})}catch(t){return console.error(\"停止训练任务失败:\",t),{code:500,msg:\"停止失败，请稍后重试\",data:{status:\"\"}}}},jf=async e=>{try{return await S.http.post(\"/api/ml/v1/training/delete\",{data:e})}catch(t){return console.error(\"训练任务失败:\",t),{code:500,msg:\"删除失败，请稍后重试\",data:null}}},Uf=async e=>{const t=await S.http.get(`/api/ml/v1/training/list-monitor?ids=${e?.join(\"&ids=\")}`",
+      "pos": 248647
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/delete",
+      "before": "data:e})}catch(t){return console.error(\"创建训练任务失败:\",t),{code:500,msg:\"创建训练任务失败，请稍后重试\",data:null}}},Of=async e=>{try{return await S.http.post(\"/api/ml/v1/training/stop\",{data:e})}catch(t){return console.error(\"停止训练任务失败:\",t),{code:500,msg:\"停止失败，请稍后重试\",data:{status:\"\"}}}},jf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/training/delete\",{data:e})}catch(t){return console.error(\"训练任务失败:\",t),{code:500,msg:\"删除失败，请稍后重试\",data:null}}},Uf=async e=>{const t=await S.http.get(`/api/ml/v1/training/list-monitor?ids=${e?.join(\"&ids=\")}`||\"\",{});return t.code===0?t.data?.list||[]:[]},Bf=async e=>{try{const t=await S.http.get(\"/api/ml/v1/dataset/mount-list\",{params:e});if(t&&t.code===0&&t.data)return t;thr",
+      "pos": 248818
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/dataset/mount-list",
+      "before": "t(\"/api/ml/v1/training/delete\",{data:e})}catch(t){return console.error(\"训练任务失败:\",t),{code:500,msg:\"删除失败，请稍后重试\",data:null}}},Uf=async e=>{const t=await S.http.get(`/api/ml/v1/training/list-monitor?ids=${e?.join(\"&ids=\")}`||\"\",{});return t.code===0?t.data?.list||[]:[]},Bf=async e=>{try{const t=await S",
+      "after": ".http.get(\"/api/ml/v1/dataset/mount-list\",{params:e});if(t&&t.code===0&&t.data)return t;throw new Error(\"Invalid response\")}catch(t){return console.warn(\"获取数据集列表失败，使用模拟数据:\",t),{code:0,data:{dataset_list:uu}}}},Vf=async e=>{try{return await S.http.post(\"/api/ml/v1/training/update_name\",{data:e})}catch(t){return console.error(\"重命名训练任务失败:\",t),{code:500,msg:\"重命名失败，请稍后重试\",data:{id:0,name:\"\"}}}},Hf=asyn",
+      "pos": 249127
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/update_name",
+      "before": "e===0?t.data?.list||[]:[]},Bf=async e=>{try{const t=await S.http.get(\"/api/ml/v1/dataset/mount-list\",{params:e});if(t&&t.code===0&&t.data)return t;throw new Error(\"Invalid response\")}catch(t){return console.warn(\"获取数据集列表失败，使用模拟数据:\",t),{code:0,data:{dataset_list:uu}}}},Vf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/training/update_name\",{data:e})}catch(t){return console.error(\"重命名训练任务失败:\",t),{code:500,msg:\"重命名失败，请稍后重试\",data:{id:0,name:\"\"}}}},Hf=async e=>{try{return await S.http.post(\"/api/ml/v1/training/extend_duration\",{data:e})}catch(t){return console.error(\"续时长失败:\",t),{code:500,msg:\"续时长失败，请稍后重试\",data:{status:\"\"}}}},zf=e=>S.http.get(\"/api/ml/v1/training/code_upload_url\",{params:{file",
+      "pos": 249368
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/training/extend_duration",
+      "before": "catch(t){return console.warn(\"获取数据集列表失败，使用模拟数据:\",t),{code:0,data:{dataset_list:uu}}}},Vf=async e=>{try{return await S.http.post(\"/api/ml/v1/training/update_name\",{data:e})}catch(t){return console.error(\"重命名训练任务失败:\",t),{code:500,msg:\"重命名失败，请稍后重试\",data:{id:0,name:\"\"}}}},Hf=async e=>{try{return await S",
+      "after": ".http.post(\"/api/ml/v1/training/extend_duration\",{data:e})}catch(t){return console.error(\"续时长失败:\",t),{code:500,msg:\"续时长失败，请稍后重试\",data:{status:\"\"}}}},zf=e=>S.http.get(\"/api/ml/v1/training/code_upload_url\",{params:{file_name:e}}),mu=e=>({id:String(e.id),name:e.name,status:e.building_status,base_image:e.basic_mirror,base_image_id:e.basic_mirror_id,model_type:e.model_type,use_scene:e.category,install_",
+      "pos": 249551
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/training/code_upload_url",
+      "before": "name\",{data:e})}catch(t){return console.error(\"重命名训练任务失败:\",t),{code:500,msg:\"重命名失败，请稍后重试\",data:{id:0,name:\"\"}}}},Hf=async e=>{try{return await S.http.post(\"/api/ml/v1/training/extend_duration\",{data:e})}catch(t){return console.error(\"续时长失败:\",t),{code:500,msg:\"续时长失败，请稍后重试\",data:{status:\"\"}}}},zf=e=>S",
+      "after": ".http.get(\"/api/ml/v1/training/code_upload_url\",{params:{file_name:e}}),mu=e=>({id:String(e.id),name:e.name,status:e.building_status,base_image:e.basic_mirror,base_image_id:e.basic_mirror_id,model_type:e.model_type,use_scene:e.category,install_method:e.installation_method,build_time:e.build_time,logs:e.logs}),_a=async e=>{try{const t=await S.http.get(\"/api/ml/v1/mirrors\",{params:{page:e.page,size:",
+      "pos": 249707
+    },
+    {
+      "method": "GET",
+      "url": "/api/ml/v1/mirrors",
+      "before": "url\",{params:{file_name:e}}),mu=e=>({id:String(e.id),name:e.name,status:e.building_status,base_image:e.basic_mirror,base_image_id:e.basic_mirror_id,model_type:e.model_type,use_scene:e.category,install_method:e.installation_method,build_time:e.build_time,logs:e.logs}),_a=async e=>{try{const t=await S",
+      "after": ".http.get(\"/api/ml/v1/mirrors\",{params:{page:e.page,size:e.size,keyword:e.keyword||void 0,building_status:e.building_status||void 0,category:e.category||void 0,sort_type:e.sort_type||\"update_time_desc\"}});if(t&&t.code===0&&t.data){const{data:n}=t;return{list:(n.list||[]).map(mu),total:n?.pagination?.total??n?.list?.length??0,max_count:n?.max_count??n?.pagination?.max_count??0}}throw new Error(\"Inv",
+      "pos": 250050
+    },
+    {
+      "method": "POST",
+      "url": "/api/ml/v1/mirrors",
+      "before": "0).map(n=>({method:n.install_method,set:n.packages.map(a=>{const r=a.lastIndexOf(\"==\");return r>0?{name:a.slice(0,r),version:a.slice(r+2)}:{name:a}})}))),e.build_config.type===\"dockerfile\"&&e.build_config.dockerfile_content&&(t.dockerfile_content=e.build_config.dockerfile_content);try{return await S",
+      "after": ".http.post(\"/api/ml/v1/mirrors\",{data:t})}catch(n){return console.error(\"创建镜像失败:\",n),{code:-1,msg:\"创建失败\",data:{id:\"\",name:\"\",status:\"failed\"}}}},Gf=async(e,t)=>{const n={category:t.use_scene,name:t.name,basic_mirror_id:t.base_image_id,resource_id:t.resource_config_id,build_config_method:t.build_config.type};t.build_config.type===\"quick\"&&t.build_config.dependency_groups&&(n.quick_install_set=t.bui",
+      "pos": 251657
+    }
+  ]
+}

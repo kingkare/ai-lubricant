@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import hashlib
 
-from providers.base import BaseProvider, make_insecure_connector
+from providers.base import BaseProvider, make_insecure_connector, ChannelError
+from providers.base import CredentialInvalid, QuotaExhausted, TemporaryFreeze
+from providers.base import UpstreamTransient, RateLimited, InvalidRequest
 from providers.custom import CustomProvider
 from providers.code_spec import (
     CodeSpecError,
@@ -98,6 +100,17 @@ def _build_namespace() -> dict:
         "make_insecure_connector": make_insecure_connector,
         "JdbcClient": JdbcClient,
         "HTTPException": HTTPException,
+        # 渠道语义异常：错误 → 账号状态的统一入口（docs/channel-error-semantics-design.md）。
+        # 改状态：CredentialInvalid（凭证失效）/ QuotaExhausted（额度耗尽）/
+        #         TemporaryFreeze（临时冻结，时长可参数指定）；特殊处理（不改状态）：
+        #         UpstreamTransient / RateLimited / InvalidRequest。基类 ChannelError 一般不用。
+        "ChannelError": ChannelError,
+        "CredentialInvalid": CredentialInvalid,
+        "QuotaExhausted": QuotaExhausted,
+        "TemporaryFreeze": TemporaryFreeze,
+        "UpstreamTransient": UpstreamTransient,
+        "RateLimited": RateLimited,
+        "InvalidRequest": InvalidRequest,
         # 渠道 / 账号 / 限流 / 出口（授权类与回调类）
         "Channel": Channel,                 # 渠道领域对象；self._channel 即此类型
         "ModelClientPool": ModelClientPool, # 渠道池单例（读兄弟渠道、查路由等）

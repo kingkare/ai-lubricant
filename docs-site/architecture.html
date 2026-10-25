@@ -103,7 +103,7 @@
 <tr><td><code>browser_screenshot</code></td><td>截取活动标签（返回 base64 PNG）</td></tr>
 <tr><td><code>browser_batch</code></td><td>一次请求执行多个扩展/CDP 命令</td></tr>
 <tr><td><code>browser_wait</code></td><td>等待某 JavaScript 条件返回真值</td></tr>
-<tr><td><code>browser_network_start / get / stop</code></td><td>启动/读取/停止标签网络请求捕获（附加调试器、缓冲事件、返回捕获）</td></tr>
+<tr><td><code>browser_watch_network / read_network / unwatch_network</code></td><td>监听/读取/停止标签网络流量（HTTP 请求 + WebSocket 帧 + SSE 消息；附加调试器、缓冲事件）</td></tr>
 </tbody></table></div>
 <h3>两种 token 不能混用</h3>
 <div class="danger"><strong>连接 token ≠ MCP 访问 token</strong>Chrome 扩展的<strong>连接 token</strong>只用于扩展↔平台的 WebSocket 握手；外部 MCP 客户端访问 <code>/mcp/cdp-bridge/sse</code> 用的是单独签发、<strong>绑定具体 CDP client</strong> 的 MCP 访问 token。per-request token 路由到对应浏览器会话池，一个外部 token 只能操作它绑定的那个 client——未绑定会得到 "not authorized to operate any CDP client"。</div>

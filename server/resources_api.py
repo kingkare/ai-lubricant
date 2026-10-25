@@ -150,6 +150,7 @@ async def _do_mirror(mirror_id: int, module: str, req: MirrorRequest) -> None:
 
 @router.get("/{module}/mirrors")
 async def list_mirrors(module: str, authorization: str | None = Header(None)) -> dict:
+    """列某模块的镜像存档清单（管理端，密钥不回传）。"""
     await _require_admin(authorization)
     if module not in store.ALLOWED_MODULES:
         raise HTTPException(400, f"unsupported module: {module}")
@@ -192,6 +193,7 @@ async def refresh_mirror(module: str, mirror_id: int, authorization: str | None 
 
 @router.delete("/{module}/mirror/{mirror_id}")
 async def delete_mirror(module: str, mirror_id: int, authorization: str | None = Header(None)) -> dict:
+    """删除镜像存档（连同磁盘上的 tar.gz），仅限镜像根目录内的文件。"""
     await _require_admin(authorization)
     row = await store.get_mirror(mirror_id)
     if not row or row.get("module") != module:

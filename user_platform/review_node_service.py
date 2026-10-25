@@ -8,9 +8,9 @@ Two responsibilities:
    must be online / approved / execution-role).
 2. **Slot-lease scheduling** — pick a node from the candidate pool that still
    has a free review slot (``ReviewNodeLease``), honouring the per-node review
-   capacity. Unlike ``TaskNodeBinding`` (one task per node for its lifetime), a
-   review lease is a short-lived slot so a node can host several reviews up to
-   its capacity.
+   capacity. Unlike the retired exclusive node binding (one task per node for
+   its lifetime), a review lease is a short-lived slot so a node can host
+   several reviews up to its capacity.
 """
 from __future__ import annotations
 

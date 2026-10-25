@@ -281,6 +281,111 @@ async def test_materialize_apple_id_session_expired(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_materialize_auto_relogin_recovers(monkeypatch):
+    """会话失效 + 密码密文在库 → 静默重登成功后物化成功，不发 412。
+
+    受信设备已信任过，begin_login 只要密码就够（不弹 2FA）——这就是
+    「token 过期用户无感」的路径。
+    """
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from user_platform import routes_ios
+    from user_platform.apple_signing import password_crypto as pc
+    from user_platform.apple_signing.errors import GsaError
+
+    calls = {"ensure": 0}
+
+    def flaky_ensure(*a, **k):
+        calls["ensure"] += 1
+        if calls["ensure"] == 1:
+            raise GsaError("Apple error 201: session expired")
+        # 重登后带的是 fresh session → 物化成功
+        return None
+
+    monkeypatch.setattr(provision, "ensure_signing_assets", flaky_ensure)
+
+    class _Gsa:
+        def begin_login(self, email, password):
+            assert password == "Correct-Horse-2026"
+            return {
+                "status": "authenticated",
+                "session": {
+                    "email": email,
+                    "adsid": "AD-2",
+                    "GsIdmsToken": "TK-2",
+                    "auth_token": "AT-2",
+                    "auth_token_expiry": "2026-11-01T00:00:00Z",
+                },
+            }
+
+    engine = SimpleNamespace(
+        provision=provision, gsa=_Gsa(), developer=SimpleNamespace(list_teams=lambda *a: [])
+    )
+    monkeypatch.setattr(routes_ios, "_load_apple_engine", lambda: engine)
+
+    import server.ios_store as ios_store
+
+    writes: list[dict] = []
+
+    async def fake_update_secret(pid, secret):
+        writes.append(secret)
+        return True
+
+    monkeypatch.setattr(ios_store, "update_signing_profile_secret", fake_update_secret)
+
+    monkeypatch.setenv("APPLE_SIGNING_PASSWORD_KEY", "test-apple-signing-key-0123456789abcdef")
+    secret = _apple_secret(udids=["OTHER-UDID"])
+    secret["password_enc"] = pc.encrypt_apple_password("Correct-Horse-2026")
+    secret["email"] = "someone@example.com"
+    profile = {"id": 3, "kind": "apple_id", "secret_data": secret}
+
+    material, bundle = await routes_ios._materialize_apple_id(
+        profile, owner_user_id="u1", udid=UDID, wda_bundle_id="com.wda.base"
+    )
+    # 物化成功 + session 换成 fresh token + 没有 session_expired 标记
+    assert material["kind"] == "p12"
+    assert calls["ensure"] == 2
+    assert writes and writes[-1].get("auth_token") == "AT-2"
+    assert writes[-1].get("session_expired") is False
+    # 密码密文必须保留（自动重登还要用）
+    assert writes[-1].get("password_enc") == secret["password_enc"]
+
+
+@pytest.mark.asyncio
+async def test_materialize_no_password_still_412(monkeypatch):
+    """会话失效但没存密码（老配置）→ 老老实实 412，绝不静默吞。"""
+    from user_platform import routes_ios
+    from user_platform.apple_signing.errors import GsaError
+
+    monkeypatch.setattr(provision, "ensure_signing_assets", lambda *a, **k: (_ for _ in ()).throw(GsaError("session expired")))
+    engine = SimpleNamespace(provision=provision)
+    monkeypatch.setattr(routes_ios, "_load_apple_engine", lambda: engine)
+
+    import server.ios_store as ios_store
+    import user_platform.notify_core as notify_core
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(ios_store, "update_signing_profile_secret", noop)
+    monkeypatch.setattr(notify_core, "emit_notification", noop)
+
+    secret = _apple_secret(udids=["OTHER-UDID"])
+    assert "password_enc" not in secret
+    profile = {"id": 3, "kind": "apple_id", "secret_data": secret}
+
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        await routes_ios._materialize_apple_id(
+            profile, owner_user_id="u1", udid=UDID, wda_bundle_id="com.wda.base"
+        )
+    assert excinfo.value.status_code == 412
+
+
+@pytest.mark.asyncio
 async def test_materialize_passthrough_non_apple_id():
     """asc/p12 原样穿透，bundle id 不动。"""
     from user_platform import routes_ios

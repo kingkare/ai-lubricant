@@ -474,7 +474,7 @@ async def test_marketplace_token_only_issued_in_marketplace_scene(monkeypatch, t
     }
 
     # 市场管理场景 → 签发 user 身份 token（管理员上下文 target="__admin__"）。
-    scene = SceneSpec(type=MARKETPLACE_ADMIN, services=("marketplace-status",))
+    scene = SceneSpec(type=MARKETPLACE_ADMIN, capabilities=("marketplace-status",))
     agent = GenericAgent(AgentConfig(**base), scene=scene)
     tokens = await agent._collect_service_tokens([
         _svc("marketplace-status", builtin=True, svc_id=9),

@@ -4,25 +4,31 @@
 <meta charset="utf-8">
 <style>
 *{box-sizing:border-box}
-html,body{width:420px;margin:0;overflow:hidden;}
-body{display:flex;padding:14px;background:#f6f7f9;color:#182033;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+/* hidden 属性必须压过 display:flex/grid 的区块级布局（.pwd-gen/.pwd-lastgen 等是
+   flex 容器，浏览器默认 [hidden]{display:none} 会被 display:flex 覆盖 → 空框常显）。 */
+[hidden]{display:none !important;}
+html{width:260px;margin:0;}
+/* 子页面（连接/代理/密码）需要横向空间：html 加 .wide 放宽到 420px。菜单页保持 260px。 */
+html.wide{width:420px;}
+body{width:100%;min-height:100vh;margin:0;overflow:hidden;display:flex;padding:14px;background:#f6f7f9;color:#182033;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
 .shell{display:flex;flex:1;min-height:0;flex-direction:column;border:1px solid rgba(18,24,38,.08);border-radius:14px;background:#fff;box-shadow:0 10px 28px rgba(18,24,38,.10);overflow:hidden;}
 .header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 14px 12px;border-bottom:1px solid rgba(18,24,38,.07);}
-.title{display:flex;align-items:center;gap:9px;min-width:0;}
-.icon{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;background:#10231b;color:#7cf29c;font-weight:700;}
 h1{margin:0;font-size:14px;line-height:1.2;font-weight:650;}
-.subtitle{margin-top:2px;color:#6b7280;font-size:12px;}
 button{height:30px;border:0;border-radius:8px;padding:0 12px;background:#182033;color:#fff;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;cursor:pointer;transition:background .15s ease,transform .15s ease,box-shadow .15s ease;}
 button:hover{background:#263047;box-shadow:0 6px 14px rgba(18,24,38,.16)}
 button:active{transform:translateY(1px);box-shadow:none}
-.status{display:flex;align-items:center;gap:10px;padding:9px 14px;color:#5f6b7a;font-size:12px;background:#fbfcfd;}
+/* 返回按钮：与 header 标题同排的轻量文字按钮 */
+.back{height:26px;padding:0 8px 0 6px;background:transparent;color:#5f6b7a;font-weight:600;font-size:13px;border-radius:7px;flex:0 0 auto;}
+.back:hover{background:#eef1f5;color:#182033;box-shadow:none;}
+.status{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;color:#5f6b7a;font-size:12px;background:#fbfcfd;}
 .dot{width:7px;height:7px;border-radius:50%}
 .dot[data-state="connected"]{background:#18a058;box-shadow:0 0 0 3px rgba(24,160,88,.12)}
 .dot[data-state="authenticating"]{background:#d99a18;box-shadow:0 0 0 3px rgba(217,154,24,.14)}
 .dot[data-state="auth_error"],.dot[data-state="disabled"]{background:#d14b4b;box-shadow:0 0 0 3px rgba(209,75,75,.12)}
 .dot[data-state="unconfigured"],.dot[data-state="disconnected"]{background:#9aa3af;box-shadow:0 0 0 3px rgba(154,163,175,.14)}
-.status-left{display:flex;align-items:center;gap:8px;min-width:0;}
-.config{display:grid;grid-template-columns:1fr;gap:8px;padding:12px 14px;border-bottom:1px solid rgba(18,24,38,.07);background:#fbfcfd;}
+.status-left{display:flex;align-items:center;gap:7px;min-width:0;flex:1;}
+.status-actions{display:flex;align-items:center;gap:4px;flex:0 0 auto;}
+.config{display:grid;grid-template-columns:1fr;gap:8px;padding:12px 14px;background:#fff;margin:12px 14px 0;border:1px solid rgba(18,24,38,.08);border-radius:10px;}
 .config label{display:block;color:#5f6b7a;font-size:11px;margin-bottom:3px;}
 .config input{width:100%;height:28px;border:1px solid rgba(18,24,38,.14);border-radius:7px;padding:0 8px;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
 .config .full{grid-column:1 / -1;}
@@ -35,33 +41,286 @@ button:active{transform:translateY(1px);box-shadow:none}
 .config .switch input:checked + .slider{background:#168456;}
 .config .switch input:checked + .slider:before{transform:translateX(16px);}
 .preview{grid-column:1 / -1;color:#6b7280;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;word-break:break-all;}
+/* 顶部三 tab：连接设置 / 出网代理 / 密码管理 */
+/* 菜单式导航：点扩展图标先见菜单，菜单项进入对应子页面（SwitchyOmega 交互）。
+   header 的返回按钮只在子页面显示；网络切换直接做在菜单上（弹出即切）。 */
+.views{flex:1;min-height:0;overflow-y:auto;background:#fff;}
+.view{display:none;padding-bottom:12px;}
+.view.on{display:block;}
+/* 菜单：ZeroOmega 结构。Profile 区 = 图标+名称（左对齐，名字可见）；
+   底部功能入口 = icon-only（居中，不显示文字，hover title 出名字）。 */
+.om-nav{margin:6px 8px;}
+.om-nav-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:8px;cursor:pointer;font-size:13px;color:#182033;}
+.om-nav-item:hover{background:#eef1f5;}
+.om-nav-item.on{background:#e6f4ff;color:#168456;font-weight:650;box-shadow:inset 0 0 0 1px rgba(22,132,86,.35);}
+.om-nav-item .ic{font-size:17px;line-height:1;flex:0 0 auto;}
+.om-nav-item .om-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+/* 功能入口：状态栏右侧 icon-only 按钮（不显示文字，hover title 出名字） */
+.om-divider{height:1px;background:rgba(18,24,38,.08);margin:4px 6px;}
+button.ghost{height:22px;padding:0 8px;font-size:11px;font-weight:600;background:#eef1f5;color:#182033;box-shadow:none;border:0;}
+button.ghost:hover{background:#e2e7ee;box-shadow:none;}
+button.ghost.icon-only{width:26px;padding:0;font-size:14px;line-height:1;}
+/* 密码管理 */
+.pwd{background:#fff;margin:12px 14px 0;border:1px solid rgba(18,24,38,.08);border-radius:10px;overflow:hidden;}
+.pwd-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 12px 7px;}
+.pwd-head .cap{font-weight:650;font-size:12px;color:#182033;}
+.pwd-tabs{display:flex;gap:6px;padding:0 12px 7px;}
+.pwd-tabs button{height:26px;background:#eef1f5;color:#5f6b7a;}
+.pwd-tabs button.on{background:#182033;color:#fff;}
+.pwd-search{display:block;width:calc(100% - 24px);margin:0 12px 8px;height:28px;border:1px solid rgba(18,24,38,.14);border-radius:7px;padding:0 8px;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+.pwd-list{padding:0 12px 10px;display:flex;flex-direction:column;gap:6px;}
+.pwd-row{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid rgba(18,24,38,.08);border-radius:9px;background:#fff;}
+.pwd-row .meta{flex:1;min-width:0;}
+.pwd-row .u{font-weight:600;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.pwd-row .d{font-size:11px;color:#6b7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.pwd-row .acts{display:flex;gap:5px;flex:0 0 auto;}
+.pwd-row button{height:24px;padding:0 8px;font-size:11px;background:#eef1f5;color:#182033;box-shadow:none;}
+.pwd-row button.danger{background:#fdecec;color:#b3261e;}
+.pwd-reveal{grid-column:1 / -1;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;word-break:break-all;background:#f2f5f8;border-radius:6px;padding:5px 7px;margin-top:5px;}
+.pwd-gen{display:flex;align-items:center;gap:7px;padding:0 12px 10px;}
+.pwd-gen code{flex:1;min-height:26px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;word-break:break-all;background:#f2f5f8;border-radius:6px;padding:5px 7px;box-sizing:border-box;}
+.pwd-gen button{height:26px;padding:0 9px;font-size:11px;}
+/* 本次生成（页面上刚生成的随机密码，没复制也能回看） */
+.pwd-lastgen{display:flex;align-items:center;gap:7px;margin:0 12px 9px;padding:7px 9px;border:1px solid rgba(24,160,88,.28);border-radius:9px;background:rgba(24,160,88,.06);}
+.pwd-lastgen .lbl{flex:0 0 auto;font-size:11px;font-weight:650;color:#168456;}
+.pwd-lastgen code{flex:1;min-width:0;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;word-break:break-all;color:#182033;}
+.pwd-lastgen button{height:24px;padding:0 8px;font-size:11px;background:#eef1f5;color:#182033;box-shadow:none;}
+.pwd-empty{color:#6b7280;font-size:12px;padding:4px 2px;}
+.pwd-hint{color:#9aa3af;font-size:11px;padding:0 12px 10px;line-height:1.4;}
+.pwd-manual-toggle{display:block;width:calc(100% - 24px);margin:0 12px 8px;height:28px;border:1px dashed rgba(18,24,38,.2);border-radius:7px;background:#fff;color:#182033;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;cursor:pointer;}
+.pwd-manual-toggle:hover{border-color:#b45309;color:#b45309;}
+.pwd-manual{padding:0 12px 8px;display:flex;flex-direction:column;gap:6px;}
+.pwd-manual .pwd-search{margin:0;width:100%;}
+.pwd-manual-act{display:flex;align-items:center;justify-content:flex-end;gap:8px;}
+.pwd-manual-status{color:#6b7280;font-size:11px;margin-right:auto;}
+.pwd-manual-save{height:26px;padding:0 12px;border:1px solid #b45309;border-radius:7px;background:#b45309;color:#fff;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;cursor:pointer;}
+.pwd-manual-save:disabled{opacity:.5;cursor:not-allowed;}
+/* 代理（出网路径）：常显当前生效态，切换即应用 */
+.proxy{background:#fff;margin:12px 14px 0;border:1px solid rgba(18,24,38,.08);border-radius:10px;overflow:hidden;}
+.proxy-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 12px 7px;}
+.proxy-head .cap{font-weight:650;font-size:12px;color:#182033;}
+.proxy-state{display:flex;align-items:center;gap:7px;margin:0 12px 8px;padding:7px 9px;border-radius:9px;font-size:12px;border:1px solid rgba(18,24,38,.08);background:#fff;}
+.proxy-state.on{border-color:rgba(24,160,88,.3);background:rgba(24,160,88,.06);}
+.proxy-state .who{color:#6b7280;font-size:11px;}
+.proxy-list{padding:0 12px 8px;display:flex;flex-direction:column;gap:6px;}
+.proxy-row{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid rgba(18,24,38,.08);border-radius:9px;background:#fff;}
+.proxy-row .meta{flex:1;min-width:0;}
+.proxy-row .u{font-weight:600;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.proxy-row .d{font-size:11px;color:#6b7280;}
+.proxy-row.active{border-color:rgba(24,160,88,.4);}
+.proxy-row button{height:24px;padding:0 8px;font-size:11px;background:#eef1f5;color:#182033;box-shadow:none;}
+.proxy-empty{color:#6b7280;font-size:12px;padding:4px 2px;}
+.proxy-hint{color:#9aa3af;font-size:11px;padding:0 12px 10px;line-height:1.4;}
+/* 代理编辑器（新增/编辑 Profile，含 auto 规则编辑） */
+.proxy-editor{margin:0 12px 10px;padding:10px;border:1px solid rgba(18,24,38,.12);border-radius:9px;background:#fff;}
+.proxy-editor .f{margin-bottom:7px;}
+.proxy-editor label{display:block;color:#5f6b7a;font-size:11px;margin-bottom:2px;}
+.proxy-editor input,.proxy-editor select,.proxy-editor textarea{width:100%;height:26px;border:1px solid rgba(18,24,38,.14);border-radius:6px;padding:0 6px;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+.proxy-editor textarea{height:44px;padding:4px 6px;resize:vertical;}
+.proxy-editor .row2{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+.proxy-editor .row3{display:grid;grid-template-columns:84px 1fr 92px 24px;gap:4px;align-items:center;margin-bottom:4px;}
+.proxy-editor .row3 select,.proxy-editor .row3 input{height:24px;font-size:11px;}
+.proxy-editor .rule-del{height:24px;padding:0 4px;background:#fdecec;color:#b3261e;box-shadow:none;}
+.proxy-editor .acts{display:flex;gap:6px;margin-top:9px;}
+.proxy-editor .acts button{flex:1;height:27px;font-size:12px;}
+.proxy-editor .acts button.primary{background:#168456;}
+.proxy-editor .acts button.danger{background:#fdecec;color:#b3261e;}
+.proxy-editor .note{color:#9aa3af;font-size:11px;line-height:1.4;margin-top:5px;}
+/* 身份验证器（TOTP） */
+.totp{background:#fff;margin:12px 14px 0;border:1px solid rgba(18,24,38,.08);border-radius:10px;overflow:hidden;}
+.totp-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 12px 7px;}
+.totp-head .cap{font-weight:650;font-size:12px;color:#182033;}
+.totp-tabs{display:flex;gap:6px;padding:0 12px 7px;}
+.totp-tabs button{height:26px;background:#eef1f5;color:#5f6b7a;}
+.totp-tabs button.on{background:#182033;color:#fff;}
+.totp-search{display:block;width:calc(100% - 24px);margin:0 12px 8px;height:28px;border:1px solid rgba(18,24,38,.14);border-radius:7px;padding:0 8px;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+.totp-list{padding:0 12px 10px;display:flex;flex-direction:column;gap:6px;}
+.totp-row{display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid rgba(18,24,38,.08);border-radius:9px;background:#fff;}
+.totp-row .meta{flex:1;min-width:0;}
+.totp-row .u{font-weight:600;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.totp-row .d{font-size:11px;color:#6b7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.totp-row .n{font-size:11px;color:#9aa3af;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.totp-row .code{flex:0 0 auto;font:16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:700;letter-spacing:1.5px;color:#182033;}
+.totp-row .ring{flex:0 0 auto;width:22px;height:22px;border-radius:50%;border:2px solid #cfd6df;display:flex;align-items:center;justify-content:center;font-size:9px;color:#6b7280;}
+.totp-row .ring.warn{border-color:#e8a33d;color:#b8791e;}
+.totp-row .ring.low{border-color:#d9534f;color:#b3261e;}
+.totp-row .acts{display:flex;gap:5px;flex:0 0 auto;}
+.totp-row button{height:24px;padding:0 8px;font-size:11px;background:#eef1f5;color:#182033;box-shadow:none;}
+.totp-row button.danger{background:#fdecec;color:#b3261e;}
+.totp-form{padding:0 12px 10px;display:flex;flex-direction:column;gap:6px;}
+.totp-head-acts{display:flex;gap:5px;flex:0 0 auto;}
+.totp-head-acts button{height:26px;padding:0 9px;font-size:11px;background:#eef1f5;color:#182033;box-shadow:none;}
+.totp-io-row{display:flex;gap:6px;}
+.totp-io-row button{height:28px;flex:1;font-size:12px;}
+.totp-area{width:100%;min-height:96px;resize:vertical;border:1px solid rgba(18,24,38,.14);border-radius:7px;padding:6px 8px;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;box-sizing:border-box;}
+.totp-input{height:28px;border:1px solid rgba(18,24,38,.14);border-radius:7px;padding:0 8px;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;box-sizing:border-box;width:100%;}
+.totp-form-acts{display:flex;gap:6px;margin-top:2px;}
+.totp-form-acts button{height:28px;flex:1;font-size:12px;}
+.totp-qr-btns{display:flex;gap:6px;}
+.totp-qr-btns button{height:28px;flex:1;font-size:11px;}
+.totp-primary{background:#182033;color:#fff;}
+.totp-secondary{background:#eef1f5;color:#182033;}
+.totp-qr-status{font-size:11px;line-height:1.4;padding:5px 7px;border-radius:6px;}
+.totp-qr-status.ok{background:rgba(24,160,88,.08);color:#168456;}
+.totp-qr-status.err{background:#fdecec;color:#b3261e;}
+.totp-empty{color:#6b7280;font-size:12px;padding:4px 2px;}
+.totp-hint{color:#9aa3af;font-size:11px;padding:0 12px 10px;line-height:1.4;}
 </style>
 </head>
 <body>
 <div class="shell">
-  <div class="header">
-    <div class="title">
-      <div class="icon">A</div>
-      <div>
-        <h1>Ai Lubricant 浏览器助手</h1>
-        <div class="subtitle">连接设置</div>
-      </div>
-    </div>
-  </div>
-  <div class="config">
-    <div class="switch-row full">
-      <label>启用连接</label>
-      <label class="switch"><input type="checkbox" id="bridgeEnabled"><span class="slider"></span></label>
-    </div>
-    <div class="full"><label>服务地址（WebSocket）</label><input id="bridgeUrl" placeholder="ws://127.0.0.1:8001/mcp/cdp-bridge/session"></div>
-    <div class="full"><label>客户端 Token（在管理端创建或轮换客户端后一次性显示）</label><input id="clientToken" placeholder="粘贴客户端 Token" style="width:100%"></div>
-    <div id="wsPreview" class="preview">ws://127.0.0.1:8001/mcp/cdp-bridge/session</div>
-    <button id="saveBridge" class="full">保存连接配置</button>
+  <div class="header" id="header" hidden>
+    <button id="btnBack" class="back">‹ 返回</button>
+    <h1 id="headerTitle"></h1>
   </div>
   <div class="status">
     <div class="status-left"><span class="dot"></span><span id="state">Ready</span></div>
+    <div class="status-actions">
+      <button class="ghost icon-only" data-view="proxy" title="配置代理">🔧</button>
+      <button class="ghost icon-only" data-view="pwd" title="密码列表">🔑</button>
+      <button class="ghost icon-only" data-view="totp" title="身份验证器">🛡</button>
+      <button id="connDetailBtn" class="ghost icon-only" title="查看连接详情">ℹ</button>
+    </div>
+  </div>
+  <div class="views">
+
+  <!-- 菜单：网络切换区 = 图标 + 名称（ZeroOmega 结构）。 -->
+  <div class="view on" id="view-menu">
+    <div class="om-nav">
+      <div class="om-nav-item" data-builtin="__direct" title="直接连接"><span class="ic">⊘</span><span class="om-name">直接连接</span></div>
+      <div class="om-nav-item" data-builtin="__system" title="系统代理"><span class="ic">🖥</span><span class="om-name">系统代理</span></div>
+      <div class="om-divider"></div>
+      <div id="quickSwitch" class="om-group"></div>
+    </div>
+  </div>
+
+  <div class="view" id="view-conn">
+    <div class="config">
+      <div class="switch-row full">
+        <label>启用连接</label>
+        <label class="switch"><input type="checkbox" id="bridgeEnabled"><span class="slider"></span></label>
+      </div>
+      <div class="full"><label>服务地址（WebSocket）</label><input id="bridgeUrl" placeholder="ws://127.0.0.1:8001/mcp/cdp-bridge/session"></div>
+      <div class="full"><label>客户端 Token（在管理端创建或轮换客户端后一次性显示）</label><input id="clientToken" placeholder="粘贴客户端 Token" style="width:100%"></div>
+      <div id="wsPreview" class="preview">ws://127.0.0.1:8001/mcp/cdp-bridge/session</div>
+      <button id="saveBridge" class="full">保存连接配置</button>
+    </div>
+  </div>
+
+  <div class="view" id="view-proxy">
+    <div class="proxy">
+      <div class="proxy-head">
+        <span class="cap">出网代理</span>
+        <span style="display:flex;gap:6px">
+          <button id="proxyImportBtn">导入</button>
+          <button id="proxyNewBtn">新增</button>
+          <button id="proxyRestore">还原直连</button>
+        </span>
+      </div>
+      <input type="file" id="proxyImportFile" accept=".bak,.json,application/json" hidden>
+      <div id="proxyState" class="proxy-state"><span id="proxyStateText">未启用</span><span class="who" id="proxyStateWho"></span></div>
+      <div id="proxyList" class="proxy-list"></div>
+      <div id="proxyEditor" class="proxy-editor" hidden></div>
+      <div id="proxyHint" class="proxy-hint">切换后本浏览器全部请求走所选代理。管理端下发的代理（租约）到期会自动还原；你手动切换的优先级最高。</div>
+    </div>
+  </div>
+
+  <div class="view" id="view-pwd">
+    <div class="pwd">
+      <div class="pwd-head">
+        <span class="cap">密码管理</span>
+        <button id="pwdGenToggle">生成随机密码</button>
+      </div>
+      <div class="pwd-tabs">
+        <button id="pwdTabSite" data-tab="site" class="on">本站</button>
+        <button id="pwdTabAll" data-tab="all">全部</button>
+      </div>
+      <div id="pwdGenBox" class="pwd-gen" hidden>
+        <code id="pwdGenValue"></code>
+        <button id="pwdGenAgain">重新生成</button>
+        <button id="pwdGenCopy">复制</button>
+      </div>
+      <div id="pwdLastGen" class="pwd-lastgen" hidden>
+        <span class="lbl">本次生成</span>
+        <code id="pwdLastGenValue"></code>
+        <button id="pwdLastGenCopy">复制</button>
+      </div>
+      <input id="pwdSearch" class="pwd-search" placeholder="搜索站点 / 账号">
+      <button id="pwdManualToggle" class="pwd-manual-toggle">＋ 手动新增密码</button>
+      <div id="pwdManualBox" class="pwd-manual" hidden>
+        <input id="pwdManualDomain" class="pwd-search" placeholder="站点域名（默认当前页）">
+        <input id="pwdManualUser" class="pwd-search" placeholder="用户名 / 账号名">
+        <input id="pwdManualPass" class="pwd-search" type="password" placeholder="密码">
+        <div class="pwd-manual-act">
+          <span id="pwdManualStatus" class="pwd-manual-status"></span>
+          <button id="pwdManualSave" class="pwd-manual-save">保存</button>
+        </div>
+      </div>
+      <div id="pwdList" class="pwd-list"></div>
+      <div id="pwdHint" class="pwd-hint">密码保存在 Ai Lubricant 服务端并关联你的账号。若同时出现 Chrome 自带的「保存密码」提示，可在浏览器设置里关闭它。</div>
+    </div>
+  </div>
+
+  <div class="view" id="view-totp">
+    <div class="totp">
+      <div class="totp-head">
+        <span class="cap">身份验证器</span>
+        <div class="totp-head-acts">
+          <button id="totpImportBtn">导入</button>
+          <button id="totpExportBtn">备份</button>
+          <button id="totpAddToggle">添加</button>
+          <input type="file" id="totpImportFile" accept=".txt,text/plain" hidden>
+        </div>
+      </div>
+      <div id="totpImportBox" class="totp-form" hidden>
+        <div class="totp-io-row">
+          <button id="totpImportPick" class="totp-secondary">选择 .txt 文件</button>
+        </div>
+        <textarea id="totpImportText" class="totp-area" placeholder="或直接粘贴：每行一条 otpauth:// 链接（Aegis/andOTP/Bitwarden 导出格式）"></textarea>
+        <div id="totpImportStatus" class="totp-qr-status" hidden></div>
+      </div>
+      <div id="totpExportBox" class="totp-form" hidden>
+        <div class="totp-hint" style="padding:0 0 4px">导出含全部验证器的明文密钥，需再次输入账号密码。管理员也只导出自己的。</div>
+        <input id="totpExportPwd" class="totp-input" type="password" placeholder="你的账号密码">
+        <div class="totp-io-row">
+          <button id="totpExportGo" class="totp-primary">导出备份 (.txt)</button>
+          <button id="totpExportCancel" class="totp-secondary">取消</button>
+        </div>
+        <div id="totpExportStatus" class="totp-qr-status" hidden></div>
+      </div>
+      <div class="totp-tabs">
+        <button id="totpTabSite" data-tab="site" class="on">本站</button>
+        <button id="totpTabAll" data-tab="all">全部</button>
+      </div>
+      <div id="totpAddBox" class="totp-form" hidden>
+        <input id="totpSecretInput" class="totp-input" placeholder="粘贴 otpauth:// 链接 / base32 密钥">
+        <div class="totp-qr-btns">
+          <button id="totpScanQr" class="totp-secondary">框选页面二维码</button>
+          <button id="totpPickQr" class="totp-secondary">选图识别</button>
+          <input type="file" id="totpQrFile" accept="image/*" hidden>
+        </div>
+        <input id="totpIssuerInput" class="totp-input" placeholder="站点 / 服务名（如 GitHub）">
+        <input id="totpAccountInput" class="totp-input" placeholder="账号（如邮箱）">
+        <input id="totpDomainsInput" class="totp-input" placeholder="关联网站域名（逗号分隔，如 github.com,api.github.com）">
+        <input id="totpNoteInput" class="totp-input" placeholder="备注（可选）">
+        <div id="totpQrStatus" class="totp-qr-status" hidden></div>
+        <div class="totp-form-acts">
+          <button id="totpSaveBtn" class="totp-primary">保存</button>
+          <button id="totpCancelBtn" class="totp-secondary">取消</button>
+        </div>
+        <div class="totp-hint">密钥加密存于服务端，本机与扩展均不可见明文；只下发当前验证码。</div>
+      </div>
+      <input id="totpSearch" class="totp-search" placeholder="搜索站点 / 账号 / 备注">
+      <div id="totpList" class="totp-list"></div>
+      <div id="totpHint" class="totp-hint">验证码 30 秒自动翻转；「复制」把当前码复制到剪贴板。登录 2FA 时可用 Agent 让浏览器自动填充。</div>
+    </div>
+  </div>
+
+  </div>
   </div>
 </div>
+<script src="config.js"></script>
+<script src="vendor/jsqr.min.js"></script>
 <script src="popup.js"></script>
 </body>
 </html>

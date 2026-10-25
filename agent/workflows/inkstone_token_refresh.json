@@ -1,0 +1,93 @@
+{
+  "name": "inkstone_token_refresh.json",
+  "label": "inkstone 自动登陆",
+  "description": "SSO 登录（浏览器扩展按账户名选账号、不碰密码）→ token 写 Redis 供渠道 spec 读取",
+  "retry_on_reboot": true,
+  "inputs": [
+    {
+      "key": "accounts",
+      "type": "array",
+      "note": "inkstone 账号列表（account_list 提供，只有账号名，绝无密码）；扇出后单跑 $input.accounts = 单个账号对象"
+    }
+  ],
+  "triggers": [
+    {
+      "id": "daily",
+      "kind": "cron",
+      "cron": "0 10 * * *",
+      "label": "每日登录续期",
+      "enabled": true,
+      "params": {
+        "source": "account_list",
+        "url": "https://sso.openxlab.org.cn",
+        "multiple": true
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "id": "login",
+      "kind": "run_session",
+      "name": "SSO 登录（扩展账号选择，不碰密码）",
+      "agent_id": "any",
+      "sop": "登录 Intern InkStone（书生·科学智能平台）的 OpenXLab SSO，为账户 {$input.accounts.username} 取新 uaa-token。\n\n严格步骤（全程用 web 工具；先 web(operation=clients) 选一台 connected 的浏览器 client_id，所有 web 调用都带上它）：\n1. web(open_tab, url=\"https://sso.openxlab.org.cn/authentication?clientId=dagw07mkg1bazlxzoy31&redirect=https%3A%2F%2Fdiscovery.intern-ai.org.cn%2Fchat\") 记下 tab。\n2. web(execute) 清 cookie + localStorage（SSO 是 cookie||localStorage 双读，只清 cookie 会被残留 uaa-token 顶掉、跳过登录页），记下 old_token 作基线。\n3. web(navigate, 同上 url) 回登录页拿全新表单，等约 2 秒。\n4. web(execute) 切「密码登录」表单（默认是微信扫码视图：先点「使用手机号/密码登录」入口，再点「密码登录」tab），轮询到密码框可见。\n5. web(execute) 探测 user/pass/submit 输入框与按钮（按 DOM 现找，不假设选择器；不要用 execute 探 tab 是否存在）。\n6. 选账号（本流程绝不填密码）：web(execute) 聚焦用户名框——浏览器扩展自己弹账号下拉（Shadow DOM #tmwd-pwd-suggest，结构 .list>.item>.u/.h），保持聚焦不要 blur；再 web(execute) 点下拉里 .u 文本等于 {$input.accounts.username} 的那个 .item，扩展会同时填入用户名和密码；等约 1 秒让异步填完。下拉没弹出或没有匹配项 → 该账号记失败、跳过、不重试。\n7. web(execute) 勾「阅读并同意协议」复选框（定位 .login-agreement-checkbox-col，不是默认已勾的「7天内免登录」），再 web(execute) 点登录按钮。\n8. web(wait, timeout=60) 等 cookie 里出现 uaa-token 且不等于步骤2的 old_token（防串号）；期间可 web(execute) 顺带点一键验证码。若是滑块/点选文字验证码 → 报失败、不重试（登录最多一次）。\n9. web(execute) 读 cookie 拿 uaa-token；若同时存在 refresh-token 相关 cookie 一并读出。\n\n最终只输出一行 JSON，不要任何其它文字：\n{\"access_token\": \"<uaa-token>\", \"token_expires_at\": \"<由JWT exp解出的ISO，可空>\", \"refresh_token\": \"<仅当上游给了刷新token才带此字段，否则省略>\"}\n禁止把密码写进输出。",
+      "output_schema": {
+        "type": "object",
+        "required": ["result"],
+        "properties": {
+          "result": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "id": "parse",
+      "kind": "code_run",
+      "name": "解析登录结果为凭据字段",
+      "type": "python",
+      "input_mapping": {
+        "raw": "$login.result"
+      },
+      "code": "import json\ntxt = (data.get('raw') or '').strip()\nif txt.startswith('```'):\n    txt = txt.strip('`')\n    txt = txt.split('json', 1)[-1].strip() if 'json' in txt[:12] else txt\nobj = {}\ntry:\n    obj = json.loads(txt)\nexcept Exception:\n    obj = {}\nif not isinstance(obj, dict) or not (obj.get('access_token') or '').strip():\n    # 不把原文带进报错（可能含 token）——只报格式问题\n    raise SystemExit('登录输出不是预期 JSON（缺 access_token 字段）')\nout = {'access_token': str(obj['access_token']).strip()}\nif (obj.get('refresh_token') or '').strip():\n    out['refresh_token'] = str(obj['refresh_token']).strip()\nif (obj.get('token_expires_at') or '').strip():\n    out['token_expires_at'] = str(obj['token_expires_at']).strip()\nresult = out",
+      "output_schema": {
+        "type": "object",
+        "required": ["access_token"],
+        "properties": {
+          "access_token": {
+            "type": "string"
+          },
+          "refresh_token": {
+            "type": "string"
+          },
+          "token_expires_at": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "id": "store",
+      "kind": "cache",
+      "name": "存 Redis 供渠道 spec 读取",
+      "action": "set",
+      "key": "wf:inkstone:token:{$input.accounts.username}",
+      "value": "$parse",
+      "ttl": 1209600
+    }
+  ],
+  "edges": [
+    {
+      "source": "login",
+      "target": "parse"
+    },
+    {
+      "source": "parse",
+      "target": "store"
+    }
+  ],
+  "end": {},
+  "failure": {
+    "agent_id": null
+  }
+}

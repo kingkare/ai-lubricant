@@ -123,6 +123,7 @@ async def _row_to_dict(row: dict, include_models: bool = True) -> dict:
 
 @router.get("/llm-configs")
 async def list_llm_configs(authorization: Optional[str] = Header(None)) -> list[dict]:
+    """列出全部 Agent 专用 LLM 配置（api_key 脱敏）。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         return []
@@ -132,6 +133,7 @@ async def list_llm_configs(authorization: Optional[str] = Header(None)) -> list[
 
 @router.get("/llm-configs/{config_id}")
 async def get_llm_config(config_id: int, authorization: Optional[str] = Header(None)) -> dict:
+    """读取单个 LLM 配置（含模型清单，api_key 脱敏）；不存在 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -143,6 +145,7 @@ async def get_llm_config(config_id: int, authorization: Optional[str] = Header(N
 
 @router.post("/llm-configs")
 async def create_llm_config(request: CreateLlmConfigRequest, authorization: Optional[str] = Header(None)) -> dict:
+    """新建 LLM 配置（base_url/chat_path/api_key 等）并同步初始模型清单；名称重名 → 409。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -168,6 +171,7 @@ async def create_llm_config(request: CreateLlmConfigRequest, authorization: Opti
 
 @router.patch("/llm-configs/{config_id}")
 async def update_llm_config(config_id: int, request: UpdateLlmConfigRequest, authorization: Optional[str] = Header(None)) -> dict:
+    """部分更新 LLM 配置（仅覆盖非 None 字段，models 字段触发同步）；重名 → 409，未找到 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -189,6 +193,7 @@ async def update_llm_config(config_id: int, request: UpdateLlmConfigRequest, aut
 
 @router.delete("/llm-configs/{config_id}")
 async def delete_llm_config(config_id: int, authorization: Optional[str] = Header(None)) -> dict:
+    """删除 LLM 配置；未找到 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -200,6 +205,7 @@ async def delete_llm_config(config_id: int, authorization: Optional[str] = Heade
 
 @router.post("/llm-configs/{config_id}/toggle")
 async def toggle_llm_config(config_id: int, authorization: Optional[str] = Header(None)) -> dict:
+    """切换 LLM 配置启用状态（enabled 取反）；未找到 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -216,6 +222,7 @@ async def list_llm_models(
     enabled_only: bool = False,
     authorization: Optional[str] = Header(None),
 ) -> list[dict]:
+    """列出 Agent LLM 模型库存行（可按 config_id 过滤，enabled_only 只取启用）。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         return []
@@ -225,6 +232,7 @@ async def list_llm_models(
 
 @router.get("/llm-configs/{config_id}/models")
 async def list_llm_config_models(config_id: int, authorization: Optional[str] = Header(None)) -> list[dict]:
+    """列出某 LLM 配置下的模型库存行；配置不存在 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         return []
@@ -278,6 +286,7 @@ async def fetch_llm_config_models(config_id: int, authorization: Optional[str] =
 
 @router.post("/llm-configs/{config_id}/models")
 async def create_llm_model(config_id: int, request: CreateLlmModelRequest, authorization: Optional[str] = Header(None)) -> dict:
+    """在指定 LLM 配置下新建模型库存行；同名 → 409，配置不存在 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -303,6 +312,7 @@ async def create_llm_model(config_id: int, request: CreateLlmModelRequest, autho
 
 @router.patch("/llm-models/{model_id}")
 async def update_llm_model(model_id: int, request: UpdateLlmModelRequest, authorization: Optional[str] = Header(None)) -> dict:
+    """部分更新模型库存行（仅覆盖非 None 字段）；同名 → 409，未找到 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -326,6 +336,7 @@ async def update_llm_model(model_id: int, request: UpdateLlmModelRequest, author
 
 @router.delete("/llm-models/{model_id}")
 async def delete_llm_model(model_id: int, authorization: Optional[str] = Header(None)) -> dict:
+    """删除模型库存行；未找到 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -337,6 +348,7 @@ async def delete_llm_model(model_id: int, authorization: Optional[str] = Header(
 
 @router.post("/llm-models/{model_id}/toggle")
 async def toggle_llm_model(model_id: int, authorization: Optional[str] = Header(None)) -> dict:
+    """切换模型库存行启用状态（enabled 取反）；未找到 → 404。"""
     await require_admin(authorization)
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")

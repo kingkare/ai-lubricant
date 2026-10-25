@@ -476,7 +476,7 @@ def _assemble(messages, tools_prompt="TOOLS_PROMPT"):
 
 
 _OVERRIDE_MARK = "系统工具协议覆盖"
-_NUDGE_MARK = "系统末位提示"
+_NUDGE_MARK = "系统末位指令"
 
 
 def test_override_injected_when_client_sends_no_system():
@@ -535,6 +535,53 @@ def test_nudge_lands_on_last_user_not_an_earlier_one():
     assert "第二轮" in _texts(users[-1])
 
 
+def test_tail_directive_re_anchors_original_task_in_long_loop():
+    """长 agent 循环里尾巴是工具结果，模型看不到原始任务——末位指令块必须把第一条
+    user 的任务文本重述进去，作为任务锚点。这是 _build_tail_directive 替代单句
+    _FENCE_NUDGE 的核心增量：不重述任务，模型不知道自己为啥在调工具、调完该不该停。
+
+    用「会转换」的 flatten（role=tool -> role=user，与 base.py 生产实现同款）：只有
+    转换后，从后往前找最后一条 user 才会命中真正的尾巴（工具结果），而不是原始提问。
+    """
+
+    class _FlatteningProvider:
+        @staticmethod
+        def flatten_tool_history(messages):
+            out = []
+            for m in messages:
+                if m.get("role") == "tool":
+                    out.append({"role": "user", "content": (
+                        f'<tool_result name="{m.get("name", "")}">'
+                        f'{m.get("content", "")}</tool_result>')})
+                else:
+                    out.append(m)
+            return out
+
+    messages = [
+        {"role": "user", "content": "帮我把 README 里的错别字改掉"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "Read", "arguments": '{"path":"README.md"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "Read", "content": "文件内容"},
+    ]
+    out = CH._messages_with_tools_near_user(_FlatteningProvider, messages, "TOOLS_PROMPT")
+    last = _texts(out[-1])
+    assert out[-1]["role"] == "user", "role=tool 拍平后应变 user，指令钉在这条上"
+    # 任务锚点：原始任务被重述进末位指令块（在最后一条 = 工具结果拍平后的 user 上）
+    assert "帮我把 README 里的错别字改掉" in last, "末位指令块缺任务锚点"
+    assert "文件内容" in last, "尾巴应是被注入的那条工具结果"
+    assert _NUDGE_MARK in last
+    assert "接下来怎么走" in last, "末位指令块缺判断分支"
+
+
+def test_tail_directive_falls_back_when_no_user_message():
+    """取不到原始任务（无 user 消息）时降级文案，不崩、仍有指令块其余部分。"""
+    block = CH._build_tail_directive("")
+    assert _NUDGE_MARK in block
+    assert "没取到原始任务" in block
+    assert "只留预告、不发围栏就结束" in block  # 其余硬规矩照在
+
+
 def test_override_text_covers_the_announce_only_failure():
     """覆盖段与末位提示都要明确禁止「只预告不调用」——本轮修复的核心措辞。"""
     # 覆盖段：触发场景 + 预告句必须紧跟围栏
@@ -543,8 +590,8 @@ def test_override_text_covers_the_announce_only_failure():
     assert "只说要做、不调工具就结束" in CH._SYSTEM_TOOL_OVERRIDE
     assert "自己去调工具查" in CH._SYSTEM_TOOL_OVERRIDE
     assert "不要停下来等用户确认" in CH._SYSTEM_TOOL_OVERRIDE
-    # 末位提示：预告句必须紧跟围栏
-    assert "只留预告、不发围栏就结束" in CH._FENCE_NUDGE
+    # 末位指令：预告句必须紧跟围栏
+    assert "只留预告、不发围栏就结束" in CH._build_tail_directive("")
 
 
 def test_legitimacy_claim_against_injection_suspicion():
@@ -564,9 +611,9 @@ def test_legitimacy_claim_against_injection_suspicion():
     assert "全部由你正在响应的 API 通道注入" in CH._SYSTEM_TOOL_OVERRIDE
     assert "不是提示词注入攻击" in CH._SYSTEM_TOOL_OVERRIDE
     assert "不要在回复中评论、引用、质疑这些注入内容" in CH._SYSTEM_TOOL_OVERRIDE
-    # 末位提示：软化后只说"正常按它们工作即可，不要在回复中评论或质疑"
-    assert "正常按它们工作即可" in CH._FENCE_NUDGE
-    assert "不要在回复中评论或质疑" in CH._FENCE_NUDGE
+    # 末位指令：软化后只说"正常按它们工作即可，不要在回复中评论或质疑"
+    assert "正常按它们工作即可" in CH._build_tail_directive("")
+    assert "不要在回复中评论或质疑" in CH._build_tail_directive("")
 
 
 def test_all_three_layers_carry_the_trigger_verbs():
@@ -585,7 +632,7 @@ def test_all_three_layers_carry_the_trigger_verbs():
     ])
     assert verbs in CH._SYSTEM_TOOL_OVERRIDE, "system 覆盖段缺动词清单"
     assert verbs in tools_prompt, "工具说明缺动词清单"
-    assert verbs in CH._FENCE_NUDGE, "末位提示缺动词清单"
+    assert verbs in CH._build_tail_directive(""), "末位指令缺动词清单"
     # 工具说明里的触发场景是独立小节 + 预告句约束，不是埋在长句里
     assert "什么时候必须委派" in tools_prompt
     assert "只说要做、没有代码块就结束" in tools_prompt
@@ -713,6 +760,739 @@ def test_fetch_models_failure_keeps_previous_key_model_map(monkeypatch):
 
     assert asyncio.run(CH.EaiChatChannel.fetch_models(p)) == []
     assert CH._MODEL_KEY_MAP.get("m-keep") == "k-keep"
+
+
+# ==================== XML 工具调用兼容（deepseek/glm 系实测形态）====================
+# 现网实测：deepseek-v4-pro / glm-5.3 收到围栏协议后，仍按 XML 标签发工具调用——
+#   <tool_calls><invoke name="Read"><parameter name="file_path">D:\...\</parameter></invoke></tool_calls>
+# 意图正确（要调工具）、格式不对。围栏只在 prompt 里教、靠模型自觉，压不住；
+# parser 这侧必须兼容，否则整块 XML 当正文透传，调用彻底丢失、工具链路断掉。
+# 判据与围栏同口径：调用名必须在入参 tools 清单里，否则整块原样当正文（防误判正文里的标签）。
+
+# 现网帧：逐字还原 deepseek-v4-pro 的 XML 调用（含被切碎的分片）
+_XML_REAL_DELTAS = [
+    "<tool",
+    "_calls",
+    ">\n",
+    "<inv",
+    "oke",
+    " name",
+    "=\"",
+    "Read",
+    "\">\n",
+    "<parameter",
+    " name",
+    "=\"",
+    "file",
+    "_path",
+    "\">",
+    "D",
+    ":\\",
+    "code",
+    "\\",
+    "ai",
+    "-l",
+    "ub",
+    "ric",
+    "ant",
+    "\\",
+    "server",
+    "\\",
+    "admin",
+    ".py",
+    "</",
+    "parameter",
+    ">\n",
+    "<parameter",
+    " name",
+    "=\"",
+    "offset",
+    "\">",
+    "462",
+    "3",
+    "</",
+    "parameter",
+    ">\n",
+    "<parameter",
+    " name",
+    "=\"",
+    "limit",
+    "\">",
+    "65",
+    "</",
+    "parameter",
+    ">\n",
+    "</",
+    "inv",
+    "oke",
+    ">\n",
+    "</",
+    "tool",
+    "_calls",
+    ">",
+]
+
+
+def test_xml_tool_call_parsed_from_real_frames():
+    """逐字还原的现网 XML 帧：解析出 Read 调用，正文不含任何 XML 碎片。"""
+    text, calls = _replay(_XML_REAL_DELTAS, names=["Read"])
+    assert len(calls) == 1, f"应解析出 1 个调用，实得 {len(calls)}；正文残留={text!r}"
+    assert calls[0]["function"]["name"] == "Read"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["file_path"] == "D:\\code\\ai-lubricant\\server\\admin.py"
+    assert args["offset"] == "4623"
+    assert args["limit"] == "65"
+    assert text == "", f"XML 块不该有任何正文残留，实得 {text!r}"
+
+
+def test_xml_tool_call_single_frame():
+    """整块在一个 delta 里（非流式聚合形态）也要认。"""
+    block = ('<tool_calls>\n<invoke name="Bash">\n'
+             '<parameter name="command">ls -la</parameter>\n'
+             '</invoke>\n</tool_calls>')
+    text, calls = _replay([block], names=["Bash"])
+    assert len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "ls -la"}
+    assert text == ""
+
+
+def test_xml_multiple_invokes_in_one_block():
+    """一个 <tool_calls> 里多个 <invoke>（并行调用）逐个解析。"""
+    block = ('<tool_calls><invoke name="Read">'
+             '<parameter name="file_path">a.py</parameter></invoke>'
+             '<invoke name="Grep">'
+             '<parameter name="pattern">foo</parameter></invoke></tool_calls>')
+    text, calls = _replay([block], names=["Read", "Grep"])
+    assert [c["function"]["name"] for c in calls] == ["Read", "Grep"]
+    assert text == ""
+
+
+def test_xml_unknown_tool_name_passes_through_as_text():
+    """XML 里工具名不在入参清单里 -> 整块原样当正文，不伪造 tool_calls（同围栏口径）。"""
+    block = ('<tool_calls><invoke name="NotMyTool">'
+             '<parameter name="x">1</parameter></invoke></tool_calls>')
+    text, calls = _replay([block], names=["Read"])
+    assert calls == []
+    assert block in text, "不在清单里的块必须原样透传，不能吞"
+
+
+def test_xml_block_survives_split_open_marker():
+    """开标记 <tool_calls> 被切碎时不能提前把碎片当正文下发。"""
+    text, calls = _replay(
+        ["<tool_cal", "ls><invoke name=\"Read\">",
+         "<parameter name=\"file_path\">b.py</parameter></invoke></tool_calls>"],
+        names=["Read"])
+    assert len(calls) == 1
+    assert text == "", f"碎片不该泄漏成正文，实得 {text!r}"
+
+
+def test_xml_and_fence_mixed_in_one_stream():
+    """同一流里围栏块与 XML 块混发：两种都切出来，顺序不乱。"""
+    fence = '```tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n```'
+    xml = ('<tool_calls><invoke name="Bash">'
+           '<parameter name="command">pwd</parameter></invoke></tool_calls>')
+    text, calls = _replay(["前置文本", fence, "中间", xml, "结尾"], names=["Read", "Bash"])
+    assert [c["function"]["name"] for c in calls] == ["Read", "Bash"]
+    assert text == "前置文本中间结尾", f"正文应只含非块文本，实得 {text!r}"
+
+
+def test_xml_unclosed_at_stream_end_is_rescued():
+    """流截断（无 </tool_calls>）时，已闭合的 <invoke> 仍要救回，不能整块丢。"""
+    text, calls = _replay(
+        ['<tool_calls><invoke name="Read">',
+         '<parameter name="file_path">c.py</parameter></invoke>'],
+        names=["Read"])
+    assert len(calls) == 1, "已闭合的 invoke 必须救回"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"file_path": "c.py"}
+
+
+def test_xml_tags_in_plain_prose_not_a_tool_call():
+    """正文里顺带提到 <tool_calls> 字样但没有合法 invoke -> 原样透传，不误判。"""
+    prose = "你可以用 <tool_calls> 标签表达调用，但本通道不认这个格式。"
+    text, calls = _replay([prose], names=["Read"])
+    assert calls == []
+    assert text == prose
+
+
+# ==================== 相邻围栏：hold 半截开标记不能只在「没切出块」时跑 ====================
+# 实测 qwen3.8-max 连发两个 Read：前一围栏的闭标 ``` 与后一围栏的开标 ```tool_function
+# 在相邻帧到达，切走第一块后残留的半截开标记（```tool）落进 prefix。旧代码只在
+# `if not blocks:` 时跑 hold，于是第一块切出后 hold 被跳过——半截开标记裸奔下发成
+# 正文（客户端看到反引号碎片），且第二块的开标记被吞，整块 JSON 当正文泄漏。
+
+# 逐字还原现网帧：模型把两个围栏紧挨着写，6 个反引号 = 闭标 3 + 开标 3 被切成一帧
+_ADJACENT_FENCE_DELTAS = [
+    "```",
+    "tool_function\n{\"",
+    "name\": \"Read",
+    "\", \"arguments\":",
+    " {\"file_path\":",
+    " \"D:\\\\L",
+    "oomy\\\\resources",
+    "\\\\app.asar",
+    ".unpacked\\\\electron",
+    "\\\\xfyun\\\\",
+    "sign.js\"}}\n",
+    "``````tool",            # ← 6 反引号 + "tool"：前块闭标 + 后块开标首段
+    "_function\n{\"name",     # ← 后块开标剩余
+    "\": \"Read\",",
+    " \"arguments\": {\"",
+    "file_path\": \"",
+    "D:\\\\Loom",
+    "y\\\\resources\\\\",
+    "app.asar.un",
+    "packed\\\\electron\\\\",
+    "xfyun\\\\__",
+    "tests__\\\\account",
+    "-service-session-auth",
+    ".test.js\"}}\n",
+    "```",
+]
+
+
+def test_adjacent_fences_second_block_not_leaked():
+    """两个围栏紧挨着：第二块必须照常解析，不能泄漏为正文。"""
+    text, calls = _replay(_ADJACENT_FENCE_DELTAS, names=["Read"])
+    assert len(calls) == 2, f"应解析出 2 个调用，实得 {len(calls)}；正文={text!r}"
+    assert [c["function"]["name"] for c in calls] == ["Read", "Read"]
+    a0 = json.loads(calls[0]["function"]["arguments"])
+    a1 = json.loads(calls[1]["function"]["arguments"])
+    assert a0["file_path"].endswith("sign.js")
+    assert a1["file_path"].endswith("account-service-session-auth.test.js")
+    assert text == "", f"两块之间不该有任何正文泄漏，实得 {text!r}"
+
+
+def test_adjacent_fence_split_marker_survives():
+    """第一块的闭标 ``` 和第二块的开标 ```tool_function 分到不同帧也要切对。"""
+    fence1 = '```tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n```'
+    fence2 = '```tool_function\n{"name": "Bash", "arguments": {"command": "ls"}}\n```'
+    text, calls = _replay([fence1[:-3], "```", "```", "tool_function", fence1[16:], fence2],
+                         names=["Read", "Bash"])
+    # 无论如何切分，只要文本连续就该解析出调用、不泄漏
+    assert len(calls) >= 1, f"至少第一块该解析出来；正文={text!r}"
+
+
+def test_fence_close_then_partial_open_in_one_delta():
+    """一帧里同时有「前块闭标 + 后块开标首段」的最小复现。"""
+    text, calls = _replay([
+        '```tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n',
+        '``````tool',               # 闭标 + 下一块开标首段
+        '_function\n{"name": "Bash", "arguments": {"command": "pwd"}}\n```',
+    ], names=["Read", "Bash"])
+    assert [c["function"]["name"] for c in calls] == ["Read", "Bash"]
+    assert text == "", f"不应泄漏，实得 {text!r}"
+
+
+# ==================== 思考帧 type 兼容（thinking_card）====================
+# 现网实测：天翼 EAI 系模型思考帧的 delta.type = "thinking_card"（不是 Anthropic 的
+# "thinking_delta"、也不是裸 "thinking"）。旧代码只认 type=="thinking"，于是思考文本
+# 落进 content 分支被当正文下发 —— 客户端看到整段内部推演（实测泄漏给用户），
+# 且会被围栏解析器当正文处理。修复：thinking / thinking_card / reasoning_content 都归 thinking。
+
+
+def test_thinking_card_delta_goes_to_thinking_not_content():
+    """delta.type=thinking_card -> 归 thinking，绝不落 content。"""
+    frame = {"choices": [{"delta": {
+        "role": "assistant", "waiting": 0,
+        "meta_data": {"thinking_card": {"id": "x", "status": "GENERATING"}},
+        "type": "thinking_card", "content": " detection to the"}}]}
+    out = CH._openai_event_chunks(frame, {"enabled": True, "buf": ""}, {})
+    assert len(out) == 1
+    assert out[0]["thinking"] == " detection to the"
+    assert out[0]["content"] == "", "思考绝不能落进 content"
+    assert out[0]["tool_calls"] == []
+
+
+def test_thinking_card_end_frame_emits_nothing():
+    """thinking_card 收尾帧（status=END、content 空、全文在 meta_data）不重复下发。"""
+    frame = {"choices": [{"delta": {
+        "role": "assistant",
+        "meta_data": {"thinking_card": {"id": "x", "status": "END",
+                                        "content": "完整思考全文（已逐帧发过）"}},
+        "type": "thinking_card", "content": ""}}]}
+    out = CH._openai_event_chunks(frame, {"enabled": True, "buf": ""}, {})
+    assert out == [], "收尾帧 content 为空，不应再发（否则思考重复）"
+
+
+def test_thinking_legacy_types_still_work():
+    """原有的 thinking / reasoning_content 两种形态不能被新分支破坏。"""
+    f1 = {"choices": [{"delta": {"type": "thinking", "content": "t1"}}]}
+    f2 = {"choices": [{"delta": {"reasoning_content": "t2"}}]}
+    assert CH._openai_event_chunks(f1, {"enabled": True, "buf": ""}, {})[0]["thinking"] == "t1"
+    assert CH._openai_event_chunks(f2, {"enabled": True, "buf": ""}, {})[0]["thinking"] == "t2"
+
+
+def test_text_delta_still_goes_to_content():
+    """type=text 的正文帧照旧进围栏缓冲（走 content），不被思考分支误吞。"""
+    frame = {"choices": [{"delta": {"type": "text", "content": "普通正文"}}]}
+    out = CH._openai_event_chunks(frame, {"enabled": False, "buf": ""}, {})
+    assert out[0]["content"] == "普通正文"
+    assert out[0]["thinking"] == ""
+
+
+# ==================== bare 开标记（上游网关吞掉前缀反引号）====================
+# 实测 2026-09-19 glm-5.2-cdn：模型发的围栏整段以 text 帧吐出，但开头的三个反引号
+# 被网关吞掉，只剩裸 `tool_function{...}`。修复前解析器只认 ```tool_function，找不到
+# 就把整块 JSON 当正文下发 —— 客户端看到「模型只输出了文本」，工具不执行、任务卡死。
+# 更狠的一档（qwen3.5-plus 实测）连 `tool` 也丢，只剩 `_function{...}`。
+
+_BARE_DELTAS = [
+    "tool_function\n{\"name\":", " \"Grep\", \"arguments", "\": {\"",
+    "pattern\": \"全局配置|", "关于|语言设置|样式", "|当前版本\", \"glob",
+    "\": \"*", ".{tsx,", "ts,jsx,js", ",vue}\", \"output",
+    "_mode\": \"files_with_matches", "\", \"head_limit\": ", "30}}\n",
+    "``", "`\n\n<", "system-reminder>",
+]
+
+
+def test_bare_open_marker_without_backticks_still_parsed():
+    """裸 `tool_function{...}`（前缀 ``` 被吞）：必须切出调用，且不泄漏成正文。"""
+    text, calls = _replay(_BARE_DELTAS, names=["Grep"])
+    assert len(calls) == 1, f"应解析出 1 个调用，实得 {len(calls)}；正文={text!r}"
+    assert calls[0]["function"]["name"] == "Grep"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["pattern"] == "全局配置|关于|语言设置|样式|当前版本"
+    assert args["glob"] == "*.{tsx,ts,jsx,js,vue}"
+    assert args["head_limit"] == 30
+    assert "tool_function" not in text, f"围栏不得泄漏成正文：{text!r}"
+    assert "system-reminder" in text, "围栏之后的正文必须保留"
+
+
+def test_bare_open_marker_split_across_frames():
+    """裸开标记本身也被上游切成多帧（`tool_` → `function` → `{`）时仍能切对。"""
+    text, calls = _replay(["tool_", "function", "\n{\"name\": \"Bash\", ",
+                           "\"arguments\": {\"command\": \"ls\"}}", "\n```"],
+                          names=["Bash"])
+    assert len(calls) == 1, f"应解析出 1 个调用，实得 {len(calls)}；正文={text!r}"
+    assert json.loads(calls[0]["function"]["arguments"])["command"] == "ls"
+
+
+def test_bare_open_marker_partial_prefix_held_not_leaked():
+    """裸开标记的半截前缀（`tool_func`）不得当正文下发，补全后必须切出调用。"""
+    text, calls = _replay(["tool_func", "tion\n{\"name\": \"Bash\", "
+                           "\"arguments\": {\"command\": \"ls\"}}", "\n```"],
+                          names=["Bash"])
+    assert len(calls) == 1, f"应解析出 1 个调用，实得 {len(calls)}；正文={text!r}"
+    assert "tool_func" not in text, f"半截开标记不得泄漏：{text!r}"
+
+
+def test_function_only_anchor_rescued():
+    """上游连 `tool` 一起吞掉、只剩 `_function{...}`：靠短锚救回。"""
+    text, calls = _replay(["\n", "_function\n{\"name\": \"Bash\", "
+                           "\"arguments\": {\"command\": \"bash pack.sh\"}}", "\n```"],
+                          names=["Bash"])
+    assert len(calls) == 1, f"应解析出 1 个调用，实得 {len(calls)}；正文={text!r}"
+    assert json.loads(calls[0]["function"]["arguments"])["command"] == "bash pack.sh"
+
+
+def test_function_anchor_requires_identifier_boundary():
+    """正文里的 `test_function{...}` / `my_function{` 不得被误判成工具调用。"""
+    text, calls = _replay(["代码说明：调用 test_function{...} 后返回。",
+                           "再看 my_function{a:1}。"], names=["Bash"])
+    assert calls == [], f"不该解析出任何调用，实得 {calls}"
+    assert "test_function{...}" in text and "my_function{a:1}" in text
+
+
+def test_bare_malformed_block_passed_through_as_text_not_dropped():
+    """bare 是启发式推断：块内 JSON 坏掉时必须**原样下发正文**，不能静默吞掉。"""
+    text, calls = _replay(["tool_function\n{\"name\": \"Bash\", \"arguments\": "
+                           "{command\": \"ls\"}}", "\n```"], names=["Bash"])
+    assert calls == [], "坏 JSON 不该产出调用"
+    assert "tool_function" in text, f"坏块必须原样可见，不能吞掉：{text!r}"
+
+
+def test_bare_and_standard_fences_coexist():
+    """同一流里 bare 形态与标准 ``` 形态混用，两块都要正确解析。"""
+    text, calls = _replay(
+        ["tool_function\n{\"name\": \"Read\", \"arguments\": {\"file_path\": \"a.py\"}}\n```\n",
+         '```tool_function\n{"name": "Bash", "arguments": {"command": "ls"}}\n```'],
+        names=["Read", "Bash"])
+    assert len(calls) == 2, f"应解析出 2 个调用，实得 {len(calls)}；正文={text!r}"
+    assert [c["function"]["name"] for c in calls] == ["Read", "Bash"]
+
+
+def test_orphan_closing_fence_swallowed():
+    """bare 块按花括号配平先切走、闭标 ``` 晚到：孤儿闭标不得当正文下发。"""
+    text, calls = _replay(["tool_function\n{\"name\": \"Bash\", "
+                           "\"arguments\": {\"command\": \"ls\"}}", "\n``", "`"],
+                          names=["Bash"])
+    assert len(calls) == 1
+    assert text.strip() == "", f"孤儿闭标不得泄漏：{text!r}"
+
+
+# ==================== 一个围栏内并列多个调用 ====================
+# 模型把多个工具调用并列写进**同一个**围栏是实测形态：换行分隔、逗号分隔、JSON 数组。
+# 旧实现只取第一个配平对象，其余要么静默丢弃（调用彻底丢、任务卡死）、要么泄漏成正文。
+
+def test_multiple_calls_in_one_fence_newline_separated():
+    """一个围栏内两个 JSON 对象（换行分隔）：两个都要出，不能只出第一个。"""
+    text, calls = _replay(['```tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n'
+                           '{"name": "Bash", "arguments": {"command": "ls"}}\n```'],
+                          names=["Read", "Bash"])
+    assert [c["function"]["name"] for c in calls] == ["Read", "Bash"], \
+        f"两个调用都要解析，实得 {[c['function']['name'] for c in calls]}；正文={text!r}"
+    assert json.loads(calls[0]["function"]["arguments"])["file_path"] == "a.py"
+    assert json.loads(calls[1]["function"]["arguments"])["command"] == "ls"
+
+
+def test_multiple_calls_in_one_fence_comma_separated():
+    """一个围栏内两个 JSON 对象（逗号分隔）：两个都要出。"""
+    text, calls = _replay(['```tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}, '
+                           '{"name": "Bash", "arguments": {"command": "ls"}}\n```'],
+                          names=["Read", "Bash"])
+    assert [c["function"]["name"] for c in calls] == ["Read", "Bash"], \
+        f"两个调用都要解析；正文={text!r}"
+
+
+def test_multiple_calls_in_one_fence_json_array():
+    """一个围栏内是 JSON 数组：数组里每个元素都是调用。"""
+    text, calls = _replay(['```tool_function\n[{"name": "Read", "arguments": {"file_path": "a.py"}}, '
+                           '{"name": "Bash", "arguments": {"command": "ls"}}]\n```'],
+                          names=["Read", "Bash"])
+    assert [c["function"]["name"] for c in calls] == ["Read", "Bash"], \
+        f"数组元素都要解析；正文={text!r}"
+
+
+def test_multiple_calls_in_one_fence_split_across_frames():
+    """多调用围栏被逐帧切开（第二块跨帧到达）时仍要全部解析。"""
+    text, calls = _replay(['```tool_function\n[{"name": "Read", "arguments": {"file_path": "a.py"',
+                           '}}, {"name": "Bash", "arguments": {"command": "ls"}}]\n```'],
+                          names=["Read", "Bash"])
+    assert [c["function"]["name"] for c in calls] == ["Read", "Bash"], \
+        f"跨帧的多调用都要解析；正文={text!r}"
+
+
+def test_multiple_calls_in_one_bare_fence():
+    """bare 形态（无前缀反引号）下多调用：第二个不得泄漏成正文。"""
+    text, calls = _replay(['tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n'
+                           '{"name": "Bash", "arguments": {"command": "ls"}}\n```'],
+                          names=["Read", "Bash"])
+    assert [c["function"]["name"] for c in calls] == ["Read", "Bash"], \
+        f"bare 多调用都要解析；正文={text!r}"
+    assert '"name"' not in text, f"第二个调用不得泄漏成正文：{text!r}"
+
+
+def test_multiple_calls_unknown_method_passes_whole_block_through():
+    """多调用里有一个名字不在入参 tools 里：整块原样当正文，不伪造部分调用。"""
+    text, calls = _replay(['```tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n'
+                           '{"name": "Nonexistent", "arguments": {}}\n```'],
+                          names=["Read", "Bash"])
+    assert calls == [], f"含未知方法时整块不下发调用，实得 {calls}"
+    assert "Nonexistent" in text, f"整块应原样可见：{text!r}"
+
+
+def test_multi_call_braces_inside_argument_value_not_split():
+    """arguments 值里含花括号（Write 写代码）不得被当成调用边界切开。"""
+    text, calls = _replay(['```tool_function\n{"name": "Write", "arguments": '
+                           '{"content": "x = {1: 2}"}}\n'
+                           '{"name": "Bash", "arguments": {"command": "ls"}}\n```'],
+                          names=["Write", "Bash"])
+    assert [c["function"]["name"] for c in calls] == ["Write", "Bash"], \
+        f"值内花括号不该影响切分；正文={text!r}"
+    assert json.loads(calls[0]["function"]["arguments"])["content"] == "x = {1: 2}"
+
+
+def test_multi_call_trailing_prose_after_calls_not_parsed_as_call():
+    """调用之后的尾随非 JSON 文本不得被卷成额外调用（只取并列的 JSON 值）。"""
+    text, calls = _replay(['```tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n'
+                           '说明文字 {不是JSON}\n```'],
+                          names=["Read"])
+    assert [c["function"]["name"] for c in calls] == ["Read"], \
+        f"尾随文本不该变成调用；实得 {[c['function']['name'] for c in calls]}"
+
+
+# ==================== 两块接缝处的反引号被上游吞掉 ====================
+# 实测 2026-09-20 glm-5.3-ctyun-pt-api：模型连发两个 Grep，第一块闭标 ``` 与第二块
+# 开标 ``` 在原文里是同一串 6 个反引号，上游吞掉 1 个（只到 5 个）。切走第一块闭标
+# （3 个）后残留 2 个落进正文，客户端看到孤立反引号碎片，第二个调用也可能切不出来。
+
+_C1 = '{"name": "Grep", "arguments": {"pattern": "async def _do_stream_chat"}}'
+_C2 = '{"name": "Grep", "arguments": {"pattern": "non_stream_chat|_do_stream_chat"}}'
+
+
+def _join_stream(n: int) -> str:
+    """两块紧挨着、接缝处共 n 个反引号（原文应为 6）的完整流。"""
+    return "```tool_function\n" + _C1 + "\n" + "`" * n + "tool_function\n" + _C2 + "\n```"
+
+
+@pytest.mark.parametrize("n", [6, 5, 4, 3])
+def test_adjacent_fences_join_backticks_absorbed(n):
+    """接缝反引号被吞到 6/5/4/3 个：两个调用都要出，且不得泄漏反引号碎片。"""
+    text, calls = _replay([_join_stream(n)], names=["Grep"])
+    assert [c["function"]["name"] for c in calls] == ["Grep", "Grep"], \
+        f"接缝 n={n} 时两个调用都要解析，实得 {[c['function']['name'] for c in calls]}"
+    assert "`" not in text, f"接缝 n={n} 时不得泄漏反引号碎片：{text!r}"
+
+
+@pytest.mark.parametrize("n", [6, 5, 4, 3])
+def test_adjacent_fences_join_backticks_absorbed_char_by_char(n):
+    """同上，但逐字符喂（最坏切分）。"""
+    text, calls = _replay(list(_join_stream(n)), names=["Grep"])
+    assert [c["function"]["name"] for c in calls] == ["Grep", "Grep"], \
+        f"逐字符接缝 n={n} 时两个调用都要解析；正文={text!r}"
+    assert "`" not in text, f"逐字符接缝 n={n} 时不得泄漏反引号碎片：{text!r}"
+
+
+def test_join_absorb_does_not_eat_plain_backtick_prose():
+    """正文里以反引号开头、后面不是工具开标记的文本不得被吸收。"""
+    text, calls = _replay(["`code` 说明", "继续"], names=["Grep"])
+    assert calls == []
+    assert "`code`" in text, f"普通反引号文本必须原样保留：{text!r}"
+
+
+def test_join_absorb_keeps_standard_open_marker():
+    """接缝后跟标准开标记（>=3 个反引号）时，必须仍按标准围栏切出第二个调用。"""
+    text, calls = _replay(['```tool_function\n' + _C1 + '\n```'
+                           '```tool_function\n' + _C2 + '\n```'], names=["Grep"])
+    assert [c["function"]["name"] for c in calls] == ["Grep", "Grep"], \
+        f"标准形态接缝也要两个调用；正文={text!r}"
+    assert text.strip() == "", f"不得泄漏：{text!r}"
+
+
+# ==================== 畸形 name 不得崩掉整条流 ====================
+# 实测 2026-09-20：解析产物里 function.name 是 dict（模型多包了一层壳）时，
+# `name in frozenset` 抛 TypeError: unhashable type: 'dict' → 整条流 502。
+
+def test_dict_valued_name_does_not_crash():
+    """name 被多包一层壳时，下沉一层取 name+arguments —— 不得崩，也不得丢参数。"""
+    text, calls = _replay(['```tool_function\n'
+                           '{"name": {"name": "Grep", "arguments": {"pattern": "x"}}}\n```'],
+                          names=["Grep"])
+    assert [c["function"]["name"] for c in calls] == ["Grep"], \
+        f"多包一层壳应下沉取值；实得 {calls}"
+    assert json.loads(calls[0]["function"]["arguments"])["pattern"] == "x", \
+        "下沉后 arguments 必须一起取到（不能只剩空参数）"
+
+
+def test_non_string_name_falls_through_as_text():
+    """name 根本不是字符串（如数字/列表）时，整块原样透传正文，不崩、不伪造调用。"""
+    text, calls = _replay(['```tool_function\n{"name": 123, "arguments": {}}\n```'],
+                          names=["Grep"])
+    assert calls == [], f"非字符串 name 不该产出调用，实得 {calls}"
+
+
+def test_calls_all_known_tolerates_non_string_name():
+    """_calls_all_known 对非字符串 name 返回 False 而非抛 TypeError。"""
+    assert CH._calls_all_known([{"function": {"name": {"nested": 1}}}], frozenset({"Grep"})) is False
+    assert CH._calls_all_known([{"function": {"name": None}}], frozenset({"Grep"})) is False
+    assert CH._calls_all_known([{"function": {}}], frozenset({"Grep"})) is False
+    assert CH._calls_all_known([{"function": {"name": "Grep"}}], frozenset({"Grep"})) is True
+
+
+def test_extra_closing_brace_in_fence_does_not_crash():
+    """块内多一个 ``}`` 时不得崩，且两个调用仍要切出来。"""
+    text, calls = _replay(['```tool_function\n' + _C1 + '}\n```\n'
+                           '```tool_function\n' + _C2 + '\n```'], names=["Grep"])
+    assert len(calls) == 2, f"多余花括号不该影响后续块；实得 {len(calls)}，正文={text!r}"
+
+
+# ==================== 无开标记形态（裸 JSON + 结束围栏）====================
+# 实测 2026-09-26 glm5.2-cdn：模型把开标记**整个丢了** —— JSON 主体写对、结尾 ```
+# 也写对，唯独开头的 ```tool_function 没吐出来，后面还跟着 </tool_function> 残片
+# （模型混用了围栏与 XML 闭标签）。修复前整块漏成正文，工具不执行。
+
+_MARKERLESS_BODY = ('{"name": "Grep", "arguments": {"pattern": "anthropic|claude-code|preset", '
+                    '"path": "D:\\\\code\\\\ai-lubricant\\\\providers\\\\custom.py"}}')
+
+
+def test_markerless_json_with_closing_fence_rescued():
+    """裸 JSON + 结束围栏（开标记整个丢失）：必须切出调用。"""
+    text, calls = _replay(["\n" + _MARKERLESS_BODY, "```\n</tool_function>"], names=["Grep"])
+    assert len(calls) == 1, f"应解析出 1 个调用，实得 {len(calls)}；正文={text!r}"
+    assert calls[0]["function"]["name"] == "Grep"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["pattern"] == "anthropic|claude-code|preset"
+    assert "tool_function" not in text, f"闭标签残片不得泄漏：{text!r}"
+
+
+def test_markerless_json_split_frames_stray_tag_fragment():
+    """日志原样帧：闭标被切成 `` `` ``+`` ` ``、残片 ``</tool`` 被截断在流末。"""
+    text, calls = _replay(["\n" + _MARKERLESS_BODY[:20], _MARKERLESS_BODY[20:] + "``",
+                           "`\n</", "tool"], names=["Grep"])
+    assert len(calls) == 1, f"应解析出 1 个调用，实得 {len(calls)}；正文={text!r}"
+    assert "tool" not in text and "<" not in text, f"残片不得泄漏：{text!r}"
+
+
+def test_markerless_json_no_fence_stays_prose():
+    """只有裸 JSON、连结束围栏都没有：不得切成调用（判据 ④ 不满足）。"""
+    text, calls = _replay(["\n" + _MARKERLESS_BODY], names=["Grep"])
+    assert calls == [], f"无结束围栏不该切成调用，实得 {calls}"
+    assert "Grep" in text, f"JSON 应原样可见：{text!r}"
+
+
+def test_json_example_inside_fence_stays_prose_cross_frame():
+    """```json 代码示例（开围栏在前面的帧）：不得误判成调用（判据 ① 的跨帧形态）。"""
+    text, calls = _replay(["好的：\n```json\n", _MARKERLESS_BODY, "\n```\n以上。"],
+                          names=["Grep"])
+    assert calls == [], f"代码示例不得误判成调用，实得 {calls}"
+    assert "```json" in text, f"示例应原样保留：{text!r}"
+
+
+def test_markerless_disabled_after_fence_in_prose():
+    """正文里出现过 ``` 后，无开标记兜底停用（防示例误判）。"""
+    text, calls = _replay(["说明：\n```\n代码块\n```\n", "再看 " + _MARKERLESS_BODY + "\n```"],
+                          names=["Grep"])
+    assert calls == [], f"见过 ``` 后不该再认无开标记形态，实得 {calls}"
+
+
+def test_stray_close_tag_alone_in_flush_dropped():
+    """流末只剩 ``</tool`` 残片：丢弃，不当正文补发。"""
+    text, calls = _replay(["```tool_function\n{\"name\": \"Read\", "
+                           "\"arguments\": {\"file_path\": \"a.py\"}}\n```", "\n</tool"],
+                          names=["Read"])
+    assert len(calls) == 1
+    assert "</tool" not in text and "tool" not in text, f"残片不得泄漏：{text!r}"
+
+
+# ==================== 中间 JSON 少外层 } 的接缝救援 ====================
+# 实测 2026-09-26 glm-5.3-ctyun-pt-api：模型连发 5 个调用（Read→Glob→Glob→Read→Grep），
+# 中间两个 Glob 各少一个最外层 `}`（`"arguments": {...}` 后没再补一个 `}`）。
+# 闭标判据依赖花括号深度归零，于是后续每个围栏都被判「未闭合」留在缓冲里，
+# 流结束整段泄漏成正文 —— 客户端只拿到第一个 Read、其余 4 个当文本。
+# 修复：接缝救援（_fence_seam_cut）——那串反引号后面紧跟下一个工具块开标记即
+# 「上一块到此为止」的确定信号，切在这里并把缺的 `}` 由解析侧补回
+# （_block_chunk → allow_unclosed=1）。
+
+_C_READ1 = '{"name": "Read", "arguments": {"file_path": "D:\\\\Loomy\\\\resources\\\\app.asar.unpacked\\\\electron\\\\points-config.js"}}'
+_C_GLOB1 = '{"name": "Glob", "arguments": {"path": "D:\\\\Loomy", "pattern": "**/.env.prod"}}'
+_C_GLOB2 = '{"name": "Glob", "arguments": {"path": "D:\\\\Loomy", "pattern": "**/env-file-crypto.js"}}'
+_C_READ2 = '{"name": "Read", "arguments": {"file_path": "D:\\\\code\\\\ai-lubricant\\\\providers\\\\code_spec.py", "limit": 60, "offset": 520}}'
+_C_GREP = '{"name": "Grep", "arguments": {"-n": true, "head_limit": 40, "output_mode": "content", "path": "D:\\\\code\\\\ai-lubricant\\\\server\\\\admin.py", "pattern": "refresh_account_auth|refresh_auth|quota_text|metadata_badges"}}'
+
+
+def test_seam_rescue_for_unbalanced_braces_one_shot():
+    """一次喂完整流（含两个 Glob 少外层 }）：5 个调用全出，正文不留。"""
+    whole = ('```tool_function\n' + _C_READ1 + '\n'
+             '``````tool_function\n' + _C_GLOB1 + '\n'
+             '``````tool_function\n' + _C_GLOB2 + '\n'
+             '``````tool_function\n' + _C_READ2 + '\n'
+             '``````tool_function\n' + _C_GREP + '\n'
+             '```')
+    text, calls = _replay([whole], names=["Read", "Glob", "Grep"])
+    got_names = [c["function"]["name"] for c in calls]
+    want_names = ["Read", "Glob", "Glob", "Read", "Grep"]
+    assert got_names == want_names, \
+        f"5 个调用都要解析；实得 {got_names}；正文={text!r}"
+    assert text.strip() == "", f"不得泄漏正文：{text!r}"
+
+
+def test_seam_rescue_for_unbalanced_braces_char_by_char():
+    """同上，但逐字符喂（最坏切分）：5 个调用全出，正文不留。"""
+    whole = ('```tool_function\n' + _C_READ1 + '\n'
+             '``````tool_function\n' + _C_GLOB1 + '\n'
+             '``````tool_function\n' + _C_GLOB2 + '\n'
+             '``````tool_function\n' + _C_READ2 + '\n'
+             '``````tool_function\n' + _C_GREP + '\n'
+             '```')
+    text, calls = _replay(list(whole), names=["Read", "Glob", "Grep"])
+    got_names = [c["function"]["name"] for c in calls]
+    want_names = ["Read", "Glob", "Glob", "Read", "Grep"]
+    assert got_names == want_names, \
+        f"逐字符 5 个调用都要解析；实得 {got_names}；正文={text!r}"
+    assert text.strip() == "", f"不得泄漏正文：{text!r}"
+
+
+def test_seam_rescue_preserves_nested_braces_in_args():
+    """参数值内嵌花括号（正则模式 `*.tsx,ts,jsx,js,vue}`）不被误判为未闭合。"""
+    # 用带嵌套花括号的真实场景测试：glob pattern 里的扩展列表
+    C_WITH_BRACES = '{"name": "Glob", "arguments": {"pattern": "x", "glob": "*.tsx,ts,jsx,js,vue"}}'
+    whole = ('```tool_function\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n'
+             '``````tool_function\n' + C_WITH_BRACES + '\n'
+             '```')
+    text, calls = _replay([whole], names=["Read", "Glob"])
+    got_names = [c["function"]["name"] for c in calls]
+    assert got_names == ["Read", "Glob"], \
+        f"参数内嵌花括号不应影响后续块；实得 {got_names}；正文={text!r}"
+    args = json.loads(calls[1]["function"]["arguments"])
+    assert args["glob"] == "*.tsx,ts,jsx,js,vue", \
+        f"扩展列表应保真：{args['glob']!r}"
+
+
+# ==================== 数字后多打一个裸引号（_can_open_string）====================
+# 实测 2026-09-27 glm-5.3-ctyun-pt-api：模型写 "offset": 788"}} —— 数字 788 后面
+# 多了一个双引号（本该直接写 788）。这个引号在字符串**外**，会开出一个永不闭合的
+# JSON 字符串，把后面的 }}、换行、闭栏 ``` 全吞进去：闭标判据认不出闭合、flush 救援
+# 也在字符串内结束 —— 整段围栏原样漏成正文，编辑器以为模型只输出了文本。
+# 与「字符串内的裸引号」（_is_real_string_close 补转义）互为镜像：这次要**丢弃**。
+
+_STRAY_BODY = ('{"name": "Read", "arguments": {"file_path": '
+               '"D:\\\\code\\\\ai-lubricant\\\\tests\\\\test_account_auth_context.py", '
+               '"limit": 60, "offset": 788"}}')
+_STRAY_BLOCK = "```tool_function\n" + _STRAY_BODY + "\n```"
+
+
+def test_stray_quote_after_number_rescues_whole_fence():
+    """数字后的多余引号：丢弃它，整块照常切出并解析成调用。"""
+    text, calls = _replay([_STRAY_BLOCK], names=["Read"])
+    assert [c["function"]["name"] for c in calls] == ["Read"], \
+        f"应解析出 1 个 Read 调用，实得 {calls}；正文={text!r}"
+    assert text.strip() == "", f"围栏不得泄漏成正文：{text!r}"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["offset"] == 788, f"offset 应为整数 788，实得 {args['offset']!r}"
+    assert args["limit"] == 60
+    assert args["file_path"].endswith("test_account_auth_context.py")
+
+
+def test_stray_quote_after_number_char_by_char():
+    """同上逐字符喂（最坏切分）：照样只剩一个调用、正文干净。"""
+    text, calls = _replay(list(_STRAY_BLOCK), names=["Read"])
+    assert [c["function"]["name"] for c in calls] == ["Read"], \
+        f"逐字符应解析出 Read，实得 {calls}；正文={text!r}"
+    assert text.strip() == "", f"逐字符不得泄漏：{text!r}"
+
+
+def test_stray_quote_survives_to_flush_rescue():
+    """流末没有闭栏（上游截断）也要靠 flush 救援把调用救回来。"""
+    text, calls = _replay(["```tool_function\n" + _STRAY_BODY], names=["Read"])
+    assert [c["function"]["name"] for c in calls] == ["Read"], \
+        f"缺闭栏也要救回；实得 {calls}；正文={text!r}"
+
+
+def test_can_open_string_allows_only_value_positions():
+    """合法起始只有 { [ , : 与块首；数字/字面量/} ]/引号 之后都算多余引号。"""
+    ok = CH._can_open_string
+    assert ok("") and ok("{") and ok("[") and ok(",") and ok(":"), "键/值起点应允许开字符串"
+    for bad in ("8", "e", "}", "]", '"', "0", "l"):
+        assert not ok(bad), f"{bad!r} 之后不该开字符串"
+
+
+@pytest.mark.parametrize("valid", [
+    '{"name": "Bash", "arguments": {"command": "ls -la"}}',
+    '{"name": "Read", "arguments": {"file_path": "a.py", "offset": 4623}}',
+    '{"name": "Grep", "arguments": {"-n": true, "head_limit": 30, "aa": false, "b": null}}',
+    '{"name": "X", "arguments": {"list": [1, 2], "nested": {"k": [ { "a": 1 } ]}}}',
+    '{"name": "X", "arguments": {"a" : 1}}',
+])
+def test_repair_stray_quotes_stays_identity_on_valid_json(valid):
+    """新增「丢弃非法起始引号」不得破坏合法 JSON —— 合法输入必须逐字节不变。"""
+    assert CH._repair_stray_quotes(valid) == valid, \
+        f"合法 JSON 被改动了：\n  {valid}\n  -> {CH._repair_stray_quotes(valid)}"
+
+
+def test_legit_string_after_number_with_comma_is_kept():
+    """数字后有逗号再接字符串是合法的，不得被当成多余引号丢掉。"""
+    body = '{"name": "Grep", "arguments": {"head_limit": 40, "pattern": "x"}}'
+    text, calls = _replay(["```tool_function\n" + body + "\n```"], names=["Grep"])
+    assert len(calls) == 1, f"合法多键块不得被误修；实得 {calls}；正文={text!r}"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"head_limit": 40, "pattern": "x"}, args
+
+
+def test_stray_quote_does_not_rescue_unrelated_prose():
+    """正文里出现「数字+引号」的普通文本不得被切成调用（仍是正文）。"""
+    text, calls = _replay(['偏移 788" 之后是说明文字，没有围栏。'], names=["Read"])
+    assert calls == [], f"正文不该产出调用，实得 {calls}"
+    assert '788"' in text, f"正文必须原样保留：{text!r}"
+
+
+def test_stray_quote_in_markerless_block_rescued():
+    """同一畸形 + 无开标记形态：_iter_json_regions 也要认得闭合（四扫描器同口径）。"""
+    text, calls = _replay(["\n" + _STRAY_BODY, "\n```"], names=["Read"])
+    assert [c["function"]["name"] for c in calls] == ["Read"], \
+        f"无开标记形态应照样救回；实得 {calls}；正文={text!r}"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["offset"] == 788, args
+    assert text.strip() == "", f"无开标记形态不得泄漏：{text!r}"
 
 
 if __name__ == "__main__":

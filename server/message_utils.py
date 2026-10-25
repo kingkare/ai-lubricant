@@ -298,6 +298,262 @@ def coerce_anthropic_system(system, system_type: str):
     return system
 
 
+def repack_tool_result_blocks(messages: list[dict]) -> list[dict]:
+    """把插在 assistant.tool_calls 与其 tool 结果之间的 system/developer 通知挪到整组之后。
+
+    移植自上游参考实现 Sliverkiss/workbuddy2api ``internal/upstream/tool_pairing.go``
+    的 ``repackToolResultBlocks``（2026-10-16 跟进其 68c08d13 修复）。OpenAI 兼容协议
+    要求同一批 tool_call 的结果在 wire 上连续：中间插任何消息都算配对断裂，上游判 400
+    code=11148（tool_call_sequence_broken）并顶死整条会话。
+
+    Codex 的 image_resize_notice 等特性会把 developer/system 消息插在两份并行结果
+    中间，也可能插在**第一份结果之前**；本函数只调顺序、不改内容：
+
+        assistant[tc c0,c1] | tool c0 | X | tool c1
+        → assistant[tc c0,c1] | tool c0 | tool c1 | X
+        assistant[tc c0,c1] | X | tool c0 | tool c1
+        → assistant[tc c0,c1] | tool c0 | tool c1 | X
+
+    只收 system/developer 通知，**绝不跨越 user/assistant 轮边界**：user（及下一组
+    assistant.tool_calls 组头）后的结果不会被反向搬到前面，宁可留给
+    ``cleanup_orphan_tool_calls`` 兜底也不打乱对话轮序（对齐上游「never cross a user
+    or assistant turn」的取舍）。仅当通知确实先于某份结果出现（会真的改变顺序）时才
+    判定改动；尾部通知 / 无插入消息时零改动（返回原列表对象）。
+    """
+    if not isinstance(messages, list) or len(messages) < 3:
+        return messages
+    out: list[dict] = []
+    changed = False
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            out.append(msg)
+            i += 1
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            out.append(msg)
+            i += 1
+            continue
+        want = {
+            tc.get("id") for tc in tool_calls
+            if isinstance(tc, dict) and tc.get("id")
+        }
+        out.append(msg)
+        i += 1
+        results: list[dict] = []
+        notices: list[dict] = []
+        notice_before_later_result = False
+        while i < len(messages):
+            nxt = messages[i]
+            if not isinstance(nxt, dict):
+                break
+            role = nxt.get("role")
+            if role == "tool":
+                if nxt.get("tool_call_id") not in want:
+                    break
+                # 已收过通知 ⇒ 这份结果要被前移，通知须让位（= 本次重排真的发生）
+                if notices:
+                    notice_before_later_result = True
+                results.append(nxt)
+                i += 1
+                continue
+            # 通知可出现在首份结果之前、也可拆开并行结果；收进本块，随整组后移。
+            # user / assistant（含下一组 tool_calls 组头）是轮边界，立刻停手——
+            # 组头留在原位由外层重新当组头处理，user 绝不跨过结果前移。
+            if role in ("system", "developer"):
+                notices.append(nxt)
+                i += 1
+                continue
+            break
+        if not results:
+            # 整组没有结果：通知原样留在 assistant 之后，孤儿配对交由 cleanup 兜底
+            out.extend(notices)
+            continue
+        if notice_before_later_result:
+            changed = True
+        out.extend(results)
+        out.extend(notices)
+    return out if changed else messages
+
+
+# ──────────────────────────────────────────────
+# 超长单条消息切分（协议兼容）
+# ──────────────────────────────────────────────
+# 背景：部分第三方上游（实测 bailu）对**单条**消息另设 token 上限（≈40000），
+# 与模型的上下文窗口无关（bailu-2.9-preview 声明 1M 上下文，但单条超限即 400
+# "Message N content exceeds maximum length"）。Anthropic/OpenAI 官方只卡总量，
+# 客户端（尤其 agent 类：Claude Code 把整份 CLAUDE.md/transcript 塞进一条 user
+# 消息）不会为此做特殊处理，网关是最后一道防线。
+#
+# 实测结论（2026-09-27，bailu-2.9-preview）：
+#   - 按 token 计，不按字符：英文 120K 字符(≈30K tok) 通过、中文 60K 字符(≈60K tok) 被拒
+#   - 单条阈值 ≈40000 token；拆成多条后总量到 105K token 仍通过（不叠加总限制）
+#   - 上游接受连续同角色消息（与 Anthropic 官方一致：会被合并成一个 turn）
+#
+# 只切「content 为纯字符串」的 system/user/assistant 消息：tool 消息（role=tool）与带
+# tool_calls 的 assistant 消息一律不动——它们靠 tool_call_id 配对，切开即断裂，
+# 上游会回 400 code=11148 顶死整条会话（见 cleanup_orphan_tool_calls 的同一背景）。
+
+# 断点优先级：从「最像自然边界」到「最不像」。切分时在预算内取最靠后的断点，
+# 避免从词/句中间硬切（那会让模型读到腰斩的句子）。
+_SPLIT_DELIMITERS: tuple[str, ...] = (
+    "\n\n",      # 段落
+    "\n",        # 换行
+    "。", "！", "？", "；",  # 中文句末 / 分号
+    ". ", "! ", "? ", "; ",  # 英文句末（含尾随空格，避免切在句点与下句之间）
+    "，", ", ",  # 逗号
+    "、", " ",   # 顿号 / 空格
+)
+
+
+def _split_at_delimiter(text: str, budget: int) -> int:
+    """在 text[:budget] 内找最靠后的「自然断点」，返回切分下标。
+
+    按 _SPLIT_DELIMITERS 的优先级逐级放宽：先在段落/句末找，找不到再退到逗号/空格。
+    任何一级都不命中时返回 budget（硬切）——总比不切导致整条请求被拒要好。
+    """
+    window = text[:budget]
+    for delim in _SPLIT_DELIMITERS:
+        idx = window.rfind(delim)
+        # 断点过于靠前（<50% 预算）说明该级没有合适的边界，交给下一级；
+        # 否则会切出大量碎片消息。
+        if idx >= budget // 2:
+            return idx + len(delim)
+    return budget
+
+
+def split_oversized_messages(
+    messages: list[dict],
+    max_tokens: int,
+    model: str = "",
+) -> list[dict]:
+    """把单条超过 max_tokens 的纯文本消息切成多条连续同角色消息。
+
+    仅处理 ``content`` 为 ``str`` 的 system/user/assistant 消息；其余（tool 结果、带
+    tool_calls 的 assistant、多模态 content 列表）原样保留——它们无法安全切分。
+
+    切分保持内容完整无损（拼接后与原文逐字相同），只在消息边界处断开。
+    未触发任何切分时返回原列表对象（零改动）。
+    """
+    if not isinstance(messages, list) or max_tokens <= 0:
+        return messages
+
+    out: list[dict] = []
+    changed = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        content = msg.get("content")
+        role = msg.get("role")
+        # 只切纯文本 system/user/assistant：tool 消息与 tool_calls 配对不可拆，多模态不拆。
+        # system 必须纳入——agent 类客户端的 system（CLAUDE.md/提示词注入）同样会超上游
+        # 单条上限（实测 128,979 字符 system），且连续同角色 system 消息上游接受。
+        if (
+            not isinstance(content, str)
+            or role not in ("system", "user", "assistant")
+            or msg.get("tool_calls")
+            or estimate_tokens_from_text(content, model) <= max_tokens
+        ):
+            out.append(msg)
+            continue
+
+        # 逐段切：每次在剩余文本里按预算取一个自然断点，直到剩余部分不超限。
+        remaining = content
+        pieces: list[str] = []
+        while remaining:
+            total_tokens = estimate_tokens_from_text(remaining, model)
+            if total_tokens <= max_tokens:
+                pieces.append(remaining)
+                break
+            # 预算按「字符→token」的实际比例换算：中文≈1tok/字符、英文≈4字符/tok，
+            # 直接用 token 数当字符预算对英文会切得过碎，故按整体比例缩放。
+            budget = max(1, int(len(remaining) * max_tokens / total_tokens))
+            cut = _split_at_delimiter(remaining, budget)
+            pieces.append(remaining[:cut])
+            remaining = remaining[cut:]
+
+        # 只有真正切出多段时才展开；单段说明估算与实际不符，保持原样。
+        if len(pieces) <= 1:
+            out.append(msg)
+            continue
+        changed = True
+        # cache_control 是 Anthropic 前缀缓存断点，语义上属于「这段内容的末尾」，
+        # 因此只保留在最后一段，避免中间段制造出无意义的缓存边界。
+        for i, piece in enumerate(pieces):
+            new_msg = dict(msg)
+            new_msg["content"] = piece
+            if i < len(pieces) - 1:
+                new_msg.pop("cache_control", None)
+            out.append(new_msg)
+
+    return out if changed else messages
+
+
+def cleanup_orphan_tool_calls(messages: list[dict]) -> list[dict]:
+    """剔除无法配对的 tool_call 与 tool 结果，让会话自愈。
+
+    移植自上游参考实现 Sliverkiss/workbuddy2api 的 ``cleanupOrphanToolCalls``。工具执行
+    失败时（参数非法、超时、工具不存在……）客户端会把 assistant 的 tool_calls 存进会话
+    历史却写不回结果消息；这条坏历史随后被每次请求原样重放，上游对之后每条消息都回
+    400 code=11148，整条会话报废。网关是最后一道防线：宁可丢一轮工具上下文，也好过整
+    条会话死亡。
+
+    两侧共用同一份 keepCalls 按 id **对称**裁剪——历史实现「批内全齐才整批保留」会留下
+    无主结果（批 [c1,c2] 只回 c1 时调用侧整批被删、tool{c1} 仍保留），反而制造 11148。
+    无任何工具流量时原列表原样返回（零分配）。
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages
+    call_ids: set[str] = set()
+    result_ids: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            tid = msg.get("tool_call_id")
+            if tid:
+                result_ids.add(tid)
+        elif role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    call_ids.add(tc["id"])
+    if not call_ids and not result_ids:
+        return messages
+    keep = call_ids & result_ids
+    changed = False
+    out: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        if msg.get("role") == "tool":
+            if msg.get("tool_call_id") not in keep:
+                changed = True
+                continue
+            out.append(msg)
+            continue
+        tool_calls = msg.get("tool_calls")
+        if msg.get("role") == "assistant" and isinstance(tool_calls, list) and tool_calls:
+            kept = [tc for tc in tool_calls if isinstance(tc, dict) and tc.get("id") in keep]
+            if len(kept) == len(tool_calls):
+                out.append(msg)
+                continue
+            changed = True
+            new_msg = dict(msg)
+            if kept:
+                new_msg["tool_calls"] = kept
+            else:
+                new_msg.pop("tool_calls", None)
+            out.append(new_msg)
+            continue
+        out.append(msg)
+    return out if changed else messages
+
+
 def strip_assistant_reasoning_content(messages: list[dict]) -> list[dict]:
     """剥离 messages 中 assistant 角色的 reasoning_content 字段。
 
@@ -425,6 +681,7 @@ def sanitize_anthropic_tool_name(name: str) -> str:
         return text
     sanitized = _ANTHROPIC_TOOL_ID_ILLEGAL.sub("_", text)
     return sanitized[:_ANTHROPIC_TOOL_NAME_MAX] or "tool"
+
 
 
 def openai_tool_calls_to_anthropic_blocks(tool_calls: list | None) -> list[dict]:
@@ -914,12 +1171,21 @@ def anthropic_to_openai_messages(body: dict) -> tuple[list[dict], dict]:
     if anthropic_tools:
         openai_tools = []
         for tool in anthropic_tools:
+            if not isinstance(tool, dict):
+                continue
+            # 有些工具条目不带 input_schema（如 Anthropic 的 web_search_20250305）。
+            # 直接取 tool.get("input_schema", {}) 会落成空对象 {}，而严格上游
+            # （WorkBuddy code=11129）要求 parameters 是合法 JSON Schema，空对象被判非法。
+            # 统一兜底成 {"type":"object","properties":{}}（合法空 schema）。
+            schema = tool.get("input_schema")
+            if not isinstance(schema, dict) or not schema:
+                schema = {"type": "object", "properties": {}}
             openai_tools.append({
                 "type": "function",
                 "function": {
                     "name": sanitize_anthropic_tool_name(tool.get("name")),
                     "description": tool.get("description", ""),
-                    "parameters": tool.get("input_schema", {})
+                    "parameters": schema,
                 }
             })
         kwargs["tools"] = openai_tools
@@ -1301,23 +1567,73 @@ def responses_to_openai_messages(body: dict) -> tuple[list[dict], dict]:
     if isinstance(instructions, str) and instructions:
         messages.append({"role": "system", "content": instructions})
 
+    # 一个 assistant 轮次的输出（tool_calls / reasoning / 正文）统一缓冲成**一条**
+    # assistant 消息；其 tool 结果与轮次内夹带的 system/developer 通知分别缓冲，flush 时
+    # 按 assistant → 结果 → 通知 的顺序落盘（见 _flush_turn）。
+    #
+    # 为什么必须这样：Codex 的 Responses 载荷把同一轮拆成多个连续 item，且顺序不固定。
+    # 实测三种破坏配对的形态：①并行 function_call 被拆成多条 assistant；②reasoning 夹在
+    # function_call 与其 output 之间（254 个调用里 221 个）；③developer「Approved command
+    # prefix saved」通知夹在 function_call 与 output 之间。任一种都会让 assistant.tool_calls
+    # 后面跟的不是它的结果，上游判 400 code=11148（tool_call_sequence_broken）并顶死整条会话。
+    pending_tool_calls: list[dict] = []
+    pending_reasoning: list[str] = []
+    pending_text: list[str] = []
+    pending_results: list[dict] = []
+    deferred_notices: list[dict] = []
+    # 尚未配对的调用 id（按出现顺序），供缺 call_id 的 output 回退取用。
+    unpaired_call_ids: list[str] = []
+    # call_id → function name：function_call_output 不带 name，
+    # 转成 OpenAI role=tool 时从前面的 function_call 回带，避免下游用 call_id 兜底当名字。
+    call_id_to_name: dict[str, str] = {}
+
+    def _flush_turn() -> None:
+        """把当前 assistant 轮次落盘：assistant 消息 → tool 结果 → 夹带的通知。
+
+        无缓冲时零操作。results / notices 用 extend 后再 clear，列表对象复用。
+        """
+        if not (
+            pending_tool_calls or pending_reasoning or pending_text
+            or pending_results or deferred_notices
+        ):
+            return
+        if pending_tool_calls or pending_reasoning or pending_text:
+            msg: dict = {"role": "assistant", "content": "\n".join(pending_text)}
+            if pending_tool_calls:
+                msg["tool_calls"] = list(pending_tool_calls)
+            if pending_reasoning:
+                msg["reasoning_content"] = "\n".join(pending_reasoning)
+            messages.append(msg)
+        messages.extend(pending_results)
+        messages.extend(deferred_notices)
+        pending_tool_calls.clear()
+        pending_reasoning.clear()
+        pending_text.clear()
+        pending_results.clear()
+        deferred_notices.clear()
+
     input_value = body.get("input")
     if isinstance(input_value, str):
         messages.append({"role": "user", "content": input_value})
     elif isinstance(input_value, list):
-        pending_call_ids: list[str] = []
-        # call_id → function name：function_call_output 不带 name，
-        # 转成 OpenAI role=tool 时从前面的 function_call 回带，避免下游用 call_id 兜底当名字。
-        call_id_to_name: dict[str, str] = {}
         for item in input_value:
             if isinstance(item, str):
+                _flush_turn()
                 messages.append({"role": "user", "content": item})
                 continue
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
             if item_type == "function_call_output":
-                call_id = item.get("call_id") or item.get("id") or (pending_call_ids.pop(0) if pending_call_ids else None) or f"call_{uuid.uuid4().hex[:24]}"
+                call_id = item.get("call_id") or item.get("id")
+                if call_id:
+                    if call_id in unpaired_call_ids:
+                        unpaired_call_ids.remove(call_id)
+                else:
+                    # 缺 call_id 时回退到最早一个尚未配对的调用（与出现顺序同序）。
+                    call_id = unpaired_call_ids.pop(0) if unpaired_call_ids else None
+                if not call_id:
+                    call_id = f"call_{uuid.uuid4().hex[:24]}"
                 tool_msg = {
                     "role": "tool",
                     "content": _responses_text_from_content(item.get("output")),
@@ -1326,32 +1642,64 @@ def responses_to_openai_messages(body: dict) -> tuple[list[dict], dict]:
                 recovered_name = call_id_to_name.get(call_id)
                 if recovered_name:
                     tool_msg["name"] = recovered_name
-                messages.append(tool_msg)
+                pending_results.append(tool_msg)
                 continue
             if item_type == "function_call":
+                if pending_results:
+                    _flush_turn()  # 结果已就位，新调用 = 新一轮
                 call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}"
-                pending_call_ids.append(call_id)
+                unpaired_call_ids.append(call_id)
                 if item.get("name"):
                     call_id_to_name[call_id] = item.get("name")
-                messages.append({
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": sanitize_anthropic_tool_name(item.get("name")),
-                            "arguments": _json_dumps_compact(item.get("arguments")) or "{}",
-                        },
-                    }],
+                pending_tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": sanitize_anthropic_tool_name(item.get("name")),
+                        "arguments": _json_dumps_compact(item.get("arguments")) or "{}",
+                    },
                 })
+                continue
+            if item_type == "reasoning":
+                if pending_results or deferred_notices:
+                    _flush_turn()
+                reasoning_text = _responses_text_from_content(item.get("content") or item.get("summary"))
+                if reasoning_text:
+                    pending_reasoning.append(reasoning_text)
                 continue
             role = item.get("role") or ("assistant" if item_type == "message" and item.get("role") == "assistant" else "user")
             if role == "developer":
                 role = "system"
             content = _responses_text_from_content(item.get("content"))
-            if content or role in ("system", "user", "assistant"):
+            if role == "assistant":
+                # assistant 轮次内的正文（含 function_call 前后夹带的文本）并入同一条
+                # 消息，不能单独建消息——否则又在 tool_calls 与其结果之间插了一条
+                # assistant，重新制造 11148。
+                if pending_results or deferred_notices:
+                    _flush_turn()
+                if content:
+                    pending_text.append(content)
+                continue
+            # 轮次尚未收尾时到达的 system/developer 通知先暂存，等 tool 结果落盘后再发
+            # ——「Approved command prefix saved」夹在 function_call 与 output 之间是 Codex
+            # 的常见形态。user 消息不在此列：它是真正的下一轮，必须结束当前轮次。
+            if role == "system" and (pending_tool_calls or pending_results):
+                deferred_notices.append({"role": role, "content": content})
+                continue
+            _flush_turn()
+            if item_type == "message":
+                # 真实对话消息：即使提取不到文本也保留（纯图片等多模态消息的正文不在
+                # text part 里），与既有行为一致，避免误删合法轮次。
                 messages.append({"role": role, "content": content})
+                continue
+            if not content:
+                # 非 message 的协议 item（web_search_call / custom_tool_call /
+                # local_shell_call 等）无正文时不下发：旧逻辑把它们塞成空 user 消息，
+                # 一次 compaction 能把十几条真实消息撑成上百条空壳（真实 Codex 载荷
+                # 实测 user=174, assistant=13）。
+                continue
+            messages.append({"role": role, "content": content})
+        _flush_turn()
 
     kwargs: dict = {}
     if body.get("max_output_tokens") is not None:

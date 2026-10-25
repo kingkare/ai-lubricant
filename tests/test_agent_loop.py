@@ -236,6 +236,74 @@ async def test_agent_loop_max_turns_exceeded():
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_warns_when_turn_budget_nearly_exhausted():
+    """Within _TURNS_REMAINING_WARNING (5) of max_turns every continuation prompt
+    must carry the wrap-up warning with the live remaining count, so the model is
+    told each round how many turns it has left and can summarize before the hard
+    MAX_TURNS exit. A snapshotting client is needed because agent_loop mutates
+    one shared messages list in place across turns."""
+    # max_turns=8: turn 1 (remaining 7) and turn 2 (remaining 6) stay quiet;
+    # turn 3 (remaining 5) starts the warning, counting down 5 → 1.
+    responses = [_response("t", [_tool_call()]) for _ in range(7)] + [_response("final")]
+    snapshots = []
+
+    class _Client:
+        pass
+
+    client = _Client()
+
+    async def _stream(messages, tools=None):
+        snapshots.append([dict(m) for m in messages])
+        if responses:
+            yield responses.pop(0)
+
+    client.stream_chat = _stream
+
+    handler = ScriptedHandler([
+        StepOutcome(data={"n": i}, next_prompt="again") for i in range(1, 8)
+    ])
+
+    outputs = await _collect_loop(
+        client, "system", "start", handler,
+        tools_schema=[], max_turns=8, verbose=False,
+    )
+
+    assert outputs[-1]["result"] in ("MAX_TURNS_EXCEEDED", "CURRENT_TASK_DONE")
+    # snapshots[0] = initial call; snapshots[1..7] carry turns 1..7 continuation.
+    continuation = [s[-1]["content"] for s in snapshots[1:]]
+    assert len(continuation) == 7
+    # Turns with 6+ remaining (turns 1, 2) — beyond the 5-turn window, no warning.
+    assert "Turn budget warning" not in continuation[0]
+    assert "Turn budget warning" not in continuation[1]
+    # Remaining=5 kicks off the warning, then counts down each round to 1.
+    for content in continuation[2:]:
+        assert "Turn budget warning" in content
+    assert "only 5 of 8 turns left" in continuation[2]
+    assert "only 4 of 8 turns left" in continuation[3]
+    assert "only 3 of 8 turns left" in continuation[4]
+    assert "only 2 of 8 turns left" in continuation[5]
+    assert "only 1 of 8 turns left" in continuation[6]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_no_budget_warning_when_turns_plentiful():
+    client = _stream_client(
+        _response("t", [_tool_call()]),
+        _response("final"),
+    )
+    handler = ScriptedHandler([StepOutcome(data={"n": 1}, next_prompt="again")])
+
+    outputs = await _collect_loop(
+        client, "system", "start", handler,
+        tools_schema=[], max_turns=50, verbose=False,
+    )
+
+    assert outputs[-1]["result"] == "CURRENT_TASK_DONE"
+    continuation = client.calls[1]["messages"][-1]
+    assert "Turn budget warning" not in continuation["content"]
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_exits_on_should_exit():
     client = _stream_client(_response("tool", [_tool_call()]))
     handler = ScriptedHandler([
@@ -607,3 +675,94 @@ async def test_agent_loop_max_retries_zero_just_falls_back(monkeypatch):
             on_event=on_event,
         )
     assert not [e for e in events if e.get("type") == "retry"]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_injects_repeat_reminder_into_next_prompt():
+    """Three identical calls → the gentle reminder rides the 3rd turn's next_prompt."""
+    import copy
+
+    # The loop grows one shared `messages` list across turns, so snapshot the
+    # tail the loop hands the model at each call to see per-turn state.
+    responses = [
+        _response("call1", [_tool_call("lookup", '{"q":"x"}')]),
+        _response("call2", [_tool_call("lookup", '{"q":"x"}')]),
+        _response("call3", [_tool_call("lookup", '{"q":"x"}')]),
+        _response("final answer"),
+    ]
+    seen_last_user: list[str] = []
+    index = 0
+
+    class _SnapClient:
+        async def stream_chat(self, messages, tools=None):
+            nonlocal index
+            last = messages[-1] if messages and messages[-1]["role"] == "user" else None
+            seen_last_user.append(last["content"] if last else "")
+            r = responses[index]
+            index += 1
+            yield r
+
+    handler = ScriptedHandler([
+        StepOutcome(data={"i": 1}, next_prompt="after 1"),
+        StepOutcome(data={"i": 2}, next_prompt="after 2"),
+        StepOutcome(data={"i": 3}, next_prompt="after 3"),
+    ])
+
+    outputs = await _collect_loop(
+        _SnapClient(),
+        "system",
+        "question",
+        handler,
+        tools_schema=[{"type": "function", "function": {"name": "lookup"}}],
+        verbose=False,
+    )
+
+    assert outputs[-1] == {"result": "CURRENT_TASK_DONE", "data": "final answer"}
+    # seen_last_user[k] is the user message that turn k+1 was asked to answer for.
+    # Turns 1 and 2 (indices 1, 2) are below threshold; no reminder.
+    assert "repeating the exact same tool call" not in seen_last_user[1]
+    assert "repeating the exact same tool call" not in seen_last_user[2]
+    # Turn 3 (index 3): the reminder rides the continuation prompt.
+    assert "repeating the exact same tool call" in seen_last_user[3]
+    # The original next_prompt text is preserved alongside the reminder.
+    assert "after 3" in seen_last_user[3]
+    # Three identical calls were observed.
+    assert len(handler.calls) == 3
+    assert all(c[0] == "lookup" and c[1] == {"q": "x"} for c in handler.calls)
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_distinct_calls_do_not_trigger_reminder():
+    """Different arguments reset the chain; no reminder ever appears."""
+    responses = [
+        _response("c1", [_tool_call("lookup", '{"q":"a"}')]),
+        _response("c2", [_tool_call("lookup", '{"q":"b"}')]),
+        _response("c3", [_tool_call("lookup", '{"q":"c"}')]),
+        _response("done"),
+    ]
+    seen_last_user: list[str] = []
+    index = 0
+
+    class _SnapClient:
+        async def stream_chat(self, messages, tools=None):
+            nonlocal index
+            last = messages[-1] if messages and messages[-1]["role"] == "user" else None
+            seen_last_user.append(last["content"] if last else "")
+            r = responses[index]
+            index += 1
+            yield r
+
+    handler = ScriptedHandler([
+        StepOutcome(data={"i": 1}, next_prompt="p1"),
+        StepOutcome(data={"i": 2}, next_prompt="p2"),
+        StepOutcome(data={"i": 3}, next_prompt="p3"),
+    ])
+
+    await _collect_loop(
+        _SnapClient(), "system", "q", handler,
+        tools_schema=[{"type": "function", "function": {"name": "lookup"}}],
+        verbose=False,
+    )
+
+    for text in seen_last_user:
+        assert "repeating the exact same tool call" not in text

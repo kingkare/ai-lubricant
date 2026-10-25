@@ -2261,20 +2261,32 @@ async def list_agents_by_ids(agent_ids: list[int]) -> list[dict]:
         return []
     async with PostgresClient.pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, display_name, description FROM agents "
-            "WHERE id=ANY($1::int[]) AND enabled=TRUE ORDER BY id",
+            "SELECT id, name, display_name, description, auto_compact, compact_threshold "
+            "FROM agents WHERE id=ANY($1::int[]) AND enabled=TRUE ORDER BY id",
             ids,
         )
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    # 压缩配置回传给面板/token 卡：compact_threshold（0~1）是超量提醒阈值，
+    # auto_compact 决定手动压缩按钮是否可用。缺列/旧数据给默认值。
+    for r in out:
+        r.setdefault("auto_compact", True)
+        r.setdefault("compact_threshold", 0.8)
+    return out
 
 
 async def list_agent_ids(agent_ids: list[int]) -> list[int]:
-    """返回 agent_ids 里存在且 enabled 的 id 子集（供配置层校验）。"""
+    """返回 agent_ids 里存在且 enabled 的 id 子集（供配置层校验）。
+
+    已无调用方（cdp_client 的 agent_ids 校验已随单轨化删除），保留以兼容外部引用。
+    """
     return [row["id"] for row in await list_agents_by_ids(agent_ids)]
 
 
 async def list_all_agents_brief() -> list[dict]:
-    """全部 enabled agent 概要，供配置契约 reference_options.agents 使用。"""
+    """全部 enabled agent 概要，供配置契约 reference_options.agents 使用。
+
+    已无调用方（cdp_client schema 不再声明 x-reference=agents），保留以兼容外部引用。
+    """
     from db import PostgresClient
 
     if not PostgresClient.pool:
@@ -2304,14 +2316,15 @@ async def get_agent_mcp_principal_id(agent_id: int) -> int | None:
 async def list_agent_ids_authorized_for_cdp_client(client_id: str) -> set[int]:
     """反查：绑定的 principal 有 ``cdp_client_id`` grant 指向该客户端的 enabled agent id 集。
 
-    这是「谁真正能操作这个浏览器」的口径——agent 的 browser_* 工具在运行时按其
+    这是「谁能操作这个浏览器」的**唯一**口径——agent 的 browser_* 工具在运行时按其
     principal 的 cdp_client_id grant 定位会话池（见 cdp_bridge_plugin._principal_cdp_client_id），
-    没有该 grant 的 agent 即便被客户端勾选也调不动。client_id = cdp_client 明细行 id
-    的字符串（mcp_grants.grant_value 存的就是字符串）。
+    没有该 grant 的 agent 就调不动。grant_value 与驱动会话池的隔离键同源=客户端的
+    对外身份（新客户端是随机串，存量是资源行 id）。传入数字资源 id 或随机串都先
+    归一成同一身份，避免两代 id 对不上。
     """
     from db import PostgresClient
 
-    cid = (client_id or "").strip()
+    cid = await _cdp_client_resource_id(client_id)
     if not cid or not PostgresClient.pool:
         return set()
     async with PostgresClient.pool.acquire() as conn:
@@ -2325,38 +2338,58 @@ async def list_agent_ids_authorized_for_cdp_client(client_id: str) -> set[int]:
     return {int(r["id"]) for r in rows}
 
 
-async def get_cdp_client_agent_ids(client_id: str) -> list[int] | None:
-    """按 client_id 取其可操作 agent_ids。client_id = cdp_client 资源行 id。
+async def _cdp_client_resource_id(client_id: str) -> str:
+    """把 cdp_client 的任一形态标识归一成**资源行 id 字符串**（授权的存储键）。
 
-    用户侧 CDP 客户端存在 ``builtin_tool_resources``（resource_type='cdp_client'，
-    client_id = 资源行 id，见 ``builtin_tool_store.cdp_client_present``）。旧
-    ``mcp_runtime_configs`` 的 cdp_client 已随迁移废弃，故这里直接读资源表——否则
-    用户页存的 agent_ids 网页对话网关读不到（表错位）。
-
-    返回 None 表示该 client 不存在或已停用；返回列表（可能为空）表示存在。
-    空列表 ⇒ 该客户端不允许操作任何 agent（网页对话面板不列出任何 agent）。
+    mcp_grants.grant_value 存的是资源行 id（与 device/mail 的 param 行同口径，
+    前端实例选择器也用资源 id 勾选）。传入随机 client_id 或资源行 id 都解析成
+    同一条资源行 id；定位不到时原样返回（交由调用方按「不存在」处理）。
     """
-    from db import PostgresClient
+    import builtin_tool_store
 
     cid = (client_id or "").strip()
-    if not cid or not PostgresClient.pool:
+    if not cid:
+        return ""
+    resource = await builtin_tool_store.find_cdp_client(cid)
+    return str(resource["id"]) if resource else cid
+
+
+async def cdp_client_session_key(client_id: str) -> str:
+    """把 cdp_client 的任一形态标识解析成**驱动会话池隔离键**（对外身份）。
+
+    新客户端是随机 client_id（cc_ 前缀），存量行回落资源行 id。授权侧存的是
+    资源行 id，插件在驱动边界经此翻译成会话键，二者才对齐。
+    """
+    import builtin_tool_store
+
+    cid = (client_id or "").strip()
+    if not cid:
+        return ""
+    resource = await builtin_tool_store.find_cdp_client(cid)
+    return builtin_tool_store.cdp_client_id_of(resource) if resource else cid
+
+
+async def get_cdp_client_agent_ids(client_id: str) -> list[int] | None:
+    """CDP 客户端资源的存在性读取（client_id = 对外身份：随机串或旧数字 id）。
+
+    ``agent_ids`` 已随权限单轨化废弃（授权只存 agent 侧 mcp_grants），返回的列表
+    不再参与任何判权——调用方只应把它当「这个客户端存在吗」用：None = 不存在，
+    [] / 非空 = 存在（enabled 时为旧数据里残留的 agent_ids，已无人消费）。
+
+    保留本函数是因为「客户端不存在」与「客户端存在但没授权任何 agent」在网页对话
+    链路上要给出不同错误（401 vs 403），需要一个独立的资源存在性探针。
+    """
+    import builtin_tool_store
+
+    cid = (client_id or "").strip()
+    if not cid:
         return None
-    try:
-        resource_id = int(cid)
-    except (TypeError, ValueError):
+    resource = await builtin_tool_store.find_cdp_client(cid)
+    if not resource:
         return None
-    async with PostgresClient.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT data FROM builtin_tool_resources "
-            "WHERE resource_type='cdp_client' AND id=$1 LIMIT 1",
-            resource_id,
-        )
-    if not row:
-        return None
-    data = _json_value(row.get("data"), {})
-    if not data.get("enabled", True):
+    if not resource.get("enabled", True):
         return []
-    return _coerce_id_list(data.get("agent_ids"))
+    return _coerce_id_list(resource.get("agent_ids"))
 
 
 async def get_cdp_client_owner_user_id(client_id: str) -> str | None:
@@ -2366,42 +2399,154 @@ async def get_cdp_client_owner_user_id(client_id: str) -> str | None:
     要从客户端资源反查 owner——AI 在网页对话里建的定时任务等副作用产物要归到这个
     人名下，否则用户态列表看不到。
     """
-    from db import PostgresClient
+    import builtin_tool_store
 
     cid = (client_id or "").strip()
-    if not cid or not PostgresClient.pool:
+    if not cid:
         return None
-    try:
-        resource_id = int(cid)
-    except (TypeError, ValueError):
-        return None
-    async with PostgresClient.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT owner_user_id FROM builtin_tool_resources "
-            "WHERE resource_type='cdp_client' AND id=$1 LIMIT 1",
-            resource_id,
-        )
-    owner = row["owner_user_id"] if row else None
+    resource = await builtin_tool_store.find_cdp_client(cid)
+    owner = resource.get("owner_user_id") if resource else None
     return str(owner) if owner else None
 
 
 async def list_agents_for_cdp_client(client_id: str) -> list[dict]:
-    """网页对话面板可选 agent：**客户端勾选的 agent_ids ∩ 拥有该 CDP 客户端资源授权**。
+    """网页对话面板可选 agent：拥有该 CDP 客户端授权（principal 的 cdp_client_id param）的
+    enabled agent 概要。
 
-    勾选集来自 builtin_tool_resources 里的 agent_ids（管理员/用户在客户端设置里选）；
-    授权集来自绑定 principal 的 cdp_client_id param（真正能驱动这个浏览器）。取交集
-    避免列出「勾了但 browser_* 工具调不动」的 agent。任一为空 ⇒ 空列表。
+    单轨口径：授权只存在 agent 侧 grants 里（agent 配置 / 用户端浏览器详情弹框写同一处），
+    cdp_client 资源行上的 agent_ids 字段已废弃移除，不再取交集。
     """
-    selected = await get_cdp_client_agent_ids(client_id)
-    if not selected:
-        return []
     authorized = await list_agent_ids_authorized_for_cdp_client(client_id)
     if not authorized:
         return []
-    eligible = [aid for aid in selected if aid in authorized]
-    if not eligible:
+    return await list_agents_by_ids(sorted(authorized))
+
+
+async def list_agents_authorized_for_cdp_client(
+    client_id: str, *, caller: str | None = None, team_id: str | None = None,
+) -> list[dict]:
+    """某浏览器可授权给哪些 agent（用户端浏览器详情弹框的编辑候选）。
+
+    返回调用者可见的 enabled agent 概要，每行附带 ``authorized``（该 agent 的
+    principal 是否已有指向该客户端的 cdp_client_id grant）与 ``mcp_user_id``
+    （写回用）。caller=None=管理员看全部；否则=自己创建的 + 团队共享。
+    """
+    from db import PostgresClient
+
+    cid = (client_id or "").strip()
+    if not cid or not PostgresClient.pool:
         return []
-    return await list_agents_by_ids(eligible)
+    authorized = await list_agent_ids_authorized_for_cdp_client(cid)
+    async with PostgresClient.pool.acquire() as conn:
+        if caller is None:
+            rows = await conn.fetch(
+                "SELECT id, name, display_name, mcp_user_id FROM agents "
+                "WHERE enabled=TRUE ORDER BY id",
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT id, name, display_name, mcp_user_id FROM agents "
+                "WHERE enabled=TRUE AND (user_id=$1 "
+                "OR (is_team_shared=TRUE AND team_id=$2)) ORDER BY id",
+                str(caller), team_id,
+            )
+    return [
+        {
+            "id": int(r["id"]),
+            "name": r["name"],
+            "display_name": r["display_name"],
+            "mcp_user_id": int(r["mcp_user_id"]) if r["mcp_user_id"] is not None else None,
+            "authorized": int(r["id"]) in authorized,
+        }
+        for r in rows
+    ]
+
+
+async def set_cdp_client_agents(
+    client_id: str, agent_ids: list[int], *, caller: str | None = None,
+    team_id: str | None = None,
+) -> list[dict]:
+    """设置某浏览器可被哪些 agent 使用（用户端浏览器详情弹框的写回入口）。
+
+    语义：对调用者可见的每个 agent，若在 agent_ids 里 → 给其 principal 补
+    ``cdp_client_id=<client_id>`` grant（缺 service 行时连 cdp-bridge service 行一起补，
+    否则 param 行写了也调不动）；若不在 → 删该 grant 行；删后该 principal 若已无任何
+    cdp_client_id 行，连 cdp-bridge service 行一起移除（避免回退到「默认全量」反而
+    获得全部浏览器）。其它服务的 grants 一律不动。
+
+    agent_ids 里不可见/不存在/已停用的 agent 直接忽略（不报错）。client 不存在或已
+    停用抛 LookupError；agent 无绑定 principal（mcp_user_id 为空）抛 ValueError。
+    返回与 list_agents_authorized_for_cdp_client 同形的最新列表。
+    """
+    from db import PostgresClient
+
+    cid = await _cdp_client_resource_id(client_id)
+    if not cid:
+        raise LookupError("CDP 客户端不存在")
+    import builtin_tool_store
+
+    resource = await builtin_tool_store.find_cdp_client(cid)
+    if not resource:
+        raise LookupError("CDP 客户端不存在")
+    if not resource.get("enabled", True):
+        raise LookupError("CDP 客户端已停用")
+
+    candidates = await list_agents_authorized_for_cdp_client(cid, caller=caller, team_id=team_id)
+    visible = {c["id"]: c for c in candidates}
+    wanted: set[int] = set()
+    for raw in agent_ids or []:
+        try:
+            aid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if aid in visible:
+            wanted.add(aid)
+
+    service = await get_service_by_name("cdp-bridge")
+    if not service or service.get("id") is None:
+        raise RuntimeError("cdp-bridge 服务不存在")
+    service_id = str(int(service["id"]))
+
+    for cand in candidates:
+        aid = cand["id"]
+        pid = cand.get("mcp_user_id")
+        if pid is None:
+            if aid in wanted:
+                raise ValueError(f"Agent {aid} 尚未绑定 MCP 用户，请重启服务完成启动对账后重试")
+            continue
+        has = cand["authorized"]
+        want = aid in wanted
+        if has == want:
+            continue
+        if want:
+            current = await list_principal_grants(int(pid))
+            next_grants = [
+                *current,
+                {"grant_key": "cdp_client_id", "grant_value": cid},
+            ]
+            if not any(
+                g.get("grant_key") == GRANT_SERVICE_KEY and str(g.get("grant_value")) == service_id
+                for g in current
+            ):
+                next_grants.append({"grant_key": GRANT_SERVICE_KEY, "grant_value": service_id})
+            await set_principal_grants(int(pid), next_grants)
+        else:
+            remaining = [
+                g for g in await list_principal_grants(int(pid))
+                if not (g.get("grant_key") == "cdp_client_id" and str(g.get("grant_value")) == cid)
+            ]
+            if not any(g.get("grant_key") == "cdp_client_id" for g in remaining):
+                remaining = [
+                    g for g in remaining
+                    if not (g.get("grant_key") == GRANT_SERVICE_KEY and str(g.get("grant_value")) == service_id)
+                ]
+            await set_principal_grants(int(pid), remaining)
+    try:
+        from mcp_runtime.configuration import notify_cdp_agents_changed
+        notify_cdp_agents_changed()
+    except Exception:
+        pass
+    return await list_agents_authorized_for_cdp_client(cid, caller=caller, team_id=team_id)
 
 
 async def recompute_service_users_from_resources(service_id: int) -> list[int]:

@@ -1,0 +1,821 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="AI 测试平台架构与设计意图：把平台从开发工具升级为生产平台——测试是平级角色。含知识体系、资产体系、能力体系、流程体系、质量门禁与底层数据设计。">
+<title>AI 测试平台 · 架构与设计意图</title>
+<style>
+:root{
+  --font-sans:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  --font-mono:"JetBrains Mono","Cascadia Code",Consolas,"Courier New",monospace;
+  --bg:#f6f7f9; --bg-card:#ffffff; --border:#e2e5ea; --border-strong:#cfd5de;
+  --text:#1f2530; --text-muted:#68707d;
+  --accent:#2f6fed; --accent-soft:#e9f0fd; --accent-2:#7a5cf5;
+  --code-bg:#f1f3f7; --code-border:#e2e5ea;
+  --ok-bg:#eefaf1; --ok-border:#a8dbb2; --ok-text:#166b2e;
+  --warn-bg:#fff7e8; --warn-border:#f0c168; --warn-text:#7a5200;
+  --danger-bg:#fdeeee; --danger-border:#f0a8a8; --danger-text:#8f1d1d;
+  --info-bg:#eef4fd; --info-border:#b3cdf5; --info-text:#1d4f91;
+  --table-alt:#fafbfc; --kbd-bg:#eef1f5;
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 6px 24px rgba(16,24,40,.06);
+}
+html[data-theme="dark"]{
+  --bg:#0e1218; --bg-card:#161c26; --border:#28303f; --border-strong:#3a4457;
+  --text:#d7dce4; --text-muted:#8b94a4;
+  --accent:#5c8bf5; --accent-soft:#1a2540; --accent-2:#9b82ff;
+  --code-bg:#11161f; --code-border:#28303f;
+  --ok-bg:#12271a; --ok-border:#2c5c3d; --ok-text:#93d4a5;
+  --warn-bg:#2a2312; --warn-border:#7a5a1c; --warn-text:#e2b86b;
+  --danger-bg:#2a1515; --danger-border:#7a3030; --danger-text:#ef9a9a;
+  --info-bg:#122036; --info-border:#27466f; --info-text:#9dc2ef;
+  --table-alt:#1b222e; --kbd-bg:#232b3a;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 28px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font-family:var(--font-sans);font-size:15px;line-height:1.7;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{display:flex;min-height:100vh;max-width:1560px;margin:0 auto}
+
+/* ---------- 侧栏 ---------- */
+.sidebar{
+  width:264px;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto;
+  background:#1b2130;color:#c3cad6;padding:22px 0 40px;
+}
+html[data-theme="dark"] .sidebar{background:#0b0f16;border-right:1px solid var(--border)}
+.brand{display:flex;align-items:center;gap:11px;padding:0 22px 20px;font-size:16px;font-weight:700;color:#fff}
+.brand .dot{
+  width:30px;height:30px;border-radius:9px;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;font-weight:800;font-size:15px;
+}
+.nav-group{padding:16px 22px 6px;font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:#79839a}
+.sidebar nav a{
+  display:flex;align-items:center;gap:9px;padding:7px 22px;color:#aeb6c4;font-size:13.5px;
+  border-left:3px solid transparent;transition:.15s;
+}
+.sidebar nav a:hover{background:#242b3c;color:#fff;text-decoration:none}
+.sidebar nav a.active{background:#242b3c;color:#fff;border-left-color:var(--accent)}
+.sidebar nav a .ic{width:18px;text-align:center;opacity:.85;font-size:13px}
+
+/* ---------- 主区 ---------- */
+.main{flex:1;min-width:0}
+.topbar{
+  position:sticky;top:0;z-index:30;display:flex;justify-content:flex-end;gap:10px;
+  padding:10px 26px;background:color-mix(in srgb,var(--bg) 86%,transparent);
+  backdrop-filter:blur(9px);border-bottom:1px solid var(--border);
+}
+.topbar button{
+  border:1px solid var(--border);background:var(--bg-card);color:var(--text);
+  padding:6px 13px;border-radius:8px;font-size:13px;cursor:pointer;font-family:var(--font-sans);
+  transition:.15s;
+}
+.topbar button:hover{border-color:var(--accent);color:var(--accent)}
+.content{max-width:1080px;margin:0 auto;padding:34px 40px 130px}
+
+/* ---------- Hero ---------- */
+.hero{
+  margin:0 0 30px;padding:38px 34px 32px;border:1px solid var(--border);border-radius:16px;
+  background:linear-gradient(135deg,var(--accent-soft) 0%,var(--bg-card) 58%);position:relative;overflow:hidden;
+  box-shadow:var(--shadow);
+}
+.hero::before{content:"";position:absolute;inset:0 0 auto 0;height:4px;
+  background:linear-gradient(90deg,var(--accent),var(--accent-2),var(--accent))}
+.eyebrow{
+  display:inline-block;font-size:12px;letter-spacing:1.6px;text-transform:uppercase;color:var(--accent);
+  background:var(--bg-card);border:1px solid var(--accent);border-radius:20px;padding:4px 14px;margin-bottom:16px;font-weight:600;
+}
+.hero h1{font-size:34px;line-height:1.25;margin:0 0 14px;letter-spacing:-.5px;font-weight:800}
+.hero .claim{font-size:16.5px;line-height:1.75;color:var(--text);max-width:760px;margin:0 0 8px}
+.hero .claim strong{color:var(--accent)}
+.hero .boundary{font-size:13px;color:var(--text-muted);max-width:760px;margin:16px 0 0;padding-top:14px;border-top:1px solid var(--border)}
+
+/* ---------- 排版 ---------- */
+h2{font-size:23px;margin:52px 0 14px;padding-bottom:9px;border-bottom:1px solid var(--border);letter-spacing:-.2px}
+h3{font-size:17.5px;margin:30px 0 10px}
+h4{font-size:15px;margin:22px 0 8px}
+p{margin:11px 0}
+ul,ol{padding-left:22px}
+li{margin:5px 0}
+strong{font-weight:600}
+.lead{font-size:16px;color:var(--text-muted)}
+hr{border:none;border-top:1px solid var(--border);margin:38px 0}
+code{font-family:var(--font-mono);font-size:.88em;background:var(--code-bg);border:1px solid var(--code-border);border-radius:4px;padding:1px 5px}
+pre{
+  background:var(--code-bg);border:1px solid var(--code-border);border-radius:10px;
+  padding:16px 18px;overflow-x:auto;font-family:var(--font-mono);font-size:12.8px;line-height:1.62;
+}
+pre code{background:none;border:none;padding:0;font-size:inherit}
+
+/* ---------- 图 ---------- */
+.arch{
+  background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px;
+  margin:18px 0;overflow-x:auto;font-family:var(--font-mono);font-size:12.8px;line-height:1.7;white-space:pre;
+  box-shadow:var(--shadow);
+}
+.arch .hi{color:var(--accent);font-weight:600}
+.arch .cmt{color:var(--text-muted)}
+
+/* ---------- 表格 ---------- */
+.table-wrap{overflow-x:auto;margin:16px 0;border:1px solid var(--border);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:13.6px}
+th,td{border-bottom:1px solid var(--border);padding:9px 13px;text-align:left;vertical-align:top}
+th{background:var(--accent-soft);font-weight:600;white-space:nowrap;color:var(--text)}
+tbody tr:nth-child(even){background:var(--table-alt)}
+tbody tr:last-child td{border-bottom:none}
+
+/* ---------- 提示框 ---------- */
+.note,.warn,.danger,.ok,.info{border-radius:10px;padding:13px 17px;margin:16px 0;border:1px solid;font-size:14px}
+.note,.info{background:var(--info-bg);border-color:var(--info-border);color:var(--info-text)}
+.warn{background:var(--warn-bg);border-color:var(--warn-border);color:var(--warn-text)}
+.danger{background:var(--danger-bg);border-color:var(--danger-border);color:var(--danger-text)}
+.ok{background:var(--ok-bg);border-color:var(--ok-border);color:var(--ok-text)}
+.note strong,.warn strong,.danger strong,.ok strong,.info strong{display:block;margin-bottom:4px}
+
+/* ---------- 卡片 ---------- */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:15px;margin:18px 0}
+.card{
+  background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:17px 18px;
+  transition:border-color .15s,transform .15s,box-shadow .15s;box-shadow:var(--shadow);
+}
+.card:hover{border-color:var(--accent);transform:translateY(-2px)}
+.card h3{margin:0 0 6px;font-size:15.5px}
+.card p{color:var(--text-muted);font-size:13.4px;margin:5px 0 0}
+.card .num{
+  display:inline-grid;place-items:center;width:24px;height:24px;border-radius:7px;margin-right:8px;
+  background:var(--accent-soft);color:var(--accent);font-size:12.5px;font-weight:700;vertical-align:middle;
+}
+
+/* ---------- 徽章 / chip ---------- */
+.badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600;margin-left:6px;vertical-align:middle}
+.badge.ok{background:var(--ok-bg);color:var(--ok-text);border:1px solid var(--ok-border)}
+.badge.warn{background:var(--warn-bg);color:var(--warn-text);border:1px solid var(--warn-border)}
+.badge.info{background:var(--info-bg);color:var(--info-text);border:1px solid var(--info-border)}
+.badge.accent{background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent)}
+.chip{display:inline-block;padding:2px 9px;border-radius:6px;font-size:12px;font-family:var(--font-mono);
+  background:var(--code-bg);border:1px solid var(--code-border);margin:2px 3px 2px 0}
+
+/* ---------- 流程步骤 ---------- */
+.flow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:16px 0}
+.flow .step{
+  background:var(--bg-card);border:1px solid var(--border);border-radius:9px;padding:7px 13px;font-size:13.5px;font-weight:600;
+}
+.flow .step.gate{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.flow .arrow{color:var(--text-muted);font-size:15px}
+
+/* ---------- KPI ---------- */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:20px 0}
+.kpi{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;text-align:center;box-shadow:var(--shadow)}
+.kpi .v{font-size:28px;font-weight:800;color:var(--accent);letter-spacing:-.5px}
+.kpi .l{font-size:12.5px;color:var(--text-muted);margin-top:4px}
+
+/* ---------- TOC ---------- */
+.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 22px;margin:18px 0 30px;font-size:14px;box-shadow:var(--shadow)}
+.toc strong{display:block;margin-bottom:8px;color:var(--text-muted);font-size:12.5px;letter-spacing:1px;text-transform:uppercase}
+.toc a{display:inline-block;padding:3px 14px 3px 0}
+
+footer{margin-top:60px;padding-top:24px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}
+
+@media (max-width:920px){
+  .sidebar{display:none}
+  .content{padding:24px 18px 90px}
+  .hero h1{font-size:26px}
+  .hero{padding:26px 20px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<aside class="sidebar">
+  <div class="brand"><span class="dot">T</span> AI 测试平台</div>
+  <div class="nav-group">总览</div>
+  <nav>
+    <a href="#position"><span class="ic">◆</span>定位</a>
+    <a href="#principles"><span class="ic">✦</span>设计理念</a>
+    <a href="#architecture"><span class="ic">▤</span>总体架构</a>
+  </nav>
+  <div class="nav-group">五大体系</div>
+  <nav>
+    <a href="#knowledge"><span class="ic">◈</span>知识体系</a>
+    <a href="#assets"><span class="ic">▦</span>资产体系</a>
+    <a href="#capability"><span class="ic">⌘</span>能力体系</a>
+    <a href="#process"><span class="ic">↻</span>流程体系</a>
+    <a href="#quality"><span class="ic">⛨</span>质量体系</a>
+  </nav>
+  <div class="nav-group">底层设计</div>
+  <nav>
+    <a href="#data"><span class="ic">▧</span>数据结构</a>
+    <a href="#surface"><span class="ic">↔</span>能力面契约</a>
+    <a href="#enforcement"><span class="ic">⛓</span>Agent 强制</a>
+  </nav>
+  <div class="nav-group">落地</div>
+  <nav>
+    <a href="#status"><span class="ic">▣</span>落地状态</a>
+    <a href="#decisions"><span class="ic">✓</span>关键决策</a>
+  </nav>
+</aside>
+
+<main class="main">
+<div class="topbar">
+  <button id="theme-toggle" type="button">☾ 深色</button>
+  <button id="print-page" type="button">⎙ 打印</button>
+</div>
+
+<article class="content">
+
+<header class="hero">
+  <span class="eyebrow">架构与设计意图</span>
+  <h1>AI 测试平台</h1>
+  <p class="claim">把平台从<strong>开发工具</strong>升级为<strong>生产平台</strong>——测试是与开发<strong>平级</strong>的角色，拥有自己完整的知识、资产、能力与流程，而不是给开发流程加一个附属环节。</p>
+  <p class="claim">三条不可动摇的原则：<strong>AI 不裁判，框架裁判</strong> · <strong>确定性的归确定性</strong> · <strong>对 AI 固定，对人可扩展</strong>。</p>
+  <p class="boundary">定位：本服务内的一个能力域，与 GA（GenericAgent）无关、不借用其概念。只讲框架、理念、体系与底层设计；表结构为关键字段摘要（非最终 DDL）。</p>
+</header>
+
+<div class="toc">
+  <strong>本页目录</strong>
+  <a href="#position">一、定位</a>
+  <a href="#principles">二、设计理念</a>
+  <a href="#architecture">三、总体架构</a>
+  <a href="#knowledge">四、知识体系</a>
+  <a href="#assets">五、资产体系</a>
+  <a href="#capability">六、能力体系</a>
+  <a href="#process">七、流程体系</a>
+  <a href="#quality">八、质量体系（门禁）</a>
+  <a href="#data">九、底层数据设计</a>
+  <a href="#surface">十、能力面契约</a>
+  <a href="#enforcement">十一、Agent 强制（四层防御）</a>
+  <a href="#status">十二、落地状态</a>
+  <a href="#decisions">十三、关键决策</a>
+</div>
+
+<!-- ===================== 一、定位 ===================== -->
+<h2 id="position">一、定位</h2>
+<p class="lead">开发只是其中一个角色。本设计要补的是<strong>测试者</strong>——一个与开发者平级、拥有独立世界观的角色。</p>
+
+<div class="cards">
+  <div class="card">
+    <h3>测试是平级角色</h3>
+    <p>不是"给开发流程加一个环节"，而是增加一个独立角色：有自己的知识视角、产出物、判断标准。</p>
+  </div>
+  <div class="card">
+    <h3>它有自己的世界观</h3>
+    <p>测试视角的知识（要测什么、测过什么、坏过哪里、覆盖如何），以及自己的产出（用例、场景、缺陷、根因）。</p>
+  </div>
+  <div class="card">
+    <h3>它有自己的判断标准</h3>
+    <p>门禁与准则——产物不达标不放行，且判定由框架（机器）完成，不由 AI 完成。</p>
+  </div>
+</div>
+
+<!-- ===================== 二、设计理念 ===================== -->
+<h2 id="principles">二、设计理念</h2>
+<p>八条理念，是整个体系的地基。其中 <strong>#2「AI 不裁判，框架裁判」</strong> 是最根本的一条——没有它，AI 的产出无法被信任。</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:44px">#</th><th style="width:200px">理念</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>知识是公共资产</strong></td><td>抽取出来的知识服务于整个平台——开发能用、测试能用。测试只是在它之上多了一层测试视角。</td></tr>
+<tr><td>2</td><td><strong>AI 不裁判，框架裁判</strong></td><td>AI 负责"想"和"写"，但<strong>是否合格由框架判定</strong>。这是整个设计的根。</td></tr>
+<tr><td>3</td><td><strong>确定性的归确定性</strong></td><td>执行脚本、跑断言、校验规范是确定性的，不需要 AI；分析、归纳、设计、生成、诊断才需要 AI。两者严格分开。</td></tr>
+<tr><td>4</td><td><strong>对 AI 固定，对人可扩展</strong></td><td>AI 只能在<strong>已注册的能力</strong>范围内组合；人要加新能力，走评审流程。这是可控性的来源。</td></tr>
+<tr><td>5</td><td><strong>一切皆可沉淀</strong></td><td>每完成一次工作，经验（优质脚本、缺陷模式、规范约定）都回流成资产，让下一次更准。</td></tr>
+<tr><td>6</td><td><strong>分层解耦，变更局部化</strong></td><td>知识、用例、场景、工具各自独立分层。改一处不动全身。</td></tr>
+<tr><td>7</td><td><strong>变更必有因，产出必有责</strong></td><td>用例和场景的任何变更都要记录理由；用例的变更必须<strong>显式传导</strong>到关联场景。设计者对设计的用例负责到底。</td></tr>
+<tr><td>8</td><td><strong>疑问不靠猜</strong></td><td>分析设计中<strong>必然</strong>产生疑问。疑问作为一等公民进入流程，通过调试/文档/用户确认闭合，不能靠 AI 假设填平。</td></tr>
+</tbody></table></div>
+
+<!-- ===================== 三、总体架构 ===================== -->
+<h2 id="architecture">三、总体架构</h2>
+<p>三层结构：底层是平台对"系统真相"的公共认识，中间是测试视角的投影，最上层是执行测试的角色。</p>
+
+<div class="arch"><span class="cmt">┌──────────────────────────────────────────────────────┐</span>
+<span class="cmt">│</span>              <span class="hi">AI 测试者（角色）</span>                        <span class="cmt">│</span>
+<span class="cmt">│</span>   规划 → 分析 → 设计 → 编码 → 执行 → 调试 → 报告       <span class="cmt">│</span>
+<span class="cmt">├──────────────────────────────────────────────────────┤</span>
+<span class="cmt">│</span>                <span class="hi">测试知识引擎</span>                            <span class="cmt">│</span>
+<span class="cmt">│</span>  需求 · 规则 · 用例 · 缺陷 · 文档 · 代码 · 接口          <span class="cmt">│</span>
+<span class="cmt">│</span>  历史 · 证据 · 覆盖 · 结果                              <span class="cmt">│</span>
+<span class="cmt">├──────────────────────────────────────────────────────┤</span>
+<span class="cmt">│</span>                <span class="hi">软件知识图谱</span>                            <span class="cmt">│</span>
+<span class="cmt">│</span>         代码图谱 + 知识化 + 业务规则                     <span class="cmt">│</span>
+<span class="cmt">│</span>       ├── 代码    ├── 文档    ├── 业务规则               <span class="cmt">│</span>
+<span class="cmt">└──────────────────────────────────────────────────────┘</span></div>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:200px">层</th><th>是什么</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td><strong>软件知识图谱</strong></td><td>最底层，是平台对"系统真相"的认识：代码是什么、文档说什么、业务规则怎么定义</td><td>公共底座，开发/测试共用</td></tr>
+<tr><td><strong>测试知识引擎</strong></td><td>在底座之上，组织出测试视角的知识：要测什么、测过什么、坏过哪里、覆盖如何</td><td>测试域专用（派生视图）</td></tr>
+<tr><td><strong>AI 测试者</strong></td><td>最上层，是执行测试的角色</td><td>从知识引擎取知识、向它写产出</td></tr>
+</tbody></table></div>
+
+<div class="note"><strong>关键边界</strong>测试视图<strong>只读底座，不回写底座</strong>——回写走正规摄取。底座是公共资产，测试域在其上派生，二者物理分离。</div>
+
+<!-- ===================== 四、知识体系 ===================== -->
+<h2 id="knowledge">四、知识体系</h2>
+<p>知识来自三个源，独立抽取、独立成资产。<strong>知识 ≠ 用例</strong>：知识是对世界的结构化认识，用例是一个流程说明；写用例参考知识，但知识的存在不为了用例。</p>
+
+<div class="arch"><span class="cmt">                      知识源</span>
+                        │
+     ┌──────────────────┼──────────────────┐
+     ▼                  ▼                  ▼
+  <span class="hi">产品知识</span>           <span class="hi">技术知识</span>           <span class="hi">测试知识</span>
+  ────────          ────────          ────────
+  PRD               CodeGraph          人工用例
+  产品文档            API                AI 用例
+  接口文档            DB                 历史 Bug
+  业务规则            MQ                 测试报告
+  ADR               Config              测试结果
+  Wiki              Dependency          缺陷根因</div>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:150px">源</th><th>回答什么</th><th>性质</th></tr></thead>
+<tbody>
+<tr><td><strong>产品知识</strong></td><td>应该做什么</td><td>业务侧定义</td></tr>
+<tr><td><strong>技术知识</strong></td><td>实际是什么</td><td>技术侧实现</td></tr>
+<tr><td><strong>测试知识</strong></td><td>测过什么、坏在哪</td><td>测试侧产出（既是输入也是产出）</td></tr>
+</tbody></table></div>
+
+<h3>四层存储（从原始到可用）</h3>
+<div class="arch">L1 <span class="hi">原始层 Raw</span>        不可变的原文快照 + 溯源
+      ↓ 解析/抽取
+L2 <span class="hi">结构化层 Item</span>     结构化知识条目（规则/接口/组件/表…）
+      ↓ 关联
+L3 <span class="hi">图谱层 Graph</span>      条目 ↔ 锚点 ↔ 条目的关系
+      ↓ 派生
+L4 <span class="hi">视图层 View</span>       面向消费者的投影（画像/覆盖/影响面）</div>
+
+<div class="warn"><strong>L4 不手工维护</strong>——它是查询结果，不是数据。这是"数据只有一份真相"的保证。</div>
+
+<h3>锚点：精确对齐，不用向量</h3>
+<p>锚点是<strong>对齐层</strong>——让产品知识、技术知识、测试知识能在同一坐标上对上。身份为 <code>(project_id, kind, path, symbol)</code>，稳定、可 grep、不随行号漂移。</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:160px">锚点 kind</th><th>来源</th></tr></thead>
+<tbody>
+<tr><td><code>endpoint</code></td><td>路由定义</td></tr>
+<tr><td><code>function</code> / <code>class</code></td><td>符号表</td></tr>
+<tr><td><code>route</code></td><td>前端路由配置</td></tr>
+<tr><td><code>table</code></td><td>迁移文件 / schema 文件</td></tr>
+<tr><td><code>config_key</code></td><td>配置文件</td></tr>
+</tbody></table></div>
+
+<div class="note"><strong>工具即抽取器</strong>不重造轮子——跑现成工具（CodeGraph 出代码符号/调用边、Graphify 出文档↔代码引用边、codetospec 出业务规则+drift），平台只做 <strong>adapter + 入库 + 统一查询 + 门禁</strong>。用<strong>我们自己的稳定身份</strong>入库，不照搬工具的 ID（行号漂移即断）。</div>
+
+<div class="cards">
+  <div class="card"><h3>三档置信度</h3><p><code>declared</code>（显式声明）&gt; <code>extracted</code>（确定性解析 1.0）&gt; <code>inferred</code>（LLM 猜测 0.55–0.95）。诚实标注"这是解析出来的还是猜的"。</p></div>
+  <div class="card"><h3>歧义即丢弃</h3><p>一个歧义的名字是猜测，猜测不是边。召回换精确，与门禁哲学一致。</p></div>
+  <div class="card"><h3>注释是一等公民</h3><p>docstring / <code># WHY:</code> / ADR 引用抽成节点，<code>rationale_for</code> 边把"为什么这么写"接进图——文档↔代码关联最便宜可靠的入口。</p></div>
+</div>
+
+<!-- ===================== 五、资产体系 ===================== -->
+<h2 id="assets">五、资产体系</h2>
+<p>测试者产出的东西，四类资产，各自独立。核心不变式：<strong>AI 只能组合已注册的工具/方法写场景；要新能力必须走评审流程。</strong></p>
+
+<div class="arch">标签 ──划分用途（任务按标签选，不直接选用例）
+   │
+<span class="hi">用例</span> = 数据 + 场景引用 + 标签      <span class="cmt">← 业务视角（测什么）</span>
+   │  ↕ 多对多
+<span class="hi">场景</span> = 步骤集合 + 局部变量         <span class="cmt">← 实现视角（怎么测）</span>
+   │
+<span class="hi">步骤</span> = 类型 + 描述 + 参数/方法 + 后置校验   <span class="cmt">← 类型化</span>
+   │
+<span class="hi">方法脚本</span> = 基础脚本库 + 项目脚本库   <span class="cmt">← Python 代码住这里</span></div>
+
+<h3>5.1 用例（业务视角）</h3>
+<p>用例只说"要测什么、预期是什么"，<strong>不含实现细节（不含步骤）</strong>。</p>
+<div class="warn"><strong>为什么不把步骤写进用例</strong>用例若解释"每一步干啥"，会写得很详细，用例的重点反而抓不住。步骤属于场景。</div>
+
+<p><strong>用例的创建准则（必须确认，不能凭空）：</strong></p>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:150px">来源</th><th>确认方式</th></tr></thead>
+<tbody>
+<tr><td><strong>调试</strong></td><td>通过实际运行/复现确认</td></tr>
+<tr><td><strong>文档</strong></td><td>通过 PRD / 接口文档 / 业务规则确认</td></tr>
+<tr><td><strong>用户确认</strong></td><td>产品不确定时，由用户拍板</td></tr>
+</tbody></table></div>
+<p><strong>产品不确定 → 必须走用户确认。</strong>发现产品定义不清、行为有歧义时，用例<strong>不得自行假设</strong>，必须挂起为"待确认"，交用户裁决后才成立。</p>
+
+<h3>5.2 场景（实现视角）</h3>
+<p><strong>场景 = 步骤集合 + 局部变量管理。</strong>它的作用是实现用例，一个场景可被多个用例关联。步骤<strong>类型化</strong>：</p>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:180px">type</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>request</code></td><td>发送请求</td></tr>
+<tr><td><code>page</code> / <code>android</code> / <code>ios</code></td><td>操作页面 / 移动端</td></tr>
+<tr><td><code>wait</code></td><td>等待</td></tr>
+<tr><td><code>script</code></td><td>执行方法脚本或内联代码</td></tr>
+<tr><td><code>check</code></td><td>校验数据</td></tr>
+<tr><td><code>sql</code> / <code>ws</code> / <code>custom</code></td><td>数据库 / WebSocket / 自定义工具</td></tr>
+<tr><td><code>ai_judge</code> / <code>agent_action</code> / <code>agent_workflow</code></td><td>AI 判断 / Agent 操作 / Agent 工作流（执行语义下沉到步骤类型）</td></tr>
+</tbody></table></div>
+
+<div class="info"><strong>局部变量流转</strong>场景内声明 <code>local_vars</code>，步骤 <code>post_cond</code> 写入、后续步骤读取；前置场景的变量<strong>传递</strong>给当前场景——这就是上下场景互相使用的机制。</div>
+
+<h3>5.2c 脚本创建准则（机器强制）</h3>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:230px">准则</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><strong>设计提取，不要从头到尾</strong></td><td>场景<strong>必须尽可能拆分</strong>，可复用部分提取为方法/自定义工具</td></tr>
+<tr><td>复用优先</td><td>同逻辑二次出现必须提为方法/工具</td></tr>
+<tr><td><strong>校验必需</strong></td><td>每个步骤至少一条后置校验</td></tr>
+<tr><td><strong>环境变量</strong></td><td>环境相关的值必须走环境变量，不硬编码</td></tr>
+<tr><td>依赖白名单</td><td>只能用注册工具/方法</td></tr>
+<tr><td>清理对称 · 幂等可重跑</td><td>前后置对称、资源必释放、重复执行不污染</td></tr>
+<tr><td>溯源完整</td><td>场景 → 用例 → 需求 链完整</td></tr>
+</tbody></table></div>
+
+<h3>5.3 缺陷与根因</h3>
+<p>失败 → 分类 → 提缺陷 → 根因分析 → 修复 → <strong>回流</strong>。根因分析的产出必须<strong>带证据链</strong>——每条结论可溯源到代码位置、日志、证据，无证据的结论不入库。</p>
+
+<h3>5.4 沉淀（测试技术）</h3>
+<p class="lead">让不同 AI 产出一致的关键——四件套：</p>
+<div class="cards">
+  <div class="card"><h3><span class="num">1</span>约定</h3><p>命名 / 目录 / 变量 / 错误处理规范。</p></div>
+  <div class="card"><h3><span class="num">2</span>模板</h3><p>骨架，AI 填空。</p></div>
+  <div class="card"><h3><span class="num">3</span>黄金样例</h3><p>已验收的优质脚本，作参照。</p></div>
+  <div class="card"><h3><span class="num">4</span>校验器</h3><p>机器判定"是否符合规范"。</p></div>
+</div>
+<div class="ok"><strong>一致性 = 约定(读) + 模板(填) + 样例(仿) + 校验器(判)</strong>。沉淀分三层：通用（跨框架）→ 框架级 → 项目级，AI 按当前上下文按需加载。</div>
+
+<!-- ===================== 六、能力体系 ===================== -->
+<h2 id="capability">六、能力体系</h2>
+<h3>6.1 AI 测试者的七个角色</h3>
+<div class="flow">
+  <span class="step">规划</span><span class="arrow">→</span>
+  <span class="step">分析</span><span class="arrow">→</span>
+  <span class="step">设计</span><span class="arrow">→</span>
+  <span class="step">编码</span><span class="arrow">→</span>
+  <span class="step gate">执行</span><span class="arrow">→</span>
+  <span class="step">调试</span><span class="arrow">→</span>
+  <span class="step">报告</span>
+</div>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:110px">角色</th><th>职责</th><th style="width:110px">性质</th></tr></thead>
+<tbody>
+<tr><td>规划</td><td>制定整体测试策略</td><td>智能</td></tr>
+<tr><td>分析</td><td>归纳知识、找缺口</td><td>智能</td></tr>
+<tr><td>设计</td><td>设计测试方案</td><td>智能</td></tr>
+<tr><td>编码</td><td>生成用例与场景</td><td>智能</td></tr>
+<tr><td><strong>执行</strong></td><td>跑脚本、判结果</td><td><strong>确定性</strong></td></tr>
+<tr><td>调试</td><td>分析失败、定位根因</td><td>智能</td></tr>
+<tr><td>报告</td><td>汇总质量视图、沉淀知识</td><td>智能</td></tr>
+</tbody></table></div>
+<div class="note"><strong>这七个是角色，不是固定的程序</strong>——谁来完成是部署选择。<strong>执行这类确定性工作流根本不需要 agent</strong>，由脚本引擎直接跑。</div>
+
+<h3>6.2 Agent 抽象（本阶段不选路）</h3>
+<p>平台<strong>不绑定任何具体 agent</strong>。测试域对外只暴露四个面——"接 pi 还是 dsh 还是别的"是部署选择，不是架构改动：</p>
+<div class="cards">
+  <div class="card"><h3>工具方法</h3><p>原子可调用单元（最底层）。</p></div>
+  <div class="card"><h3>MCP</h3><p>工具方法的 MCP 暴露，任何会说 MCP 的 agent 都能调。</p></div>
+  <div class="card"><h3>接口</h3><p>契约：输入输出、能力保证、域边界。</p></div>
+  <div class="card"><h3>AI 工作流</h3><p>七个角色的编排定义。</p></div>
+</div>
+
+<h3>6.3 任务（每次启动的用途不一样）</h3>
+<p class="lead">不同测试场景下没必要整个用例集跑一遍，应该有侧重点。<strong>任务 = 一次有侧重、有标签、有通知的启动。</strong></p>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:170px">任务包含</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><strong>场景标签</strong></td><td>按标签选例（不是直接选用例）——跑的时候按标签划分用途</td></tr>
+<tr><td><strong>执行类型</strong></td><td>多维度启动：手动 / 定时 / 事件 / 接口</td></tr>
+<tr><td><strong>通知配置</strong></td><td>执行结果需要通知（通道 + 时机 + 内容）</td></tr>
+<tr><td><strong>任务用途描述</strong> / 标题</td><td>这次跑是为了什么</td></tr>
+<tr><td><strong>全局参数</strong></td><td>本次任务所有场景共享的参数</td></tr>
+</tbody></table></div>
+<div class="info">标签有分类（用途 / 优先级 / 模块 / 测试类型），任务可按不同维度组合选例，如"模块=支付 且 优先级=P0"。任务提供接口，<strong>人和 AI 都能添加/修改</strong>。</div>
+
+<!-- ===================== 七、流程体系 ===================== -->
+<h2 id="process">七、流程体系</h2>
+<p>完整流水线，14 段，<strong>循环</strong>——最后一段的产出回流第一段，系统越用越准。</p>
+<div class="arch">多源知识 → 分析归纳 → 知识模型 → 测试设计 → 用例
+   → 脚本生成 → 脚本验证 → 执行测试 → 结果分析 → 缺陷分析
+   → 缺陷提交 → 根因分析 → 测试报告 → 质量沉淀 <span class="hi">↺</span></div>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:280px">段</th><th>承担角色</th></tr></thead>
+<tbody>
+<tr><td>多源知识 / 分析归纳 / 知识模型</td><td>分析</td></tr>
+<tr><td>测试设计 / 用例</td><td>设计</td></tr>
+<tr><td>脚本生成 / 脚本验证</td><td>编码</td></tr>
+<tr><td>执行测试 / 结果分析</td><td>执行（确定性）</td></tr>
+<tr><td>缺陷分析 / 缺陷提交 / 根因分析</td><td>调试</td></tr>
+<tr><td>测试报告 / 质量沉淀</td><td>报告</td></tr>
+</tbody></table></div>
+<p><strong>规划</strong>贯穿全程：先定策略，再动态编排其余角色。<strong>关键：这是循环，不是直线。</strong>优质脚本进沉淀，缺陷模式进知识，覆盖事实更新画像。</p>
+
+<h3>7.1 疑问与确认（流程的一等公民）</h3>
+<p>分析与设计过程中<strong>一定</strong>会产生疑问，这些疑问不能消失，必须显式表达并收敛。两类来源：产品侧不确定（PRD 没写清、行为有歧义）、设计侧疑问（接口契约与文档不一致）。</p>
+
+<div class="arch">疑问提出
+   │
+   ├── 调试验证（跑一下就知道）─────────┐
+   ├── 文档/代码确认（查得到答案）──────┤
+   └── 用户确认（产品不确定时必须走）────┤
+                                        ▼
+                                  结论回写知识 / 用例</div>
+
+<h4>7.1.1 疑问分诊（提交用户后的第一步是"归类"）</h4>
+<p>上一步"用户确认"不是终点，是起点。提交给用户的疑问，第一件事是判断它属于哪一类——类型决定后续走哪条路。</p>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:180px">类型</th><th>含义</th><th>后续</th></tr></thead>
+<tbody>
+<tr><td><strong>bug</strong></td><td>已有定义被违反 / 系统缺陷 / 理解错了</td><td>走修 bug 流</td></tr>
+<tr><td><strong>需求问题</strong></td><td>产品未定义、行为有歧义、要拍板</td><td>走产品决策</td></tr>
+<tr><td><strong>设计问题</strong></td><td>设计不自洽、约束冲突</td><td>走设计修订</td></tr>
+<tr><td><strong>问错 / 信息不足</strong></td><td>问题本身有问题、超范围</td><td>补上下文后重问</td></tr>
+</tbody></table></div>
+<div class="warn"><strong>两条硬规则</strong>① 不许 AI 自行假设填平（无论多小的疑问）——自己拍 = 越权。② 不许把未分析的疑问直接扔回用户——先分析合理性 + 给出归类建议，再交用户裁决。</div>
+<div class="danger"><strong>疑问阻塞下游</strong>用例带着 <code>open</code> 疑问，不得进入脚本生成；脚本带着 <code>open</code> 疑问，不得进入执行。每个疑问有状态：<code>open → 已解决</code>，附解决方式与依据。</div>
+
+<!-- ===================== 八、质量体系 ===================== -->
+<h2 id="quality">八、质量体系（门禁）</h2>
+<p class="lead">整个设计的信任基础：<strong>AI 不裁判，框架裁判。</strong>每个环节都有门，产物不达标不放行。</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:130px">门</th><th>判什么</th></tr></thead>
+<tbody>
+<tr><td>知识门</td><td>结构化 + 可溯源 + 可测</td></tr>
+<tr><td>生成门</td><td>契约合法 + 只用已注册工具 + 可断言 + 可溯源</td></tr>
+<tr><td><strong>校验门</strong></td><td><strong>脚本写没写校验</strong>——每步、每个关键结果都有可判定校验</td></tr>
+<tr><td><strong>确认门</strong></td><td>用例依据是否可确认（调试/文档/用户确认）；未解决的疑问是否已收敛</td></tr>
+<tr><td>执行门</td><td>断言由框架机械判定</td></tr>
+<tr><td>保证门</td><td>可执行 + 可稳定通过 + 有增量价值</td></tr>
+<tr><td>根因门</td><td>每条结论带证据引用</td></tr>
+<tr><td><strong>变更门</strong></td><td>每次变更是否记录理由；用例变更是否已传导到关联场景</td></tr>
+</tbody></table></div>
+<div class="ok"><strong>门禁是机器，不是 AI</strong>——这是"不同 AI 产出一致"的机制保证。</div>
+
+<h3>8.1 失败分流（与疑问分诊同构：先归类，再决定走哪条路）</h3>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:160px">结果</th><th>判据</th><th>处理</th></tr></thead>
+<tbody>
+<tr><td><code>script_issue</code></td><td>定位/时序/断言写法问题</td><td>自愈或转人工</td></tr>
+<tr><td><code>product_bug</code></td><td>断言合理但系统行为不符</td><td>建测试缺陷（<code>mc_test_bug</code>）</td></tr>
+<tr><td><code>case_outdated</code></td><td>需求已变，预期过时</td><td>标用例 deprecated</td></tr>
+<tr><td><code>env_flaky</code></td><td>重跑即过</td><td>标 flaky，不计失败</td></tr>
+</tbody></table></div>
+<p><strong>判据顺序（确定性优先）</strong>：重跑一次 → 比对知识库预期 → 判失败层（脚本层 vs 系统层）→ 不确定才交 AI。失败指纹相同则归并到同一缺陷。</p>
+
+<h3>8.2 三模执行（per case 可选，工业级容错）</h3>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:150px">模式</th><th>流程</th></tr></thead>
+<tbody>
+<tr><td><code>script_only</code></td><td>引擎跑 → 判定（默认，纯确定性）</td></tr>
+<tr><td><code>hybrid</code></td><td>引擎跑 → 失败 → Debugger 诊断 → 自愈建议 → 修场景 → 重跑</td></tr>
+<tr><td><code>ai_only</code></td><td>无场景，AI 直接执行（仍只用注册工具/方法，断言仍机械判）</td></tr>
+</tbody></table></div>
+<div class="warn"><strong>hybrid 自愈边界</strong>只改场景/步骤（不改被测代码）；有次数/时间/token 预算；改完<strong>重新过校验门</strong>；重跑后仍由断言库判定（AI 不能自判 pass/fail）。</div>
+
+<!-- ===================== 九、底层数据设计 ===================== -->
+<h2 id="data">九、底层数据设计</h2>
+<p>三条治理铁律贯穿全部实体：<strong>稳定 ID、显式状态机、版本 + 溯源</strong>。测试域表统一 <code>mc_test_*</code> 段，知识为平台公共资产用 <code>mc_knowledge_*</code>，沿用服务存储惯例（Postgres + Tortoise ORM + UUID 主键）。</p>
+
+<h3>9.1 域边界与模块划分</h3>
+<div class="arch">testing_platform/                <span class="cmt"># 测试域根（独立于 GA）</span>
+├── <span class="hi">knowledge/</span>   知识引擎（源适配 / 抽取 / 图谱 / 门）
+├── <span class="hi">assets/</span>      资产域（用例 + 确认 + 传导 / 场景步骤 / 工具 / 环境）
+├── <span class="hi">engine/</span>      脚本引擎（确定性，不走 AI：解释/驱动/断言/变量）
+├── <span class="hi">runtime</span>→tasks 执行调度（run 生命周期 / 失败分流 / 三模）
+├── <span class="hi">quality/</span>     质量体系（八道门禁 / 校验器 / 疑问追踪）
+├── <span class="hi">defects/</span>     缺陷域（缺陷工单 / 根因 / 缺陷模式）
+├── <span class="hi">craft</span>→quality 沉淀域（约定/模板/样例/校验器）
+├── <span class="hi">surface/</span>     能力面（工具方法 / MCP / 接口 / 工作流）
+├── <span class="hi">projects/</span>    测试项目（整个项目维度；git 配置 + 代码快照）
+├── <span class="hi">reports/</span>     报告与质量沉淀
+└── <span class="hi">workflow/</span>    工作流域（7 角色定义 + 契约校验）</div>
+
+<h3>9.2 核心实体（关键字段摘要）</h3>
+<p><strong>知识域（平台级底座）</strong></p>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:230px">表</th><th>关键字段</th></tr></thead>
+<tbody>
+<tr><td><code>mc_knowledge_source</code></td><td>kind, name, source_type, location, sync_policy, project_id, last_synced_at</td></tr>
+<tr><td><code>mc_knowledge_item</code></td><td>kind(rule/api/component/…), key, content(JSONB), status(candidate|confirmed|stale), confidence, provenance, version</td></tr>
+<tr><td><code>mc_knowledge_anchor</code></td><td>project_id, path, symbol, kind, content_hash, version_id</td></tr>
+<tr><td><code>mc_knowledge_edge</code></td><td>from_item_id, to_item_id, relation(defines|uses|implemented_by|covered_by|…)</td></tr>
+<tr><td><code>mc_test_profile</code></td><td>anchor_id(unique), rule_ids[], coverage_gaps, last_tested_at, test_status(green|flaky|red)</td></tr>
+</tbody></table></div>
+
+<p><strong>资产域（用例 = 业务视角，场景 = 实现视角）</strong></p>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:230px">表</th><th>关键字段</th></tr></thead>
+<tbody>
+<tr><td><code>mc_test_case</code></td><td>code(TC-xxxx), title, intent, preconditions, expected, steps(自然语言), dataset_id, <strong>confirm_source</strong>(debug|doc|user_confirm), origin, priority, module, feature, test_type, status, version</td></tr>
+<tr><td><code>mc_test_case_scenario</code></td><td>case_id, scenario_id, is_primary, order（多对多，不用数组列）</td></tr>
+<tr><td><code>mc_test_scenario</code></td><td>code(SCN-xxxx), transport_id, env_id, local_vars, flow, status, version</td></tr>
+<tr><td><code>mc_test_scenario_step</code></td><td>step_key, seq(唯一顺序真相), type, params, pre_cond, <strong>post_checks</strong>(必填≥1), post_cond, on_error, enabled</td></tr>
+<tr><td><code>mc_test_transport</code></td><td>code, kind(http|ws), auth(登录流程+re_login_on), common_headers, path_rewrite</td></tr>
+<tr><td><code>mc_test_environment</code></td><td>code, name, parent_id(分层继承), is_default</td></tr>
+<tr><td><code>mc_test_env_variable</code></td><td>env_id, key, value(JSONB), <strong>type</strong>(string|int|float|boolean|json|list|dict), is_secret</td></tr>
+<tr><td><code>mc_test_method_module</code> / <code>mc_test_method</code></td><td>Python 代码唯一居所；kind(base|project) / full_ref, signature, is_async</td></tr>
+<tr><td><code>mc_test_dataset</code></td><td>code, schema(JSONB), rows(JSONB)</td></tr>
+<tr><td><code>mc_test_custom_tool</code></td><td>code, scope, purpose, signature, <strong>impl_ref</strong>(只指向公共场景或方法，杜绝两处实现)</td></tr>
+</tbody></table></div>
+
+<p><strong>执行域 · 缺陷域 · 任务 · 报告 · 变更</strong></p>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:230px">表</th><th>关键字段</th></tr></thead>
+<tbody>
+<tr><td><code>mc_test_run</code></td><td>code(RUN-xxxx), trigger, env_id, global_params, scenario_ids, status, summary(JSONB)</td></tr>
+<tr><td><code>mc_test_run_scenario</code></td><td>run_id, scenario_id, case_refs[], status(pass|fail|error|flaky|skipped), <strong>failure_kind</strong>, healing</td></tr>
+<tr><td><code>mc_test_step_result</code></td><td>run_scenario_id, step_seq, status, expected/actual/diff, duration_ms（响应时间来源）</td></tr>
+<tr><td><code>mc_test_evidence</code></td><td>kind(screenshot|log|network|trace|db_state|assertion_diff), uri</td></tr>
+<tr><td><code>mc_test_bug</code></td><td>code(BUG-xxxx), project_id(测试项目), symptom, status(open→triaged→fixed→verified→closed/rejected), severity, <strong>fingerprint</strong>, repro, case_refs[]</td></tr>
+<tr><td><code>mc_test_bug_root_cause</code></td><td>location, classification, hypothesis, confidence, fix_suggestion, <strong>evidence_chain</strong>(根因门必填)</td></tr>
+<tr><td><code>mc_test_bug_pattern</code></td><td>symptom_pattern, root_cause_kind, prevention, regression_template, hit_count（沉淀回流）</td></tr>
+<tr><td><code>mc_test_task</code></td><td>code(TASK-xxxx), scenario_tags(JSONB), exec_type, schedule, notify, global_params</td></tr>
+<tr><td><code>mc_test_report</code></td><td>code(RPT-xxxx), run_id, test_version, status, <strong>snapshot</strong>(JSONB 生成时快照)</td></tr>
+<tr><td><code>mc_test_change_record</code></td><td>entity_type, entity_id, <strong>change_reason</strong>(必填), field_changes(diff), propagation, rollback_ref</td></tr>
+<tr><td><code>mc_test_project</code> / <code>_git</code> / <code>_version</code></td><td>测试项目不拥有代码，只配 git（1-N 仓库）；版本选仓库分支 → 图谱按版本过滤</td></tr>
+</tbody></table></div>
+
+<h3>9.3 状态机汇总</h3>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:150px">实体</th><th>状态流</th></tr></thead>
+<tbody>
+<tr><td>知识条目</td><td><code>candidate → confirmed → stale</code></td></tr>
+<tr><td>疑问</td><td><code>open → resolved</code>（附 resolution 方式）</td></tr>
+<tr><td>用例</td><td><code>draft → pending_confirmation → active → deprecated → archived</code></td></tr>
+<tr><td>场景</td><td><code>draft → verified → active → broken → archived</code></td></tr>
+<tr><td>运行</td><td><code>pending → running → done / aborted</code></td></tr>
+<tr><td>场景结果</td><td><code>pass / fail / error / flaky / skipped</code></td></tr>
+<tr><td>缺陷</td><td><code>open → triaged → fixed → verified → closed / rejected</code></td></tr>
+<tr><td>工作流运行</td><td><code>pending → running → done / failed / blocked_by_question</code></td></tr>
+</tbody></table></div>
+
+<h3>9.4 出入准则与变更传导</h3>
+<div class="cards">
+  <div class="card"><h3>进</h3><p>过保证门才入库，不达标降级为"候选"。</p></div>
+  <div class="card"><h3>改</h3><p>只增版本，不覆盖历史；每次变更必须记录理由。</p></div>
+  <div class="card"><h3>废</h3><p>标失效，不物理删除，通知依赖方。</p></div>
+  <div class="card"><h3>删</h3><p>仅限误建，人工确认。</p></div>
+</div>
+<div class="info"><strong>变更传导（字段级选择性同步）</strong><code>change_record.field_changes</code> → 匹配下游绑定 → <strong>只同步受影响字段</strong> → 留历史 → 可回滚。避免"改一小字段触发整脚本重生成"。源变更 → 沿依赖链标记失效，这是"代码变了，哪些用例要重测"的机制基础。</div>
+
+<!-- ===================== 十、能力面契约 ===================== -->
+<h2 id="surface">十、能力面契约（对外唯一出口）</h2>
+<p>任何 agent（pi / dsh / 自研）都通过这一面驱动测试域；换 agent 不改契约。MCP 层只做<strong>协议适配 + 鉴权</strong>，不含业务逻辑。</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:190px">方法</th><th>职责</th><th style="width:80px">性质</th></tr></thead>
+<tbody>
+<tr><td><code>knowledge.query</code> / <code>ingest</code> / <code>profile</code></td><td>查知识 / 从源抽取（过知识门）/ 取画像</td><td>读·写</td></tr>
+<tr><td><code>question.raise</code> / <code>resolve</code></td><td>提出疑问（阻塞下游）/ 收敛疑问</td><td>写</td></tr>
+<tr><td><code>case.create</code> / <code>update</code> / <code>confirm</code></td><td>建用例（须带 confirm_source）/ 改用例（必填 reason）/ 确认</td><td>写</td></tr>
+<tr><td><code>scenario.generate</code> / <code>validate</code> / <code>update</code></td><td>生成（过生成门+校验门）/ 校验 / 改（记录原因）</td><td>写·读</td></tr>
+<tr><td><code>tool.list</code> / <code>register</code></td><td>列已注册工具 / 注册自定义工具（走评审）</td><td>读·写</td></tr>
+<tr><td><code>run.execute</code> / <code>status</code> / <code>result</code></td><td>执行测试（确定性）/ 查状态 / 查结果</td><td>执行·读</td></tr>
+<tr><td><code>bug.create</code> / <code>triage</code> / <code>root_cause</code></td><td>提缺陷 / 失败分流 / 根因分析（过根因门）</td><td>写</td></tr>
+<tr><td><code>craft.load</code> / <code>report.generate</code></td><td>按需加载沉淀 / 生成报告 + 质量沉淀</td><td>读·写</td></tr>
+</tbody></table></div>
+
+<h3>10.1 AI 工作流定义（7 角色 = 7 条 workflow_def）</h3>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:110px">角色</th><th>输入 → 输出</th><th>可调工具</th><th style="width:90px">性质</th></tr></thead>
+<tbody>
+<tr><td>planner</td><td>目标+知识 → 测试计划</td><td>knowledge.query, craft.load</td><td>LLM</td></tr>
+<tr><td>analyst</td><td>原始知识 → 知识模型+缺口</td><td>knowledge.ingest, question.raise</td><td>LLM</td></tr>
+<tr><td>designer</td><td>知识模型+缺口 → 测试设计+用例</td><td>case.create, question.raise</td><td>LLM</td></tr>
+<tr><td>coder</td><td>设计 → 场景</td><td>scenario.generate, tool.list, craft.load</td><td>LLM</td></tr>
+<tr><td>executor</td><td>场景 → 执行结果</td><td>run.execute</td><td><strong>确定性</strong></td></tr>
+<tr><td>debugger</td><td>失败证据 → 分类+根因+自愈建议</td><td>bug.triage, bug.root_cause</td><td>LLM</td></tr>
+<tr><td>reporter</td><td>全部产出 → 报告+沉淀</td><td>report.generate, craft.load</td><td>LLM</td></tr>
+</tbody></table></div>
+<div class="ok"><strong>引擎包本身不 import agent/LLM</strong>——有护栏测试 <code>test_engine_never_calls_llm</code> 强制。含 AI 步骤的场景由 <code>run.execute</code> 注入的 <code>ctx.ai</code> 真跑：<code>ai_judge</code> 交网关 LLM 判定（判定结果作 actual，仍由步骤 post_checks 机械裁定，<strong>AI 不直接判 pass/fail</strong>）。</div>
+
+<!-- ===================== 十一、Agent 强制 ===================== -->
+<h2 id="enforcement">十一、Agent 规则强制（四层防御）</h2>
+<div class="danger"><strong>核心原则</strong>Agent 是随机的，你无法保证它"想"什么。任何试图"让 agent 遵守"的做法（写进 CLAUDE.md、prompt 叮嘱）本质是<strong>建议</strong>，agent 可忽略——不是强制。<strong>强制的本质：agent 的所有动作，必须经过我们控制的关口才能生效。不合规的动作不生效——不是"告诉它别做"，而是"做了也没用"。</strong></div>
+
+<div class="arch">Layer 4  <span class="hi">审计与回滚</span>   — 发现违规、撤销后果          <span class="cmt">（兜底，最后手段）</span>
+Layer 3  <span class="hi">环境沙箱</span>     — 物理上做不了                <span class="cmt">（强）</span>
+Layer 2  <span class="hi">产物门</span>       — 产物不过门就不生效          <span class="cmt">（强）</span>
+Layer 1  <span class="hi">工具中介</span>     — agent 只能用我们的工具      <span class="cmt">（最强）</span>
+Layer 0  <span class="hi">规则声明</span>     — prompt / instructions       <span class="cmt">（引导，非控制）</span></div>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:130px">层</th><th>机制</th><th>要点</th></tr></thead>
+<tbody>
+<tr><td><strong>L1 工具中介</strong></td><td>agent 只能通过注册的工具/方法行动，工具层是唯一出口</td><td>未注册的能力<strong>无法调用</strong>；调用前校验参数/权限/规则；天然 agent 无关</td></tr>
+<tr><td><strong>L2 产物门</strong></td><td>产物过门之前是"惰性"的——不生效</td><td>用例不过确认门不成立；场景不过校验门不入库；代码不过提交门提交不了</td></tr>
+<tr><td><strong>L3 环境沙箱</strong></td><td>物理上做不了，比"检查后拒绝"更强</td><td>文件系统限目录、网络限白名单、命令限白名单、凭据不注入就不存在</td></tr>
+<tr><td><strong>L4 审计与回滚</strong></td><td>前面都失效时的最后手段</td><td>全量审计、违规检测、回滚能力（撤销已生效的坏后果）</td></tr>
+</tbody></table></div>
+
+<div class="note"><strong>设计纪律</strong>每条可强制的规则必须配一个检查器。没有检查器的规则是愿望，不是规则。"把活干好"这类不可机器检查的——<strong>不假装能强制</strong>。</div>
+
+<!-- ===================== 十二、落地状态 ===================== -->
+<h2 id="status">十二、落地状态</h2>
+<p>按「先做方法，不接流程/agent」推进：先立确定性核心（资产模型 → 引擎 → 校验器），再叠任务/报告，最后接知识与 AI。</p>
+
+<div class="kpis">
+  <div class="kpi"><div class="v">41</div><div class="l">已建数据表</div></div>
+  <div class="kpi"><div class="v">107</div><div class="l">MCP 暴露方法</div></div>
+  <div class="kpi"><div class="v">5</div><div class="l">测试项目阶段（已完成）</div></div>
+  <div class="kpi"><div class="v">7</div><div class="l">AI 角色工作流</div></div>
+</div>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="width:60px">#</th><th>阶段</th><th style="width:110px">状态</th></tr></thead>
+<tbody>
+<tr><td>11</td><td>测试项目域（阶段 1）：4 张新表 + <code>project.*</code> 19 个方法 + 代码快照 + 图谱 query</td><td><span class="badge ok">已完成</span></td></tr>
+<tr><td>12</td><td>双轨数据源 + 用例扫描：A 轨 7 格式 + B 轨 agent 通道 + L1 原始层 + <code>case.scan</code></td><td><span class="badge ok">已完成</span></td></tr>
+<tr><td>13</td><td>阶段 3/4/5 收口：工作流断点 + 分析师编排 + 版本捕获/影响面 + 可靠性</td><td><span class="badge ok">已完成</span></td></tr>
+<tr><td>14</td><td>前端可视化：测试项目管理页 + 力导向图谱页 + 可靠性仪表</td><td><span class="badge ok">已完成</span></td></tr>
+<tr><td>15</td><td>dsh 接入 + MCP server（107 方法）+ 对话后端 SSE</td><td><span class="badge ok">已完成</span></td></tr>
+<tr><td>16</td><td>四件遗留收口：对话持久化 / 覆盖矩阵边 / analyst 自动收口 / 定时源同步</td><td><span class="badge ok">已完成</span></td></tr>
+</tbody></table></div>
+
+<div class="note"><strong>后续</strong>用例生成、缺陷闭环、根因、沉淀回流——在方法层立住后另开计划。<strong>v1 不开放 Code 层</strong>（纯声明式），遇到表达不了的场景走自定义工具评审。</div>
+
+<h3>12.1 平台能力依托（已逐条核对实际代码）</h3>
+<p>所有"复用既有能力"的声称均对着平台真实实现核验过。设计写"复用既有"时必须同时写<strong>出处文件</strong>，否则视为未验证。</p>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:180px">复用的</th><th>实际出处</th><th>怎么用</th></tr></thead>
+<tbody>
+<tr><td>列级加密</td><td><code>server/browser_password_crypto.py</code></td><td>secret 环境变量照此加密（AES-256-GCM + 域分离派生）</td></tr>
+<tr><td>通知通道 / 移动推送</td><td><code>user_platform/notify_dispatch.py</code> / <code>notify_push.py</code></td><td>任务通知只声明通道+时机+内容</td></tr>
+<tr><td>定时调度</td><td><code>agent/scheduler.py</code>（APScheduler + CronTrigger）</td><td>任务 schedule 复用该模式</td></tr>
+<tr><td>附件/证据存储</td><td><code>server/attachment_store.py</code>（TTL + sha256）</td><td>证据经 register_attachment 落库</td></tr>
+<tr><td>设备控制 / 浏览器通道</td><td><code>mcp_builtin/device_control/driver.py</code> / <code>mcp_sdk/cdp.py</code></td><td>引擎的 android/ios/page 步骤直接调</td></tr>
+<tr><td>审计 / 一次性审批卡</td><td><code>agent/guardian.py</code> / <code>file_write_approval.py</code></td><td>强制层 L4 审计 + 逃生口范式</td></tr>
+<tr><td>存储惯例</td><td>全平台（PG + Tortoise + UUID + <code>mc_</code> 前缀）</td><td>测试域表 <code>mc_test_*</code> 沿用</td></tr>
+</tbody></table></div>
+<div class="warn"><strong>核对原则</strong>设计写"复用既有"时必须同时写出处文件，否则视为未验证。（例：email 通知平台不存在——02 原设计误列，已删。）</div>
+
+<!-- ===================== 十三、关键决策 ===================== -->
+<h2 id="decisions">十三、关键决策</h2>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:44px">#</th><th style="width:230px">事项</th><th>决策</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>内联代码（步骤 <code>code</code>）</td><td><strong>v1 不开放</strong>，走方法脚本 + 自定义工具（纯声明式）</td></tr>
+<tr><td>2</td><td>知识锚点实现</td><td>自建薄层 + 现成工具（CodeGraph/Graphify/codetospec）经 adapter 入库；<strong>不引入 sidecar</strong></td></tr>
+<tr><td>3</td><td>测试缺陷与 coding 关系</td><td><strong>彻底解耦</strong>：测试域自持 <code>mc_test_bug</code>，<code>project_id</code> 是测试项目 id，<strong>不需要 coding 桥</strong></td></tr>
+<tr><td>4</td><td>方法脚本源码存储</td><td><strong>DB text</strong>（同库、事务一致、便于 diff）</td></tr>
+<tr><td>5</td><td>引擎运行位置</td><td><strong>服务端进程内</strong>（确定性执行，设备/浏览器操作走现有控制通道下达）</td></tr>
+<tr><td>6</td><td>报告生成/导出</td><td><strong>生成时快照</strong>；v1 导出 HTML 单文件</td></tr>
+<tr><td>7</td><td>环境变量</td><td><strong>分层继承 + 7 类型</strong>（保持 JSON 原生类型，防"数字变字符串"断言误判）</td></tr>
+<tr><td>8</td><td>场景是 YAML 声明式</td><td>AI 产出的是<strong>结构化数据</strong>，不是自由代码；DB 是唯一事实源，YAML 只是交换格式</td></tr>
+<tr><td>9</td><td>用例组织</td><td>项目 → 模块 → 功能点 → 用例；用例本身<strong>扁平、互不关联</strong></td></tr>
+<tr><td>10</td><td>缺陷是质量事件</td><td>10 维度模型，不是"标题+状态"</td></tr>
+</tbody></table></div>
+
+<hr>
+
+<div class="cards">
+  <div class="card"><h3>测试是平级角色</h3><p>不是开发流程的附属环节。</p></div>
+  <div class="card"><h3>知识是公共资产</h3><p>知识 ≠ 用例。</p></div>
+  <div class="card"><h3>确定性归确定性</h3><p>执行不走 AI。</p></div>
+  <div class="card"><h3>AI 不裁判，框架裁判</h3><p>门禁是信任基础。</p></div>
+  <div class="card"><h3>对 AI 固定，对人可扩展</h3><p>能力注册制。</p></div>
+  <div class="card"><h3>一切皆可沉淀</h3><p>闭环让系统越用越准。</p></div>
+  <div class="card"><h3>变更必有因，产出必有责</h3><p>变更记理由，用例变更传导场景。</p></div>
+  <div class="card"><h3>疑问不靠猜</h3><p>产品不确定必须用户确认；疑问显式表达、显式收敛、阻塞下游。</p></div>
+</div>
+
+<footer>
+  AI 测试平台 · 架构与设计意图 ｜ 事实源：<code>docs/ai-testing-platform/design.md</code>、<code>test-project-definition.md</code>、16 份实施计划、<code>testing_platform/</code> 代码。<br>
+  本页为设计层综述，不含最终 DDL 与部署步骤。
+</footer>
+
+</article>
+</main>
+</div>
+
+<script>
+(function(){
+  var root=document.documentElement;
+  var t=document.getElementById('theme-toggle');
+  var saved=null; try{saved=localStorage.getItem('tp-theme')}catch(e){}
+  if(saved){root.setAttribute('data-theme',saved);}
+  else if(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches){root.setAttribute('data-theme','dark');}
+  function sync(){t.textContent = root.getAttribute('data-theme')==='dark' ? '☀ 浅色' : '☾ 深色';}
+  sync();
+  t.addEventListener('click',function(){
+    var next = root.getAttribute('data-theme')==='dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('tp-theme',next)}catch(e){}
+    sync();
+  });
+  document.getElementById('print-page').addEventListener('click',function(){window.print()});
+
+  // 侧栏高亮当前小节
+  var links=[].slice.call(document.querySelectorAll('.sidebar nav a'));
+  var targets=links.map(function(a){return document.querySelector(a.getAttribute('href'))}).filter(Boolean);
+  function onScroll(){
+    var y=window.scrollY+140, cur=null;
+    targets.forEach(function(el){ if(el.offsetTop<=y) cur=el; });
+    links.forEach(function(a){ a.classList.toggle('active', cur && a.getAttribute('href')==='#'+cur.id); });
+  }
+  window.addEventListener('scroll',onScroll,{passive:true});
+  onScroll();
+})();
+</script>
+</body>
+</html>

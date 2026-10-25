@@ -175,7 +175,7 @@ def test_fixture_dir_exists_and_populated():
     """夹具目录是回归的地基：空了/没了必须立刻发现，不能静默跳过全部用例。"""
     fixtures = list(_iter_fixtures())
     assert len(fixtures) >= 8, (
-        f"实抓夹具应有至少 8 条（现网 6 种已修形态 + 2 条已知未修），实得 {len(fixtures)}。"
+        f"实抓夹具应有至少 8 条（现网各种已修形态 + 已知未修形态），实得 {len(fixtures)}。"
         "夹具文件在 specs/fixtures/eaichat/，丢了就等于回归防线没了。")
     names = [f["name"] for _, f in fixtures]
     assert len(names) == len(set(names)), "夹具 name 必须唯一"

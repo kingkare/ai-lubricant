@@ -285,3 +285,37 @@ def test_stall_watchdog_disabled_by_zero(monkeypatch):
     events = asyncio.run(_collect_events(provider))
 
     assert len(events) == 1
+
+
+def test_stall_watchdog_ignores_heartbeat_events(monkeypatch):
+    """上游只发心跳事件（``event: HEARTBEAT data: {}``）也必须判停滞。
+
+    2026-10-12 IMA 实证：qa 在联网搜索/思考期每 ~6s 发一次 HEARTBEAT（带 event 行，
+    不是 SSE 注释），把看门狗无限重置，渠道配置的 timeout 形同虚设、请求跑 200s+。
+    心跳与注释同档——只能证明连接活着，不能证明模型在出内容。
+    """
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT", "0.05")
+    provider = DummyProvider("u", "p", timeout=45)
+    _install_stalling_pm(
+        monkeypatch,
+        [b"event: HEARTBEAT\ndata: {}\n\n", b"event: HEARTBEAT\ndata: {}\n\n"],
+        delay_after=1,
+        delay=5.0,
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(_collect_events(provider))
+
+    assert excinfo.value.status_code == 504
+    assert "stalled" in str(excinfo.value.detail)
+
+
+def test_is_progress_event_classification():
+    """_is_progress_event：注释 / 心跳判无进展；正文/思考/未知事件判有进展。"""
+    p = DummyProvider
+    assert p._is_progress_event(": ping\n\n") is False
+    assert p._is_progress_event("event: HEARTBEAT\ndata: {}\n\n") is False
+    assert p._is_progress_event("event: heartbeat\ndata: {}\n\n") is False  # 大小写不敏感
+    assert p._is_progress_event("event: MESSAGE\ndata: {\"Text\":\"hi\"}\n\n") is True
+    assert p._is_progress_event("event: THINKING\ndata: {}\n\n") is True
+    assert p._is_progress_event("data: {\"x\":1}\n\n") is True  # 无 event 行的裸 data

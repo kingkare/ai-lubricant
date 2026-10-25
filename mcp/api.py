@@ -4,7 +4,7 @@
 此处 include_router 汇总挂载。``from mcp.api import router``（main.py 入口）保持不变。
 
 模块划分：
-- api_catalog.py        服务注册表（CRUD + manifest/assets/sop + 配置资源 + tools）
+- api_catalog.py        服务注册表（CRUD + manifest/assets + 配置资源 + tools）
 - api_principals.py     principal / grants / service-users / runtime-settings / market-settings
 - api_runtime.py        MCP Runtime 代理路由（版本/安全审查/热加载/连接配置）
 - api_my_services.py    用户个人外部 MCP

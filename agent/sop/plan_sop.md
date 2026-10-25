@@ -17,7 +17,7 @@ For one-shot answers or a single tool call, use normal `interact` mode.
 2. **Plan** — write `workspace/plan_<task>/plan.md` with the step list. Each step is one line starting with a status marker (below). Group independent steps for parallel work; mark delegation and verification clearly.
 3. **User confirm** — use `ask_user` to present the plan and wait for approval before executing. Do not proceed past this phase without explicit confirmation.
 4. **Execute** — run the steps in order, updating markers as each completes or fails. Keep `update_working_checkpoint` current so the anchor survives context compression.
-5. **Verify** — spawn a subagent (via the parent's spawn_subagent flow) to review the result against the objective. The subagent returns PASS / FAIL / PARTIAL.
+5. **Verify** — call `spawn_subagent` with a self-contained review task (the objective + the deliverable paths) to get an independent PASS / FAIL / PARTIAL. The child does not see this conversation, so name the files it must check. See `memory/sop/subagent_sop.md`.
 
 ## plan.md step markers
 

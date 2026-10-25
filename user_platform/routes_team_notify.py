@@ -85,6 +85,7 @@ async def _audit(
 # ---- Event types ----------------------------------------------------------
 @router.get("/event-types")
 async def list_event_types(user: User = Depends(get_current_user)) -> dict:
+    """列出支持的通知事件类型（静态目录，无 DB 访问）。"""
     # Static catalogue, no DB access — ``list_event_types`` is a plain sync
     # method and must not be awaited.
     return _ok(notify_service.list_event_types())
@@ -93,6 +94,7 @@ async def list_event_types(user: User = Depends(get_current_user)) -> dict:
 # ---- Channels -------------------------------------------------------------
 @router.get("/channels")
 async def list_channels(team_id: str = Depends(get_current_team_id)) -> dict:
+    """列出本团队的全部共享通知渠道。"""
     return _ok(await notify_service.list_channels(team_id, owner_type="team"))
 
 
@@ -103,6 +105,11 @@ async def create_channel(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """为团队创建一条共享通知渠道，并记录创建审计。
+
+    以 ``owner_type="team"`` 落库，团队成员的事件可扇出到同一个群机器人。
+    ``event_types`` 随渠道一并提交，服务端同步维护订阅行；参数非法返回 400。
+    """
     payload = body.model_dump(exclude_none=True)
     try:
         result = await notify_service.create_channel(team_id, payload, owner_type="team")
@@ -120,6 +127,7 @@ async def update_channel(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """更新团队通知渠道（名称/凭据/订阅事件等），不存在或无权访问返回 404。"""
     payload = body.model_dump(exclude_none=True)
     ok = await notify_service.update_channel(
         team_id, channel_id, payload, owner_type="team"
@@ -140,6 +148,7 @@ async def delete_channel(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """删除团队通知渠道，不存在或无权访问返回 404，并记录删除审计。"""
     ok = await notify_service.delete_channel(team_id, channel_id, owner_type="team")
     if not ok:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
@@ -182,6 +191,7 @@ async def test_channel(
 async def list_send_logs(
     channel_id: str, team_id: str = Depends(get_current_team_id)
 ) -> dict:
+    """列出指定团队渠道的发送日志，渠道不存在或无权访问返回 404。"""
     rows = await notify_service.list_send_logs(team_id, channel_id, owner_type="team")
     if rows is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)

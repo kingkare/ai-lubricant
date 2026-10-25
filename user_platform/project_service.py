@@ -1573,17 +1573,17 @@ class ProjectService:
             "extra": {
                 "project_id": str(project.id),
                 "issue_id": str(issue.id),
-                **({"skill_ids": req["skill_ids"]} if req.get("skill_ids") else {}),
             },
         }
         # Caller-selected runtime knobs pass straight through; mode validity is
         # checked against the node's advertised editor capabilities at dispatch.
+        # skill_config/mcp_config/plugin_config 已退役：资源归环境，任务不携带
+        # （issue 派任务曾是公开 API 写任务资源列的第二条路）。
         for key in (
-            "mode", "mode_label", "mode_capability_snapshot",
+            "mode", "mode_label",
             "model_id", "node_id", "cli_name", "git_identity_id",
             "parent_api_key_id", "usage_limit", "expires_at",
             "expected_client_id", "bootstrap_content",
-            "skill_config", "mcp_config", "plugin_config",
         ):
             if req.get(key) is not None:
                 payload[key] = req[key]

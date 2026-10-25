@@ -312,6 +312,113 @@ async def _subscribed_channels(user_id: str, event_type: str) -> list[dict[str, 
     return [dict(r) for r in rows]
 
 
+async def _owner_channels(user_id: str, channel_ids: list[str]) -> list[dict[str, Any]]:
+    """Resolve the user's (or their teams') enabled channels among ``channel_ids``.
+
+    Ownership is enforced **here**, not trusted from the caller: a workflow's end
+    config names channel uuids, but delivery must never cross to another user's
+    webhook even if a stale/foreign id leaks into the definition. Mirrors
+    :func:`_subscribed_channels`' owner scoping (own channels + team channels),
+    minus the subscription join.
+    """
+    from db import PostgresClient
+
+    if PostgresClient.pool is None or not channel_ids:
+        return []
+    try:
+        owner = uuid.UUID(str(user_id))
+    except (ValueError, TypeError):
+        return []
+    wanted = []
+    for cid in channel_ids:
+        try:
+            wanted.append(uuid.UUID(str(cid).strip()))
+        except (ValueError, TypeError):
+            continue
+    if not wanted:
+        return []
+    async with PostgresClient.pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT c.id, c.kind, c.webhook_url, c.secret, c.headers, c.name "
+            "FROM mc_notify_channels c "
+            "WHERE c.enabled AND c.id = ANY($1::uuid[]) "
+            "  AND ("
+            "        (COALESCE(c.owner_type, 'user') = 'user' AND c.owner_id = $2)"
+            "     OR (c.owner_type = 'team' AND c.owner_id IN ("
+            "            SELECT team_id FROM mc_team_members WHERE user_id = $2"
+            "        ))"
+            "  ) "
+            "ORDER BY c.id",
+            wanted,
+            owner,
+        )
+    return [dict(r) for r in rows]
+
+
+async def dispatch_to_channels(
+    user_id: str,
+    channel_ids: list[str],
+    *,
+    event_type: str,
+    text: str,
+    payload: Mapping[str, Any] | None = None,
+    event_ref_id: str = "",
+) -> int:
+    """Deliver one message to **specific** channels owned by ``user_id``.
+
+    Unlike :func:`dispatch_event` (which fans out by subscription), this is the
+    direct form used by workflow 终态通知: the definition names the channels, we
+    verify ownership and deliver. Never raises — a dead webhook must not fail
+    the workflow run that triggered it. Returns the number of channels attempted.
+    """
+    try:
+        rows = await _owner_channels(user_id, channel_ids)
+        if not rows:
+            return 0
+        await asyncio.gather(
+            *(
+                _deliver_one(
+                    row,
+                    event_type=event_type,
+                    text=text,
+                    event_ref_id=event_ref_id,
+                    payload=dict(payload or {}),
+                )
+                for row in rows
+            )
+        )
+        return len(rows)
+    except Exception:  # noqa: BLE001
+        logger.exception("[notify] direct dispatch to {} channels failed", len(channel_ids))
+        return 0
+
+
+async def list_owner_channels(user_id: str) -> list[dict[str, Any]]:
+    """The user's (and their teams') enabled channels — for the workflow 结束
+    node's channel multi-select. Meta only (id/name/kind), never the secret."""
+    from db import PostgresClient
+
+    if PostgresClient.pool is None:
+        return []
+    try:
+        owner = uuid.UUID(str(user_id))
+    except (ValueError, TypeError):
+        return []
+    async with PostgresClient.pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT c.id, c.name, c.kind FROM mc_notify_channels c "
+            "WHERE c.enabled AND ("
+            "        (COALESCE(c.owner_type, 'user') = 'user' AND c.owner_id = $1)"
+            "     OR (c.owner_type = 'team' AND c.owner_id IN ("
+            "            SELECT team_id FROM mc_team_members WHERE user_id = $1"
+            "        ))"
+            "  ) "
+            "ORDER BY c.created_at DESC",
+            owner,
+        )
+    return [{"id": str(r["id"]), "name": r["name"], "kind": r["kind"]} for r in rows]
+
+
 async def dispatch_event(
     user_id: str,
     event_type: str,

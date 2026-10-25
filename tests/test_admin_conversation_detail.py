@@ -35,7 +35,9 @@ def _patch_store(monkeypatch, conv, messages):
     async def _get_conversation(conv_id):
         return conv
 
-    async def _get_messages(conv_id):
+    async def _get_messages(conv_id, *, timeline=False):
+        # 管理端对话详情是显示路径 → 必须折叠时间线（timeline=True）。
+        assert timeline is True
         return messages
 
     monkeypatch.setattr(conversation_store, "get_conversation", _get_conversation)

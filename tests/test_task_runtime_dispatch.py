@@ -201,7 +201,7 @@ async def test_send_task_message_lazy_dispatches_storage_state(monkeypatch):
 
     assert client.dispatch_calls == 1
     assert client.sent[0][1] == "human_message"
-    assert client.sent[0][2] == task_service_module._with_git_credential_note("hello")
+    assert client.sent[0][2] == "hello"
     assert task.node_session_id == "session-1"
     assert task.status == "processing"
 
@@ -254,7 +254,7 @@ async def test_send_task_message_revives_finished_task_by_probing_runtime(monkey
     assert client.start_calls == ["existing"]  # probed/started, not re-dispatched
     assert client.dispatch_calls == 0
     assert client.sent[0][0] == "existing"
-    assert client.sent[0][2] == task_service_module._with_git_credential_note("again")
+    assert client.sent[0][2] == "again"
     assert task.status == "processing"
     assert len(enables) == 1
 
@@ -291,7 +291,7 @@ async def test_send_task_message_redispatches_stale_placement(monkeypatch):
     # The stale handle was rejected by the pre-send probe, so only the fresh
     # session ever receives the message (no doomed first write to stale stdin).
     assert [entry[0] for entry in client.sent] == ["session-1"]
-    assert client.sent[0][2] == task_service_module._with_git_credential_note("hello")
+    assert client.sent[0][2] == "hello"
 
 
 @pytest.mark.asyncio
@@ -1438,7 +1438,7 @@ async def test_send_to_finished_task_resumes_key_before_delivery(monkeypatch):
     assert client.start_calls == ["existing"]
     assert client.dispatch_calls == 0
     assert events == ["resume"]
-    assert client.sent[0][2] == task_service_module._with_git_credential_note("again")
+    assert client.sent[0][2] == "again"
 
 
 @pytest.mark.asyncio
@@ -1471,3 +1471,42 @@ async def test_restart_task_runtime_resumes_key(monkeypatch):
     await service.restart_task_runtime(str(USER_ID), str(TASK_ID))
 
     assert events == ["resume", "node_restart"]
+
+
+@pytest.mark.asyncio
+async def test_restart_clear_context_drops_provider_thread_binding(monkeypatch):
+    """A "clear context" restart (load_session=False) must forget the thread.
+
+    The node runs restartRuntime(fresh=true) → resetRuntimeState, wiping the
+    provider state dir, so the runtime starts a brand-new thread. Keeping the
+    Task's old binding would 403 the next request ("Task API Key 与 provider 会话
+    不匹配"). A normal restart (load_session=True) keeps the binding — the runtime
+    resumes the same thread.
+    """
+    import db as db_module
+
+    events: list[str] = []
+
+    class _RestartClient(_Client):
+        async def restart_node_session_runtime(self, session_id, fresh=True):
+            events.append(f"node_restart:fresh={fresh}")
+            return {"accepted": True}
+
+    async def clear(cls, task_id):
+        events.append(f"clear_thread:{task_id}")
+        return True
+
+    monkeypatch.setattr(db_module.PostgresClient, "clear_task_provider_thread", classmethod(clear))
+
+    task = _task(node_session_id="existing")
+    _install(monkeypatch, _RestartClient(), task=task)
+    service = TaskService()
+    monkeypatch.setattr(service, "_owned_task_or_raise", lambda *a, **kw: _return(task))
+
+    await service.restart_task_runtime(str(USER_ID), str(TASK_ID), load_session=False)
+    assert "clear_thread:" + str(TASK_ID) in events
+
+    events.clear()
+    await service.restart_task_runtime(str(USER_ID), str(TASK_ID), load_session=True)
+    assert not any(e.startswith("clear_thread:") for e in events)
+

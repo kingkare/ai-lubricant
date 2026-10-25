@@ -1,15 +1,24 @@
 """Scene presets for Agent conversation entry points.
 
-Three entry points open a conversation with an implicit *scene*: the cdp-bridge
-webpage panel drives a browser, the node terminal page drives a host shell, and
-the marketplace admin chat drives the marketplace MCP. Each used to hand-roll
-its own prompt text (or, for marketplace, none at all), so the model was told
-about its situation in three different shapes and one entry point not at all.
+Several entry points open a conversation with an implicit *scene*: the cdp-bridge
+webpage panel drives a browser, the node terminal page drives a host shell, the
+marketplace admin chat drives the marketplace MCP, and the scheduler wakes with
+no human present. Each used to hand-roll its own prompt text (or none), so the
+model was told about its situation in several different shapes.
 
-This module is the single source of truth: an entry point passes its own native
+This module is the single source of truth. An entry point passes its native
 inputs to :func:`normalize`, gets a :class:`SceneSpec`, and uses
-:func:`render_prompt` for the one-time system prompt segment plus
-:func:`persist` for the ``chat_settings`` keys.
+:func:`render_prompt` for the one-time situation segment appended to the
+system prompt plus :func:`persist` for the ``chat_settings`` keys.
+
+A scene is OUR internal concept — the model is never told "you are in scene X".
+It only receives a plain description of the user's situation, the parameters it
+must pass through (client_id, tab_id, node_id, …), and the elevated tool/MCP
+capabilities :mod:`agent.agent_main` inlines on the first turn. The scene's
+``capabilities`` name those capabilities **as the agent actually calls them**:
+the cdp-bridge webpage panel's capability is the built-in ``web`` tool, not the
+``cdp-bridge`` MCP (that name only exists for external MCP clients; internally
+the agent reaches the bridge exclusively through ``web``).
 
 Two deliberate properties:
 
@@ -17,19 +26,17 @@ Two deliberate properties:
   scene's identity keys (CDP client_id + tab_id, node_id) hold for the whole
   conversation in the normal case, so they belong in the conversation's
   ``system_prompt`` rather than a per-turn rewrite. A Chrome ``tabId`` survives
-  full-page navigation (the CDP session key *is* ``{client_id}:{tabId}``), which
-  is why the page's current URL is explicitly NOT part of the scene: it is
-  volatile content the model fetches on demand with ``web operation=scan/tabs``.
-  A URL snapshot from the previous turn is worse than no URL at all, because the
-  model cannot tell it is stale. The one key that *can* die is ``tabId`` — a
-  conversation continued from a different tab would leave the model driving a
-  closed one — so that case re-resolves the scene and swaps the written segment
-  via :func:`replace_prompt` instead of rewriting every turn.
-- **Scene-bound capabilities are inlined, not pointed at.** ``services`` names
-  the MCP services this scene exists to drive; ``agent_main`` inlines their full
-  seeded SOP (method list with parameter schemas) into the first system prompt
-  instead of advertising an ``(SOP: ...)`` pointer the model must ``file_read``
-  before it can make its first call.
+  full-page navigation (the CDP session key *is* ``{client_id}:{tabId}``), so
+  the page's current URL is deliberately NOT part of the scene: it is volatile
+  content the model fetches on demand with ``web``. The one key that *can* die
+  is ``tabId`` — a conversation continued from a different tab would leave the
+  model driving a closed one — so that case re-resolves the scene and swaps the
+  written segment via :func:`replace_prompt` instead of rewriting every turn.
+- **Scene-bound capabilities are inlined, not pointed at.** ``capabilities``
+  names the tools/MCP services this scene exists to drive; ``agent_main``
+  inlines their full SOP (method list with parameter schemas, or the built-in
+  tool's seeded SOP) into the first system prompt instead of advertising an
+  ``(SOP: ...)`` pointer the model must ``file_read`` before it can act.
 
 Volatile per-turn facts the model *cannot* fetch itself (terminal cwd, recent
 terminal output) stay outside this module — see ``terminal_context`` in
@@ -39,9 +46,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Scene type identifiers. ``marketplace_admin`` matches the value the frontend
-# already sends as ``CreateConversationRequest.context``, so no client change is
-# needed to recognise that scene.
+# Scene type identifiers (internal; never shown to the model). ``marketplace_admin``
+# matches the value the frontend already sends as ``CreateConversationRequest.context``,
+# so no client change is needed to recognise that scene.
 BROWSER = "browser"
 NODE_TERMINAL = "node_terminal"
 MARKETPLACE_ADMIN = "marketplace_admin"
@@ -52,23 +59,37 @@ CODE_CHANNEL = "code_channel"
 # 外部系统，而在于「现场没有用户」——这决定了 ask_user 不可用、结论必须自己落地。
 SCHEDULED = "scheduled"
 
-# The browser-class MCP service backing the CDP scene, and the reserved
-# marketplace service granted by ``_provision_marketplace_mcp``.
-_CDP_SERVICE = "cdp-bridge"
-_MARKETPLACE_SERVICE = "marketplace-status"
-
 
 @dataclass(frozen=True)
 class SceneSpec:
-    """One resolved scene: who the agent is driving, and how it must behave."""
+    """One resolved scene: where the user is, and which capabilities it carries.
+
+    ``description`` is plain prose the model receives verbatim — it describes the
+    user's situation in their own words and never names "场景". ``identity`` holds
+    the stable keys server-side (persist + tab lease); the model is NOT asked to
+    pass them. ``capabilities`` names the tools/MCP services the scene drives,
+    **using the name the agent actually calls them by**: a built-in tool name
+    (``web``, ``node_shell_exec``) or an MCP service name (``marketplace-status``).
+    The resolution layer in :mod:`agent.agent_main` decides per name whether it is
+    a built-in tool (no promotion; inline its seeded SOP) or an MCP service
+    (promote its methods + SOP) — no scene type is special-cased.
+    """
 
     type: str
-    # Stable identity keys, rendered into the prompt once. Never volatile state.
+    description: str = ""
+    # Stable identity keys, held server-side (persist + tab lease). Never volatile.
     identity: dict[str, str] = field(default_factory=dict)
-    # MCP services this scene drives; their full SOP is inlined on turn one.
-    services: tuple[str, ...] = ()
-    # Scene behaviour rules, rendered after the identity block.
-    rules: str = ""
+    # Optional override for how the identity is *shown* to the model. The browser
+    # scene needs it: the internal ``tab_id`` is the bare Chrome id (used to build
+    # the ``client_id:tab_id`` session key), but every browser tool accepts and
+    # returns the **composite** ``client_id:tab_id`` — showing the bare id handed
+    # the model a value no tool recognises. Rendering the composite keeps the
+    # model's view identical to ``web(operation="tabs")`` output.
+    display_identity: dict[str, str] | None = None
+    # Capability names as the agent calls them (built-in tool names and/or MCP
+    # service names). ``agent_main`` resolves each: built-in → inline its SOP;
+    # MCP service → promote methods + inline SOP.
+    capabilities: tuple[str, ...] = ()
 
 
 def _clean(value: object) -> str:
@@ -81,6 +102,7 @@ def normalize(
     node_id: str | None = None,
     context: str | None = None,
     scheduled: dict | None = None,
+    node_shell_flavor: str | None = None,
 ) -> SceneSpec | None:
     """Resolve a scene from an entry point's native inputs.
 
@@ -88,7 +110,9 @@ def normalize(
 
     - CDP panel: ``cdp={"client_id", "session_key", "client_alias"}`` (the
       identity headers injected by the authenticated mcp_runtime connection).
-    - Node terminal page: ``node_id``.
+    - Node terminal page: ``node_id`` (+ optional ``node_shell_flavor``, the
+      server-inferred shell of the target host — ``posix`` / ``powershell`` — so
+      the model writes commands in the right syntax instead of guessing).
     - Marketplace admin chat: ``context="marketplace_admin"``.
     - Scheduler: ``scheduled={"job_id", "name", "cron"}``.
 
@@ -108,7 +132,7 @@ def normalize(
         return SceneSpec(
             type=SCHEDULED,
             identity=identity,
-            rules=(
+            description=(
                 "本轮由调度器按上面的 schedule 唤醒，现场没有用户。\n"
                 "ask_user 在这里问不到人：需要人裁决的事不要停下等，把判断依据和"
                 "建议写进结论，让下一个看报告的人能直接接手。同理，需要人确认的"
@@ -135,34 +159,55 @@ def normalize(
         alias = _clean(cdp.get("client_alias"))
         if alias and alias != client_id:
             identity["client_alias"] = alias
+        # 展示给模型的 tab_id 必须是工具认的复合格式 ``client_id:tab_id``（与
+        # web(tabs) 返回的 id、tab 参数同形）。内部 identity 仍存裸 Chrome id：
+        # persist 拼回 session_key、_scene_cdp_session_key 拼租约键都依赖它。
+        tab_key = f"{client_id}:{tab_id}" if tab_id else ""
+        display = {"client_id": client_id}
+        if tab_key:
+            display["tab_id"] = tab_key
         return SceneSpec(
             type=BROWSER,
             identity=identity,
-            services=(_CDP_SERVICE,),
-            rules=(
-                "你正通过 cdp-bridge 操作用户的浏览器。client_id 在整个会话内稳定不变；"
-                "tab_id 在当前标签页内稳定，用户换标签页继续这个会话时会更新成本轮所在"
-                "标签页。需要 client_id 参数的工具一律传上面这个值，不要向用户追问，也"
-                "不要操作其它客户端的会话。\n"
-                "当前页面的 URL、标题和内容是会变的，不在本段里给出——需要时用 "
-                "web operation=scan 或 operation=tabs 现取，不要沿用历史消息里出现过的"
-                "旧 URL。\n"
-                "默认操作上面这个 tab。跳转到另一个页面时优先点击页内链接/元素"
-                "（web operation=execute），避免直接 navigate 打开新 URL——那会打断当前"
-                "页面会话。"
+            display_identity=display,
+            # The cdp-bridge webpage panel's capability is the built-in ``web``
+            # tool: the agent reaches the bridge exclusively through ``web``, so
+            # that is the name it knows. ``cdp-bridge`` is the external MCP
+            # service name and never reaches the agent.
+            capabilities=("web",),
+            description=(
+                "用户正在浏览器页面上，可能需要你用 web 工具完成他交代的事情。\n"
+                "本会话已由服务端绑定到用户当前所在的标签页：web 工具默认就操作它，"
+                "不需要你传 client_id 或 tab_id 参数；用户说的「这个」「当前页面」"
+                "「这里」「它」指的就是它。要操作其它标签页时，先用 web(operation=tabs) "
+                "列出（返回的 id 就是 client_id:tab_id 形式），按返回值原样传 tab。"
             ),
         )
 
     node = _clean(node_id)
     if node:
+        flavor = _clean(node_shell_flavor)
+        identity = {"node_id": node}
+        if flavor:
+            identity["shell"] = flavor
+        os_hint = ""
+        if flavor == "posix":
+            os_hint = "节点系统为 Linux/macOS（POSIX shell），命令用 POSIX 语法（如 ls/test/grep），不要用 PowerShell。\n"
+        elif flavor == "powershell":
+            os_hint = "节点系统为 Windows（PowerShell），命令用 PowerShell 语法（Get-ChildItem/Test-Path），不要用 POSIX。\n"
         return SceneSpec(
             type=NODE_TERMINAL,
-            identity={"node_id": node},
-            rules=(
-                "目标节点由服务端绑定（就是上面的 node_id），不要要求用户重复提供节点 ID。"
-                "需要读取或修改节点宿主机时，使用 node_shell_exec 工具；没有工具结果时"
-                "不要声称操作成功。如果工具返回 confirmation_required 或 denied，明确告诉"
-                "管理员需要确认或已被拒绝，不要尝试改写命令绕过确认。\n"
+            identity=identity,
+            capabilities=("node_shell_exec",),
+            description=(
+                "用户正在一个执行节点的终端页面上，可能需要你用 node_shell_exec "
+                "工具在节点宿主机上执行命令完成他交代的事情。\n"
+                "目标节点由服务端绑定（就是上面的 node_id），不要要求用户重复提供"
+                "节点 ID。\n"
+                + os_hint +
+                "没有工具结果时不要声称操作成功。如果工具返回 confirmation_required "
+                "或 denied，明确告诉管理员需要确认或已被拒绝，不要尝试改写命令绕过"
+                "确认。\n"
                 "当前工作目录与最近终端输出会按轮次单独提供，不在本段里给出。"
             ),
         )
@@ -171,17 +216,18 @@ def normalize(
         return SceneSpec(
             type=MARKETPLACE_ADMIN,
             identity={"scope": "marketplace_admin"},
-            services=(_MARKETPLACE_SERVICE,),
-            rules=(
-                "你处在市场管理场景：通过 marketplace-status 的工具维护市场资源——普通市场 "
-                "manifest（marketplace_list_items / marketplace_get_item / marketplace_upsert_item 等）"
-                "和外部榜单草稿（marketplace_leaderboard_list / marketplace_leaderboard_get / "
+            capabilities=("marketplace-status",),
+            description=(
+                "用户正在市场管理页面，你可能需要通过 marketplace-status 的工具维护"
+                "市场资源——普通市场 manifest（marketplace_list_items / "
+                "marketplace_get_item / marketplace_upsert_item 等）和外部榜单草稿"
+                "（marketplace_leaderboard_list / marketplace_leaderboard_get / "
                 "marketplace_leaderboard_update / marketplace_leaderboard_publish / "
                 "marketplace_leaderboard_unpublish / marketplace_leaderboard_delete / "
                 "marketplace_leaderboard_set_sort / marketplace_leaderboard_sync_field / "
                 "marketplace_leaderboard_add_github）。\n"
-                "这些 MCP 服务是市场管理页面的保留能力：只有本场景的对话临时获权，普通 Agent "
-                "的 MCP 选择器里看不到，也不要在其它场景里调用。\n"
+                "这些 MCP 服务是市场管理页面的保留能力：只有从这个页面发起的对话临时"
+                "获权，普通 Agent 的 MCP 选择器里看不到，也不要在其它对话里调用。\n"
                 "市场清单与条目明细是会变的——隐藏、删除、导入、发布都会改写它：每次查询与"
                 "操作前用工具现取，不要沿用历史消息里出现过的旧清单。\n"
                 "写操作（新增/更新/隐藏/删除/导入/发布/撤回）完成后，用对应的查询方法回读一次"
@@ -193,7 +239,7 @@ def normalize(
         return SceneSpec(
             type=CODE_CHANNEL,
             identity={"scope": "code_channel"},
-            rules=(
+            description=(
                 "你在帮管理员为「代码渠道」编写 spec 源码。代码渠道是本平台让用户贴一个"
                 "普通类（不继承任何基类）、方法用 @staticmethod、首参 p 是渠道实例，"
                 "即可造一个完整渠道的机制；没写的钩子回落到 CustomProvider 配置驱动实现。\n"
@@ -257,17 +303,20 @@ def from_chat_settings(settings: dict | None) -> SceneSpec | None:
 
 
 def render_prompt(spec: SceneSpec | None) -> str:
-    """Render the one-time scene segment appended to a conversation's system prompt.
+    """Render the one-time situation segment appended to a conversation's system prompt.
 
-    Contains only stable facts, so it never needs rewriting on later turns.
+    The model never sees a scene *name*; it sees a plain description of the
+    user's situation followed by the stable parameters it must pass through.
+    Deterministic, so :func:`replace_prompt` can swap a segment by exact match.
     """
     if spec is None:
         return ""
-    lines = [f"[场景: {spec.type}]"]
-    lines.extend(f"- {key}: {value}" for key, value in spec.identity.items())
-    rules = spec.rules.strip()
-    if rules:
-        lines.append(rules)
+    lines: list[str] = []
+    description = (spec.description or "").strip()
+    if description:
+        lines.append(description)
+    shown = spec.identity if spec.display_identity is None else spec.display_identity
+    lines.extend(f"- {key}: {value}" for key, value in shown.items())
     return "\n".join(lines).strip()
 
 
@@ -321,7 +370,7 @@ def persist(spec: SceneSpec | None) -> dict:
     if spec.type == NODE_TERMINAL:
         return {"node_id": spec.identity.get("node_id", "")}
     if spec.type == SCHEDULED:
-        out: dict = {"scheduled_job_id": spec.identity.get("job_id", "")}
+        out = {"scheduled_job_id": spec.identity.get("job_id", "")}
         task_name = spec.identity.get("task")
         if task_name:
             out["scheduled_task"] = task_name

@@ -463,9 +463,14 @@ async def delete_signing_profile(profile_id: int, user: User = Depends(get_curre
 # ── Apple ID 登录（两步：login → verify-2fa）──────────────────────────────────
 
 
-def _apple_secret_from_session(session: dict[str, Any]) -> dict[str, Any]:
-    """gsa 会话产物 → apple_id secret_data 骨架（密码绝不在内）。"""
-    return {
+def _apple_secret_from_session(session: dict[str, Any], *, password_enc: str = "") -> dict[str, Any]:
+    """gsa 会话产物 → apple_id secret_data 骨架（密码密文可选带入）。
+
+    ``password_enc``：登录成功时把密码加密落下来（AES-256-GCM，见
+    apple_signing/password_crypto.py），token 失效后自动重登用。明文绝不入
+    secret_data，也不回显（GET 只返 id/name/kind）。
+    """
+    secret = {
         "email": session.get("email"),
         "adsid": session.get("adsid"),
         "idms_token": session.get("GsIdmsToken"),
@@ -474,6 +479,9 @@ def _apple_secret_from_session(session: dict[str, Any]) -> dict[str, Any]:
         "session_expired": False,
         # cert / app_id / profile 由物化时 ensure_signing_assets 写入
     }
+    if password_enc:
+        secret["password_enc"] = password_enc
+    return secret
 
 
 async def _apple_persist_secret(
@@ -507,8 +515,10 @@ async def _apple_persist_secret(
         if str(existing.get("kind") or "") != "apple_id":
             raise HTTPException(status_code=400, detail="该配置不是 Apple ID 类型")
         old_secret = existing.get("secret_data") or {}
-        # 保留旧 cert/app_id/profile 缓存（团队相同时材料仍有效）。
-        for carry_key in ("cert", "app_id", "profile", "team_id", "team_name"):
+        # 保留旧 cert/app_id/profile 缓存（团队相同时材料仍有效）；password_enc
+        # 也带上：加密落库依赖密钥，密钥缺失时本次没存成，不能把上一次存的抹掉
+        # （否则一次「无密钥」登录会让自动重登永久失效）。
+        for carry_key in ("cert", "app_id", "profile", "team_id", "team_name", "password_enc"):
             if old_secret.get(carry_key) and not secret.get(carry_key):
                 secret[carry_key] = old_secret[carry_key]
         updated = await ios_store.update_signing_profile(
@@ -527,10 +537,23 @@ async def _apple_persist_secret(
 
 
 async def _apple_finalize_login(
-    engine: Any, result: dict[str, Any], *, user: User, name: str, profile_id: int | None
+    engine: Any, result: dict[str, Any], *, user: User, name: str, profile_id: int | None,
+    password: str = "",
 ) -> dict:
-    """begin_login/complete_2fa 成功结果 → 持久化 + 富化响应。"""
-    secret = _apple_secret_from_session(result["session"])
+    """begin_login/complete_2fa 成功结果 → 持久化 + 富化响应。
+
+    登录成功即把密码加密落库（自动重登用）。加密失败不阻断登录——顶多退回
+    「token 过期需人工重登」的老行为，不能因为存密码失败把能用的登录打掉。
+    """
+    password_enc = ""
+    if password:
+        try:
+            from .apple_signing.password_crypto import encrypt_apple_password
+
+            password_enc = encrypt_apple_password(password)
+        except Exception:  # noqa: BLE001 — 密钥缺失/加密异常：照常登录
+            logger.exception("[apple-signing] 密码加密落库失败（登录照常，自动重登不可用）")
+    secret = _apple_secret_from_session(result["session"], password_enc=password_enc)
     profile = await _apple_persist_secret(
         engine, secret, result["session"], user=user, name=name, profile_id=profile_id
     )
@@ -601,7 +624,8 @@ async def apple_id_login(body: AppleIdLoginReq, user: User = Depends(get_current
             "phone_numbers": result.get("phone_numbers"),
         }
     return await _apple_finalize_login(
-        engine, result, user=user, name=body.name.strip(), profile_id=body.profile_id
+        engine, result, user=user, name=body.name.strip(), profile_id=body.profile_id,
+        password=body.password,
     )
 
 
@@ -666,7 +690,8 @@ async def apple_id_verify_2fa(body: AppleIdVerify2faReq, user: User = Depends(ge
     # 成功：先持久化配置，落库成功后再清 pending；持久化异常时保留 token 便于
     # 服务端重试（Apple 侧 session 已完成，但密码不会落库）。
     result = await _apple_finalize_login(
-        engine, result, user=user, name="", profile_id=body.profile_id
+        engine, result, user=user, name="", profile_id=body.profile_id,
+        password=body.password,
     )
     _APPLE_2FA_PENDING.pop(body.login_token, None)
     return result
@@ -759,6 +784,44 @@ async def _materialize_apple_id(
         )
         return build_dispatch_material(secret), final_id
 
+    async def _auto_relogin() -> bool:
+        """用落库的密码密文静默重登，成功则把 fresh session 写回 secret。
+
+        返回 True 表示可以重试物化。受信设备首次已信任过，Apple 不再要求
+        2FA——所以这里只需要密码，不需要人工。任何一步失败都返回 False
+        （调用方照老路发 412，让用户手动重登；绝不静默吞掉）。
+        """
+        blob = str(secret.get("password_enc") or "")
+        email = str(secret.get("email") or "")
+        if not blob or not email:
+            return False
+        try:
+            from .apple_signing.password_crypto import decrypt_apple_password
+
+            plaintext = decrypt_apple_password(blob)
+        except Exception:  # noqa: BLE001 — 密钥轮换/坏 blob：不能自动重登
+            logger.warning(
+                "[apple-signing] profile {} 密码解密失败，需人工重登", profile_id
+            )
+            return False
+        try:
+            fresh = await asyncio.to_thread(engine.gsa.begin_login, email, plaintext)
+        except Exception as login_exc:  # noqa: BLE001 — 重登也失败（Apple 限流/密码改过）
+            logger.warning(
+                "[apple-signing] profile {} 自动重登失败: {}", profile_id, login_exc
+            )
+            return False
+        if fresh.get("status") != "authenticated":
+            # 又要 2FA：说明信任失效了，人工重登不可避免。
+            return False
+        secret.update(_apple_secret_from_session(fresh["session"], password_enc=blob))
+        try:
+            await ios_store.update_signing_profile_secret(profile_id, secret)
+        except Exception:  # noqa: BLE001 — 落库失败：内存里的 session 仍可用于本次
+            logger.warning("[apple-signing] profile {} 重登 session 回写失败", profile_id)
+        logger.info("[apple-signing] profile {} 自动重登成功，续签继续", profile_id)
+        return True
+
     async with lock:
         try:
             material, final_id = await asyncio.to_thread(_sync_materialize, secret)
@@ -767,42 +830,65 @@ async def _materialize_apple_id(
             from .apple_signing.developer import DeveloperServicesError
 
             if isinstance(exc, (GsaError, DeveloperServicesError)):
-                # 会话/权限失效：标记 + 通知 + 412（网络类 AnisetteError 原样 503，
-                # 自动续签下一轮自然重试，不打扰用户）。
-                secret["session_expired"] = True
-                try:
-                    await ios_store.update_signing_profile_secret(profile_id, secret)
-                except Exception:  # noqa: BLE001 — 标记失败不影响本次报错
-                    pass
-                try:
-                    from .notify_core import emit_notification
+                # 会话失效先试自动重登（密码已加密落库 + 受信设备不弹 2FA 时可行），
+                # 重登成功就重试物化——用户完全无感，并落到下面统一成功路径回写 secret。
+                # 重登不可行才标记 + 通知 + 412。
+                retried_ok = False
+                if await _auto_relogin():
+                    try:
+                        material, final_id = await asyncio.to_thread(
+                            _sync_materialize, secret
+                        )
+                        retried_ok = True
+                        logger.info(
+                            "[apple-signing] profile %s 自动重登后物化成功", profile_id
+                        )
+                    except Exception as retry_exc:  # noqa: BLE001 — 重登后仍失败
+                        logger.warning(
+                            "[apple-signing] profile %s 重登后物化仍失败: %s",
+                            profile_id, retry_exc,
+                        )
+                        exc = retry_exc
+                if not retried_ok:
+                    # 会话/权限失效（网络类 AnisetteError 原样 503，自动续签下一轮
+                    # 自然重试，不打扰用户）。
+                    secret["session_expired"] = True
+                    try:
+                        await ios_store.update_signing_profile_secret(profile_id, secret)
+                    except Exception:  # noqa: BLE001 — 标记失败不影响本次报错
+                        pass
+                    try:
+                        from .notify_core import emit_notification
 
-                    await emit_notification(
-                        "ios.wda.apple_session_expired",
-                        params={"profile_id": profile_id, "udid": udid},
-                        owner_type="user",
-                        owner_id=owner_user_id or None,
-                        severity="error",
-                        kind="ios",
-                        source="ios-wda-materialize",
-                        title="Apple ID 会话已过期",
-                        message=(
-                            "Apple ID 签名配置的登录会话已过期，自动续签已暂停。"
-                            "请到「资源 → 签名配置」重新登录该 Apple ID。"
-                        ),
-                        detail=str(exc),
-                        dedupe_key=f"ios-wda-apple-session-expired:{profile_id}",
-                        dedupe_window_seconds=12 * 3600,
-                    )
-                except Exception:  # noqa: BLE001 — 通知失败不影响报错
-                    pass
-                raise HTTPException(
-                    status_code=412,
-                    detail=f"Apple ID 会话已过期，请重新登录后重试（{exc}）",
-                ) from exc
-            if isinstance(exc, AnisetteError):
+                        await emit_notification(
+                            "ios.wda.apple_session_expired",
+                            params={"profile_id": profile_id, "udid": udid},
+                            owner_type="user",
+                            owner_id=owner_user_id or None,
+                            severity="error",
+                            kind="ios",
+                            source="ios-wda-materialize",
+                            title="Apple ID 会话已过期",
+                            message=(
+                                "Apple ID 签名配置的登录会话已过期，自动续签已暂停。"
+                                "请到「资源 → 签名配置」重新登录该 Apple ID。"
+                            ),
+                            detail=str(exc),
+                            dedupe_key=f"ios-wda-apple-session-expired:{profile_id}",
+                            dedupe_window_seconds=12 * 3600,
+                        )
+                    except Exception:  # noqa: BLE001 — 通知失败不影响报错
+                        pass
+                    raise HTTPException(
+                        status_code=412,
+                        detail=f"Apple ID 会话已过期，请重新登录后重试（{exc}）",
+                    ) from exc
+            elif isinstance(exc, AnisetteError):
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
-            raise HTTPException(status_code=502, detail=f"Apple 签名材料准备失败: {exc}") from exc
+            else:
+                raise HTTPException(
+                    status_code=502, detail=f"Apple 签名材料准备失败: {exc}"
+                ) from exc
 
         # 成功：回写刷新后的 secret（新 profile 缓存/首次 cert/team 信息）。
         # 比较旧值避免每次 prepare 都写库（缓存命中路径 secret 未变）。
@@ -846,6 +932,12 @@ async def prepare_wda(resource_id: int, body: WdaJobRequest, user: User = Depend
 
     if not node_id or not udid or not device_id:
         raise HTTPException(status_code=400, detail="设备缺少 iOS 节点绑定信息")
+
+    # 在线门禁：设备离线就不派发。初始化需要手机插着且被 usbmuxd 识别，离线时
+    # 派发只会让 job 在流水线深处以 device_not_present 失败——在入口拦住并说清楚。
+    from .routes_builtin_tools import _ensure_ios_device_online
+
+    await _ensure_ios_device_online(ios_info, action="初始化")
 
     # Fetch signing profile secret (one-time dispatch)
     signing_profile = None
@@ -940,6 +1032,11 @@ async def renew_wda(resource_id: int, body: WdaJobRequest, user: User = Depends(
     if not node_id or not udid or not device_id:
         raise HTTPException(status_code=400, detail="设备缺少节点绑定信息")
 
+    # 在线门禁：离线设备不派发（同 prepare）。
+    from .routes_builtin_tools import _ensure_ios_device_online
+
+    await _ensure_ios_device_online(ios_info, action="续期")
+
     # 续期时若未显式传 signing_profile_id，回退到 prepare 时落库的绑定（自动续签依赖此路径）。
     signing_profile = await _resolve_signing_profile(
         body.signing_profile_id,
@@ -1014,6 +1111,11 @@ async def reinstall_wda(resource_id: int, body: WdaJobRequest, user: User = Depe
 
     if not node_id or not udid or not device_id:
         raise HTTPException(status_code=400, detail="设备缺少节点绑定信息")
+
+    # 在线门禁：离线设备不派发（同 prepare）。
+    from .routes_builtin_tools import _ensure_ios_device_online
+
+    await _ensure_ios_device_online(ios_info, action="重装")
 
     signing_profile = await _resolve_signing_profile(
         body.signing_profile_id,

@@ -49,6 +49,25 @@ async def init() -> bool:
             await ensure_builtin_sops()
         except Exception:
             logger.exception("[user-platform] built-in SOP provisioning failed")
+        # AI 测试平台：播种内置基础方法类（时间/随机/密钥/编码，全局作用域，
+        # 幂等不覆盖）。失败只记日志——绝不阻断兼容层/主服务启动。
+        try:
+            from testing_platform.assets import ensure_builtin_method_classes
+
+            created = await ensure_builtin_method_classes()
+            if created:
+                logger.info("[testing-platform] seeded {} builtin method classes", created)
+        except Exception:
+            logger.exception("[testing-platform] built-in method class seeding failed")
+        # AI 测试平台：接口导入任务定时调度（扫 mc_test_api_import_job 到期任务，
+        # 抓取 URL 文档 → 按 source_format 显式导入）。表已由 init_database 建好。
+        # 失败只记日志——绝不阻断兼容层/主服务启动。
+        try:
+            from testing_platform.importers import start_import_scheduler
+
+            await start_import_scheduler()
+        except Exception:
+            logger.exception("[testing-platform] import scheduler start failed")
         from .webhook_review_worker import webhook_review_worker
 
         await webhook_review_worker.start()
@@ -69,6 +88,12 @@ async def close() -> None:
     if not _initialized:
         return
     try:
+        try:
+            from testing_platform.importers import stop_import_scheduler
+
+            await stop_import_scheduler()
+        except Exception:
+            logger.exception("[testing-platform] import scheduler stop failed")
         from .task_runtime_worker import task_runtime_worker
 
         await task_runtime_worker.stop()
@@ -122,6 +147,8 @@ def mount_routes(app) -> bool:
         from .routes_team_users import router as team_users_router
         from .routes_team_models import router as team_models_router
         from .routes_nodes import admin_router as nodes_admin_router, team_router as nodes_team_router
+        from .routes_studio import admin_router as studio_admin_router
+        from .routes_carriers import admin_router as carriers_admin_router
         from .routes_nodes_terminal import router as nodes_terminal_router
         from .routes_nodes_files import (
             router as nodes_files_router,
@@ -129,6 +156,8 @@ def mount_routes(app) -> bool:
         )
         from .routes_node_bootstrap import router as node_bootstrap_router
         from .routes_builtin_tools import router as builtin_tools_router
+        from .routes_browser_passwords import router as browser_passwords_router
+        from .routes_totp import router as totp_credentials_router
         from .routes_ios import router as ios_router
         from .routes_build import router as project_build_router, upload_router as project_build_upload_router
         from .routes_project_prompts import (
@@ -138,9 +167,11 @@ def mount_routes(app) -> bool:
         from .routes_resources import router as resource_references_router
         from .routes_github_recognize import router as github_recognize_router
         from .routes_environment import router as environment_router
+        from .routes_notes import router as notes_router
         from .system_env_upload import router as system_env_upload_router
         from .routes_shell_approval import router as shell_approval_router
         from .routes_tunnel import router as tunnel_router
+        from .routes_ddns import router as ddns_router
         app.include_router(server_router)
         app.include_router(captcha_router)
         app.include_router(user_models_router)
@@ -166,7 +197,13 @@ def mount_routes(app) -> bool:
         app.include_router(team_models_router)
         app.include_router(nodes_admin_router)
         app.include_router(nodes_team_router)
+        app.include_router(studio_admin_router)
+        # 节点载体（创空间/AI 沙箱…）：与 studio 同前缀 /api/v1/admin，挂在其后
+        # 不影响已有路径（路由前缀 /node-carriers、/nodes/{id}/carrier 与 studio 的
+        # /nodes/{id}/studio 不冲突）。
+        app.include_router(carriers_admin_router)
         app.include_router(environment_router)
+        app.include_router(notes_router)
         # Node → server archive ingest for the system-env panel. Token-authenticated
         # (one-time, signed), so it is mounted alongside the user routes rather than
         # behind the session dependency the node cannot satisfy.
@@ -176,6 +213,8 @@ def mount_routes(app) -> bool:
         app.include_router(nodes_files_team_router)
         app.include_router(node_bootstrap_router)
         app.include_router(builtin_tools_router)
+        app.include_router(browser_passwords_router)
+        app.include_router(totp_credentials_router)
         app.include_router(ios_router)
         # 项目页「构建」tab：用户路由 + 节点产物公开上传（token 鉴权）。
         app.include_router(project_build_router)
@@ -186,6 +225,7 @@ def mount_routes(app) -> bool:
         app.include_router(github_recognize_router)
         app.include_router(shell_approval_router)
         app.include_router(tunnel_router)
+        app.include_router(ddns_router)
 
         # 市场。两组路由都常驻挂载：「看市场」与「管市场」的分界改在请求时判定——
         # - 公开 /status 一直可用，前端据此探测 enabled/writable（导航显隐靠它）。

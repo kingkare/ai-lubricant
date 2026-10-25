@@ -79,6 +79,7 @@ class LimitLease:
     acquired_keys: list[str] = field(default_factory=list)
     reserved_amounts: dict[str, int] = field(default_factory=dict)
     window_ids: dict[str, str] = field(default_factory=dict)
+    test_probe: bool = False
     settled: bool = False
     rolled_back: bool = False
     renewal_task: object | None = None

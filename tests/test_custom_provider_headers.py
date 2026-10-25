@@ -40,7 +40,63 @@ def test_custom_provider_headers_maps_codex_cli_session_id():
 def test_custom_provider_headers_maps_opencode_session_affinity():
     provider = _provider("opencode")
     headers = provider._headers({"client_session_id": "s789"})
+    # 入站透传的会话 ID 同时落在两个头（真实客户端两者恒同值）。
     assert headers["x-session-affinity"] == "s789"
+    assert headers["x-session-id"] == "s789"
+
+
+def test_custom_provider_opencode_generates_real_id_format():
+    """无入站会话 ID 时现场生成 ses_<12hex><14base62>，不是 uuid4/固定常量。"""
+    provider = _provider("opencode")
+    first = provider._headers({})
+    second = provider._headers({})
+
+    for headers in (first, second):
+        sid = headers["x-session-affinity"]
+        assert sid.startswith("ses_")
+        body = sid[len("ses_"):]
+        assert len(body) == 26, body
+        int(body[:12], 16)  # 前 12 位是十六进制
+        assert headers["x-session-id"] == sid
+    assert first["x-session-affinity"] != second["x-session-affinity"]
+
+
+def test_opencode_identifier_ses_is_ones_complement_of_msg():
+    """ses_ 走 ~v（降序）、msg_ 走 v（升序），同毫秒同计数互为 48 位反码。"""
+    from providers.custom import CustomProvider
+
+    CustomProvider._OPENCODE_ID_LAST_MS = 0
+    CustomProvider._OPENCODE_ID_COUNTER = 0
+    now_ms = 1789733035483
+    ses = CustomProvider._opencode_identifier("ses", descending=True, now_ms=now_ms)
+    CustomProvider._OPENCODE_ID_COUNTER = 0
+    msg = CustomProvider._opencode_identifier("msg", descending=False, now_ms=now_ms)
+
+    ses_field = int(ses[len("ses_"):][:12], 16)
+    msg_field = int(msg[len("msg_"):][:12], 16)
+    assert ses_field == (~msg_field) & ((1 << 48) - 1)
+
+
+def test_opencode_identifier_reproduces_real_captured_ids():
+    """对齐真实抓包：同一毫秒下 hex 段与真客户端逐位相同（随机段除外）。
+
+    样本取自 1.18.31 实跑：ses_f4b992225ffe… 与 msg_0b466ddda001… 同属一轮请求，
+    其 12 位 hex 段互为反码、解出 ms=1789733035483、counter=1。
+    """
+    from providers.custom import CustomProvider
+
+    now_ms = 1789733035483
+    CustomProvider._OPENCODE_ID_LAST_MS = 0
+    CustomProvider._OPENCODE_ID_COUNTER = 0
+    ses = CustomProvider._opencode_identifier("ses", descending=True, now_ms=now_ms)
+    CustomProvider._OPENCODE_ID_COUNTER = 0
+    msg = CustomProvider._opencode_identifier("msg", descending=False, now_ms=now_ms)
+
+    assert ses[: len("ses_") + 12] == "ses_f4b992225ffe"
+    assert msg[: len("msg_") + 12] == "msg_0b466ddda001"
+    # 反码解出的毫秒时间戳与构造入参一致（真客户端时间戳段就是发起时刻）。
+    ses_field = int(ses[4:16], 16)
+    assert (((~ses_field) & ((1 << 48) - 1)) >> 12) == now_ms
 
 
 def test_custom_provider_headers_defaults_to_x_session_id():

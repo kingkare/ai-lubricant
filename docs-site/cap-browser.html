@@ -57,7 +57,7 @@
 <tr><td><code>browser_screenshot</code></td><td>截取活动标签（返回 base64 PNG）</td></tr>
 <tr><td><code>browser_batch</code></td><td>一次请求执行多个扩展/CDP 命令</td></tr>
 <tr><td><code>browser_wait</code></td><td>等待某 JavaScript 条件返回真值</td></tr>
-<tr><td><code>browser_network_start / get / stop</code></td><td>启动/读取/停止标签网络请求捕获（附加调试器、缓冲事件、返回捕获）</td></tr>
+<tr><td><code>browser_watch_network / read_network / unwatch_network</code></td><td>监听/读取/停止标签网络流量（HTTP 请求 + WebSocket 帧 + SSE 消息；附加调试器、缓冲事件）</td></tr>
 </tbody></table></div>
 <div class="note"><strong>新任务开新标签</strong>新任务或独立站点用 <code>browser_open_tab</code> 开新 tab，同站内跳转才用页内点击——避免把当前会话的上下文覆盖掉。</div>
 

@@ -42,6 +42,7 @@ from .source_config import (
     update_source_config,
 )
 from .community_config import (
+    admin_view as community_admin_view,
     get_community_config_async,
     public_view as community_public_view,
     update_community_config,
@@ -70,6 +71,7 @@ from .validator import (
 # 定时同步，天然只反映「已发布」状态。
 MOBILE_VERSION_SCHEMA = "ai-lubricant.mobile-version/v1"
 DEVICE_CONTROL_VERSION_SCHEMA = "ai-lubricant.device-control-version/v1"
+SERVER_VERSION_SCHEMA = "ai-lubricant.server-version/v1"
 
 router = APIRouter(prefix="/api/v1/marketplace", tags=["marketplace"])
 
@@ -364,6 +366,41 @@ async def consumer_mobile_version() -> dict:
     }
 
 
+@router.get("/consumer/server-version")
+async def consumer_server_version() -> dict:
+    """服务端自身版本信息：消费侧视图，供升级检测比对。
+
+    与 ``/consumer/device-control-version`` 同构且同样公开：部署实例（含其他实例）
+    轮询它拿「社区已发布的最新版本 + 升级包直链」，与本地 VERSION 文件比对后按
+    「社区配置 → 升级检测逻辑」决定是否提示。**升级包直链本就公开**，无敏感信息。
+
+    ``proxy_download_url`` 是服务端代理下载的站内路径——部署机不一定要能直连
+    GitHub，优先走它。
+    """
+    import server_release_catalog as src
+
+    # 只读内存快照（启动加载 PG 快照 + 后台 sync_loop 刷新），绝不在请求线程现拉。
+    snapshot = await src.get_latest_release()
+    filename = str(snapshot.get("filename") or "").replace('"', "").replace("/", "")
+    if not filename and snapshot.get("download_url"):
+        filename = str(snapshot["download_url"]).rsplit("/", 1)[-1].split("?", 1)[0]
+    proxy = ""
+    if snapshot.get("download_url"):
+        base = "/api/v1/marketplace/consumer/download/server"
+        proxy = f"{base}/{filename}" if filename else base
+    return {
+        "version": str(snapshot.get("version") or ""),
+        "version_notes": str(snapshot.get("version_notes") or ""),
+        "release_tag": str(snapshot.get("release_tag") or ""),
+        "download_url": str(snapshot.get("download_url") or ""),
+        "proxy_download_url": proxy,
+        "digest": str(snapshot.get("digest") or ""),
+        "size_bytes": int(snapshot.get("size_bytes") or 0),
+        "updated_at": str(snapshot.get("updated_at") or ""),
+        "stale": bool(snapshot.get("stale")),
+    }
+
+
 @router.get("/consumer/device-control-version")
 async def consumer_device_control_version() -> dict:
     """设备控制 App（被控端）版本信息：消费侧视图，供「添加设备」弹框拿下载直链。
@@ -626,19 +663,23 @@ async def get_community_config_public() -> dict:
 
 @router.get("/admin/community-config")
 async def get_community_config_route(_: User = Depends(_require_admin)) -> dict:
-    """管理端读取社区运营配置（与公开视图同形）。"""
-    return community_public_view(await get_community_config_async())
+    """管理端读取社区运营配置：公开视图 + 升级检测配置（用户侧看不到后者）。"""
+    return community_admin_view(await get_community_config_async())
 
 
 @router.put("/admin/community-config")
 async def update_community_config_route(
     body: dict = Body(...), _: User = Depends(_require_admin)
 ) -> dict:
-    """保存社区运营配置：``groups`` / ``notice`` 整段替换，未传的不动。"""
+    """保存社区运营配置：``groups`` / ``notice`` 整段替换，未传的不动。
+
+    也可只传 ``upgrade_check_mode``（升级检测逻辑：ignore/ask/once）或
+    ``upgrade_acked_version``（「不再提醒」记住已确认的版本）。
+    """
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="配置必须是对象")
     config = await update_community_config(body)
-    return {"ok": True, **community_public_view(config)}
+    return {"ok": True, **community_admin_view(config)}
 
 
 # ── 节点公网 IP 探测备份（市场管理 → 节点公网 IP tab）──────────────────────────
@@ -717,6 +758,12 @@ async def catalog(
     fresh: bool = Query(False, description="保留参数：读取恒为本地 store，不再绕过出网缓存"),
     _: User = Depends(_require_admin),
 ) -> dict:
+    """管理端条目目录：只读本地 store（PG 真相源），绝不在请求线程出网拉 GitHub。
+
+    支持 ``q`` 关键字与 ``kind`` 类型过滤；保留 hidden（可逆隐藏），只剔物理删除的
+    deleted。store 尚未 bootstrap 完成时返回空目录——管理员点「刷新」或显式 resync
+    才会从仓库回填。附带 publish 计数（镜像进度）。
+    """
     if not _valid_module(module):
         raise HTTPException(status_code=400, detail=f"unknown module: {module}")
     import marketplace_store as store
@@ -738,6 +785,7 @@ async def catalog(
 
 @admin_router.get("/admin/items/{module}/{item}")
 async def get_item(module: str, item: str, _: User = Depends(_require_admin)) -> dict:
+    """读取单条 manifest（管理端视图）。只读本地 store，缺失直接 404，不现拉 GitHub。"""
     if not _valid_module(module):
         raise HTTPException(status_code=400, detail=f"unknown module: {module}")
     safe = safe_item_id(item)
@@ -759,6 +807,10 @@ async def export(
     fresh: bool = Query(False, description="保留参数：读取恒为本地 store，不再绕过出网缓存"),
     _: User = Depends(_require_admin),
 ) -> dict:
+    """导出全部（或指定模块）条目的 index + manifest 快照，可用于备份或迁移导入。
+
+    只读本地 store；store 尚未 bootstrap 完成时各模块为空，不现拉 GitHub。
+    """
     import marketplace_store as store
 
     # 导出只读本地 store；store 尚未 bootstrap 完成时各模块为空，不现拉 GitHub。
@@ -995,6 +1047,10 @@ async def start_channel_import_job(
 
 @admin_router.get("/admin/channels/import-jobs/{job_id}")
 async def get_channel_import_job(job_id: str, _: User = Depends(_require_admin)) -> dict:
+    """轮询渠道模板后台导入任务的进度（phase / per-item 状态）。
+
+    job 是内存态：不存在、已过期或服务重启过都返回 404。
+    """
     from . import channel_import_jobs
     job = channel_import_jobs.get_job(job_id)
     if job is None:
@@ -2147,10 +2203,316 @@ async def server_release_upgrade(
     return result
 
 
+# ── 服务端版本（第 4 条发行线）────────────────────────────────────────────
+#
+# 与节点/移动端/设备控制同构：上传升级包 → 发布到 GitHub Release → manifest 落
+# store → publisher 渲染 server-releases/version.json 到市场仓 → 部署实例轮询比对。
+#
+# 包由 publish_github.sh 第 4 步在打 tag 时生成（自包含：主仓 + node_server +
+# user-frontend + VERSION），**VERSION 在打包时就写进去**。管理方像创建节点版本
+# 一样把这个包传上来；也可填外链（URL 模式）。
+#
+# 发行仓就是主仓 ai-lubricant 自己（包是主仓产物，不另建仓）。
+
+_SERVER_URL_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+
+@admin_router.post("/admin/server-versions/upload")
+@_github_write_guard("上传服务端版本")
+async def upload_server_version(
+    version: str = Form(...),
+    version_notes: str = Form(...),
+    status: str = Form("published"),
+    files: list[UploadFile] | None = File(None),
+    download_url: str = Form(""),
+    _: User = Depends(_require_admin),
+) -> dict:
+    """第①阶段：收升级包或外链地址、暂存，起后台第②阶段发布到主仓 Release。
+
+    两种模式二选一（与移动端/设备控制同口径）：
+    - 文件模式：传 ``ai-lubricant-<version>.tar.gz``（publish 脚本产出），第②阶段
+      上传到主仓 Release（tag ``server-v<version>``），manifest 记 ``download_url``。
+    - URL 模式：填外部下载地址，平台下载校验 sha256，manifest 记 ``download_url``。
+
+    立即返回 ``{job_id}``，前端轮询 ``/admin/server-versions/upload/{job_id}``。
+    """
+    version = version.strip()
+    status = status.strip() or "published"
+    download_url = download_url.strip()
+    if not version:
+        raise HTTPException(status_code=400, detail="version 必填")
+    if status not in ("draft", "published"):
+        raise HTTPException(status_code=400, detail="status 必须为 draft 或 published")
+
+    from .validator import _is_server_version, is_https_url
+    if not _is_server_version(version):
+        raise HTTPException(status_code=400, detail="version 必须是日期串（如 v260912 / 260912）或 semver")
+
+    from . import upload_jobs
+
+    has_files = bool(files)
+    has_url = bool(download_url)
+    if has_files and has_url:
+        raise HTTPException(status_code=400, detail="不能同时上传升级包与填写外部下载地址，请二选一")
+    if not has_files and not has_url:
+        raise HTTPException(status_code=400, detail="必须上传升级包，或填写外部下载地址")
+
+    max_bytes = _SERVER_URL_MAX_BYTES
+    files_meta: list[dict] = []
+    job_id = upload_jobs.create_job(version, [])
+
+    if has_url:
+        if not is_https_url(download_url):
+            upload_jobs.cleanup_job(job_id)
+            raise HTTPException(status_code=400, detail="下载地址必须是 HTTPS URL")
+        from .validator import _FORBIDDEN_QUERY_KEYS, _url_query
+        leaked = [k for k in _url_query(download_url) if any(n in k.lower() for n in _FORBIDDEN_QUERY_KEYS)]
+        if leaked:
+            upload_jobs.cleanup_job(job_id)
+            raise HTTPException(
+                status_code=400,
+                detail=f"下载地址不得携带可能含 token 的 query 字段: {sorted(set(leaked))}",
+            )
+        from urllib.parse import unquote
+        basename = (
+            unquote(download_url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0])
+            if "/" in download_url else ""
+        ) or f"ai-lubricant-{version}.tar.gz"
+        files_meta.append({
+            "filename": basename, "role": "server-bundle", "platform": "linux",
+            "arch": "universal", "size": 0, "tmp_path": "",
+            "content_type": "application/gzip",
+            "source": "url", "download_url": download_url,
+        })
+    else:
+        tmpdir = upload_jobs.tmp_dir(job_id)
+        os.makedirs(tmpdir, exist_ok=True)
+        for upload in files:
+            filename = (upload.filename or "").strip()
+            if not filename.lower().endswith((".tar.gz", ".tgz")):
+                upload_jobs.cleanup_job(job_id)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"无法识别文件「{filename or '(空)'}」；必须是 publish 脚本产出的 .tar.gz 升级包",
+                )
+            out_path = upload_jobs.tmp_path_for(job_id, filename)
+            size = 0
+            try:
+                with open(out_path, "wb") as fh:
+                    while True:
+                        chunk = await upload.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > max_bytes:
+                            upload_jobs.cleanup_job(job_id)
+                            raise HTTPException(status_code=413, detail=f"文件过大（>2GB）：{filename}")
+                        fh.write(chunk)
+            except HTTPException:
+                raise
+            except OSError as exc:
+                upload_jobs.cleanup_job(job_id)
+                if exc.errno == 28:
+                    raise HTTPException(status_code=507, detail=f"磁盘空间不足：{filename}") from exc
+                raise HTTPException(status_code=500, detail=f"写入上传文件失败：{exc}") from exc
+            if size == 0:
+                upload_jobs.cleanup_job(job_id)
+                raise HTTPException(status_code=400, detail=f"上传文件为空：{filename}")
+            files_meta.append({
+                "filename": filename, "role": "server-bundle", "platform": "linux",
+                "arch": "universal", "size": size, "tmp_path": out_path,
+                "content_type": upload.content_type or "application/gzip",
+            })
+
+    job = upload_jobs.get_job(job_id)
+    upload_jobs.set_files(job_id, files_meta)
+    job["version_notes"] = version_notes
+    job["status_form"] = status
+
+    upload_jobs.mark_to_github(job_id)
+    _start_server_github_transfer(job_id)
+    return {"job_id": job_id}
+
+
+def _server_release_asset(f: dict, asset_resp: dict | None, digest: str, size: int) -> dict:
+    """升级包 asset 形态：只记 download_url + digest + size（无 repo_path）。"""
+    url = ""
+    if isinstance(asset_resp, dict):
+        url = str(asset_resp.get("browser_download_url") or "")
+    return {
+        "filename": f["filename"],
+        "download_url": url or str(f.get("download_url") or ""),
+        "digest": digest,
+        "size_bytes": int(size or 0),
+    }
+
+
+async def _run_server_github_transfer(job_id: str) -> None:
+    """第②阶段后台任务：把升级包发布到主仓 Release，manifest 落 store。
+
+    文件模式：主仓 Release（tag ``server-v<version>``），asset 记 download_url。
+    URL 模式：只下载校验 sha256，asset 只记 download_url。
+    两种模式都只落 store，市场仓 version.json 由 publisher 异步推送。
+    """
+    from . import upload_jobs
+    from . import github as mp_github
+    from . import release_repos
+    import marketplace_store as store
+
+    job = upload_jobs.get_job(job_id)
+    if job is None:
+        return
+    version = job["version"]
+    tag = f"server-v{version}"
+    version_notes = job.get("version_notes") or ""
+    status = job.get("status_form") or "published"
+
+    try:
+        new_assets: list[dict] = []
+        item_id = f"server-suite-{version}"
+        prior_assets: list[dict] = []
+        prior_row = await store.get_item("server-versions", item_id)
+        if prior_row and isinstance(prior_row.get("manifest"), dict):
+            prior_assets = [a for a in (prior_row["manifest"].get("assets") or []) if isinstance(a, dict)]
+        prior_by_name = {a.get("filename"): a for a in prior_assets}
+
+        release_repo = release_repos.load_server_release_repo()
+        release_info: dict | None = None
+        if any(f.get("source") != "url" for f in job["files"]):
+            if not release_repo.enabled:
+                raise RuntimeError("服务端发行仓库未配置（SERVER_RELEASE_REPO_URL 与 token）")
+            release_info = await mp_github.get_release_by_tag(
+                release_repo.github_owner, release_repo.github_repo,
+                release_repo.github_token, tag,
+            ) or await mp_github.create_release(
+                owner=release_repo.github_owner,
+                repo=release_repo.github_repo,
+                token=release_repo.github_token,
+                tag=tag,
+                name=f"服务端升级包 {version}",
+                body=version_notes,
+                prerelease=(status == "draft"),
+            )
+
+        for f in job["files"]:
+            if f["state"] == "done":
+                pa = prior_by_name.get(f.get("filename"))
+                if pa:
+                    new_assets.append(pa)
+                continue
+            f["state"] = "uploading"
+            upload_jobs.set_file_state(job_id, f["filename"], "uploading")
+            try:
+                if f.get("source") == "url":
+                    tmp_path = upload_jobs.tmp_path_for(job_id, f["filename"])
+                    f["tmp_path"] = tmp_path
+                    size, digest_hex = await _fetch_url_to_file(
+                        f["download_url"], tmp_path,
+                        proxy_config_id=mp_config.settings.proxy_id or None,
+                        max_bytes=_SERVER_URL_MAX_BYTES,
+                    )
+                    f["size"] = size
+                    new_assets.append(_server_release_asset(f, None, "sha256:" + digest_hex, size))
+                else:
+                    if not release_repo.enabled or release_info is None:
+                        raise RuntimeError("服务端发行仓库未配置（SERVER_RELEASE_REPO_URL / token）")
+                    with open(f["tmp_path"], "rb") as fh:
+                        data = fh.read()
+                    asset_resp = await mp_github.upload_release_asset(
+                        upload_url=release_info["upload_url"],
+                        token=release_repo.github_token,
+                        filename=f["filename"],
+                        content=data,
+                        content_type=f.get("content_type") or "application/gzip",
+                    )
+                    new_assets.append(_server_release_asset(
+                        f, asset_resp, "sha256:" + hashlib.sha256(data).hexdigest(), f["size"],
+                    ))
+                upload_jobs.set_file_state(job_id, f["filename"], "done")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[marketplace] server-versions asset {} failed: {}", f["filename"], exc)
+                upload_jobs.set_file_state(job_id, f["filename"], "failed", str(exc))
+                continue
+
+        failed = [f for f in upload_jobs.get_job(job_id)["files"] if f["state"] == "failed"]
+        if failed:
+            upload_jobs.mark_failed(job_id, f"{len(failed)} 个文件发布失败")
+            return
+
+        job["phase"] = "finalizing"
+        by_name = {a.get("filename"): a for a in prior_assets}
+        for asset in new_assets:
+            by_name[asset["filename"]] = asset
+        merged_assets = list(by_name.values())
+        # 顶层 download_url 取主包（.tar.gz）：升级卡片与宿主执行器直接用它，
+        # 不必从 assets 里挑——与另三条线的 version.json 顶层字段口径一致。
+        primary = next(
+            (a for a in merged_assets if str(a.get("filename") or "").lower().endswith((".tar.gz", ".tgz"))),
+            merged_assets[0] if merged_assets else {},
+        )
+        manifest = {
+            "schema": SERVER_VERSION_SCHEMA, "id": item_id,
+            "kind": "server_app_version",
+            "name": "server", "display_name": f"服务端 {version}", "version": version,
+            "version_notes": version_notes, "status": status,
+            "assets": merged_assets, "release_tag": tag,
+            "download_url": str(primary.get("download_url") or ""),
+            "digest": str(primary.get("digest") or ""),
+            "size_bytes": int(primary.get("size_bytes") or 0),
+            "category": "server-app", "tags": ["server"],
+        }
+        errors = validate_manifest("server-versions", manifest)
+        if errors:
+            upload_jobs.mark_failed(job_id, "manifest 校验失败: " + "; ".join(errors))
+            return
+        await store.upsert_item("server-versions", manifest)
+        upload_jobs.mark_done(job_id)
+        upload_jobs.cleanup_job(job_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        upload_jobs.mark_failed(job_id, f"转传任务异常: {exc}")
+
+
+def _start_server_github_transfer(job_id: str) -> None:
+    task = asyncio.create_task(_run_server_github_transfer(job_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+@admin_router.get("/admin/server-versions/upload/{job_id}")
+async def get_server_upload_job(job_id: str, _: User = Depends(_require_admin)) -> dict:
+    """轮询服务端版本上传进度。"""
+    from . import upload_jobs
+    job = upload_jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="上传任务不存在或已过期")
+    return upload_jobs.public_state(job)
+
+
+@admin_router.post("/admin/server-versions/upload/{job_id}/retry")
+async def retry_server_upload_job(job_id: str, _: User = Depends(_require_admin)) -> dict:
+    """重试：把 failed 文件标回 pending，重启第②阶段。已 done 的不重传。"""
+    from . import upload_jobs
+    job = upload_jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="上传任务不存在或已过期")
+    if not upload_jobs.reset_failed_for_retry(job_id):
+        raise HTTPException(status_code=400, detail="没有可重试的失败文件")
+    _start_server_github_transfer(job_id)
+    return {"job_id": job_id, "retried": True}
+
+
 @admin_router.post("/admin/items")
 async def upsert(
     body: dict = Body(...), _: User = Depends(_require_admin)
 ) -> dict:
+    """新建/更新一条市场条目（module + manifest）。
+
+    落 PG 编辑真相源：保存即生效（本进程消费端立即可见），GitHub 镜像由后台
+    publisher 异步推送，请求零出网、毫秒级返回。manifest 先过 schema 校验，
+    字段级错误一次全返回。
+    """
     module = str(body.get("module") or "")
     manifest = body.get("manifest") if isinstance(body.get("manifest"), dict) else body
     if not _valid_module(module):
@@ -2179,6 +2541,12 @@ async def upsert(
 
 @admin_router.post("/admin/import")
 async def import_data(body: dict = Body(...), _: User = Depends(_require_admin)) -> dict:
+    """批量导入条目（merge 或 replace 两种模式）。
+
+    merge：逐条 upsert，不动现有条目；replace：未在导入包里的现有条目物理删除。
+    每条先过 schema 校验，任一无效不写入并记字段级错误，其余照常写入。
+    落 PG 即生效，GitHub 镜像由 publisher 异步推送。
+    """
     mode = str(body.get("mode") or "merge")
     if mode not in ("merge", "replace"):
         raise HTTPException(status_code=400, detail="mode 必须是 merge 或 replace")
@@ -2238,6 +2606,10 @@ async def import_data(body: dict = Body(...), _: User = Depends(_require_admin))
 
 @admin_router.post("/admin/rebuild-index")
 async def rebuild_index(body: dict = Body(default={}), _: User = Depends(_require_admin)) -> dict:
+    """以 manifest 为准重算指定模块的全部索引行（summary 投影修复用）。
+
+    index/marker/发行投影由 publisher 异步镜像到仓库。
+    """
     module = str(body.get("module") or "")
     if not _valid_module(module):
         raise HTTPException(status_code=400, detail=f"unknown module: {module}")
@@ -2253,6 +2625,12 @@ async def rebuild_index(body: dict = Body(default={}), _: User = Depends(_requir
 async def delete_item(
     module: str, item: str, hard: bool = False, _: User = Depends(_require_admin)
 ) -> dict:
+    """删除一条市场条目：``hard=true`` 物理删除，``hard=false`` 软隐藏（可恢复）。
+
+    硬删前 manifest 进 publisher job payload，据它清理入仓二进制与 release manifest
+    （Gitee 免费仓 1GB，残留会顶满配额）；仓库镜像由 publisher 异步完成，本地
+    消费侧事务提交后立即可见新状态。
+    """
     if not _valid_module(module):
         raise HTTPException(status_code=400, detail=f"unknown module: {module}")
     safe = safe_item_id(item)
@@ -2537,6 +2915,10 @@ async def list_leaderboard_items(
     offset: int = 0,
     _: User = Depends(_require_admin),
 ) -> dict:
+    """榜单候选池列表：按板/状态/来源/目标模块/可安装性等条件过滤，附计数汇总。
+
+    同步与 agent 补全都只写草稿字段，没有任何自动发布路径——发布要人手动确认。
+    """
     import marketplace_leaderboard_store as store
 
     items = await store.list_items(

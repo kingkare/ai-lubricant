@@ -23,7 +23,7 @@
 
 | 产物类型 | 必做 |
 | --- | --- |
-| 网页/前端 | 打开 + 截图 → console 错误 → `web(operation="scan")` 子资源确认非空壳 |
+| 网页/前端 | 打开 + 截图 → console 错误 → `web(operation="read_page")` 子资源确认非空壳 |
 | 脚本/CLI | `code_run` 执行 → 检查 stdout/stderr/exit code → 边界输入再跑 |
 | 数据文件 | `file_read` 格式校验 → 行数 → 抽查首/中/尾 3 条 |
 | API/服务 | 调 endpoint → 响应形状（不只 200）→ 错误输入 |

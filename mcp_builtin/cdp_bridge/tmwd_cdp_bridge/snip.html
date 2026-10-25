@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>框选二维码</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;width:100%;}
+body{
+  font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+  background:#14181f;color:#e6eaf2;
+  display:flex;flex-direction:column;overflow:hidden;
+  cursor:crosshair;
+  user-select:none;-webkit-user-select:none;
+}
+.topbar{
+  flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:10px 16px;background:rgba(0,0,0,.42);backdrop-filter:blur(6px);
+  border-bottom:1px solid rgba(255,255,255,.08);z-index:5;
+}
+.topbar .title{font-weight:650;font-size:13px;}
+.topbar .hint{font-size:12px;color:#9aa8bd;}
+.topbar .acts{display:flex;gap:8px;flex:0 0 auto;}
+.topbar button{height:30px;border:0;border-radius:7px;padding:0 13px;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;cursor:pointer;}
+.topbar button.primary{background:#2b8cff;color:#fff;}
+.topbar button.primary:hover{background:#1e7ae8;}
+.topbar button.ghost{background:rgba(255,255,255,.12);color:#e6eaf2;}
+.topbar button.ghost:hover{background:rgba(255,255,255,.2);}
+.topbar button:disabled{opacity:.5;cursor:default;}
+
+#stage{flex:1;position:relative;min-height:0;overflow:auto;background:#0d1014;}
+#shot{position:absolute;top:0;left:0;transform-origin:0 0;}
+/* 框选遮罩：四块暗化 + 高亮矩形（用 outline 亮框，暗化靠 mask 太复杂，改四边阴影）。 */
+#box{
+  position:absolute;border:2px solid #2b8cff;pointer-events:none;display:none;
+  box-shadow:0 0 0 9999px rgba(0,0,0,.55);
+}
+#box::after{
+  content:attr(data-dim);
+  position:absolute;left:0;top:100%;margin-top:5px;
+  background:rgba(0,0,0,.7);color:#7ec4ff;font:11px ui-monospace,Menlo,Consolas,monospace;
+  padding:2px 6px;border-radius:4px;white-space:nowrap;
+}
+/* 识别结果条：底部浮层，含站点/账号字段与保存按钮。 */
+#result{
+  position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
+  width:min(560px,92vw);z-index:8;
+  background:rgba(20,24,31,.97);border:1px solid rgba(255,255,255,.12);
+  border-radius:12px;padding:14px 16px;box-shadow:0 16px 48px rgba(0,0,0,.5);
+  display:none;flex-direction:column;gap:9px;cursor:default;
+}
+#result.show{display:flex;}
+#result .rtitle{font-weight:650;font-size:13px;display:flex;align-items:center;gap:7px;}
+#result .rtitle .ok{color:#4ade80;}
+#result .rtitle .bad{color:#f87171;}
+#result .row{display:flex;gap:8px;}
+#result .row .f{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0;}
+#result label{font-size:11px;color:#9aa8bd;}
+#result input{
+  height:30px;border:1px solid rgba(255,255,255,.14);border-radius:7px;
+  padding:0 8px;background:rgba(255,255,255,.06);color:#e6eaf2;
+  font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+}
+#result input:focus{outline:none;border-color:#2b8cff;}
+#result .acts{display:flex;gap:8px;justify-content:flex-end;}
+#result .raw{font:11px ui-monospace,Menlo,Consolas,monospace;color:#9aa8bd;word-break:break-all;max-height:34px;overflow:auto;}
+#empty{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  flex-direction:column;gap:8px;color:#9aa8bd;text-align:center;padding:24px;pointer-events:none;
+}
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <span class="title">框选页面二维码</span>
+    <span class="hint">在页面截图上按住拖动，框住二维码松手即识别</span>
+    <div class="acts">
+      <button class="ghost" id="btnRetry">重新截图</button>
+      <button class="ghost" id="btnCancel">取消</button>
+    </div>
+  </div>
+
+  <div id="stage">
+    <img id="shot" alt="">
+    <div id="box"></div>
+    <div id="empty" hidden>
+      <div style="font-size:34px">🖼</div>
+      <div id="emptyMsg">正在载入页面截图…</div>
+    </div>
+  </div>
+
+  <div id="result">
+    <div class="rtitle"><span id="rIcon" class="ok">✓</span><span id="rTitle">已识别二维码</span></div>
+    <div class="row">
+      <div class="f"><label>站点 / 服务名</label><input id="rIssuer" placeholder="GitHub"></div>
+      <div class="f"><label>账号</label><input id="rAccount" placeholder="you@example.com"></div>
+    </div>
+    <div class="row">
+      <div class="f"><label>关联网站域名（逗号分隔）</label><input id="rDomains" placeholder="github.com"></div>
+    </div>
+    <div class="row">
+      <div class="f"><label>备注</label><input id="rNote" placeholder="可选"></div>
+    </div>
+    <div class="raw" id="rRaw"></div>
+    <div class="acts">
+      <button class="ghost" id="btnDiscard">换个框</button>
+      <button class="primary" id="btnSave">保存到身份验证器</button>
+    </div>
+  </div>
+
+<script src="vendor/jsqr.min.js"></script>
+<script src="snip.js"></script>
+</body>
+</html>

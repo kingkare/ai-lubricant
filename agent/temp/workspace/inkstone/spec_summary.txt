@@ -1,0 +1,55 @@
+GET    /api/ml/v1/cloud-disk/list  || desc= || query={'query': ['page_size', 'page_token', 'dir_path', 'keyword', 'sort_by', 'sort_order', 'dirs_only', 'recursive']} || body=
+GET    /api/ml/v1/cloud-disk/quota  || desc= || query= || body=
+GET    /api/ml/v1/cloud-disk/default-name-list  || desc= || query={'query': ['dir_path', 'is_dir']} || body=
+POST   /api/ml/v1/cloud-disk/mkdir  || desc= || query= || body=['dir_path', 'dir_name']
+POST   /api/ml/v1/cloud-disk/copy  || desc= || query= || body=['src_keys', 'dst_dir', 'conflict_strategy']
+POST   /api/ml/v1/cloud-disk/move  || desc= || query= || body=['src_keys', 'dst_dir', 'conflict_strategy']
+POST   /api/ml/v1/cloud-disk/rename  || desc= || query= || body=['src_key', 'new_name', 'conflict_strategy']
+POST   /api/ml/v1/cloud-disk/delete  || desc= || query= || body=['file_keys']
+POST   /api/ml/v1/cloud-disk/upload-url  || desc= || query= || body=['dir_path', 'files']
+POST   /api/ml/v1/cloud-disk/download-url  || desc= || query= || body=['file_keys']
+POST   /api/ml/v1/cloud-disk/check  || desc= || query= || body=['dst_dir', 'file_names']
+GET    /api/ml/v1/dev-machine/list  || desc= || query={'query': ['(page,size等list过滤参数)']} || body=
+GET    /api/ml/v1/dev-machine/user_resource  || desc= || query= || body=
+POST   /api/ml/v1/dev-machine/create  || desc= || query= || body=['(创建开发机完整对象 e)']
+POST   /api/ml/v1/dev-machine/start  || desc= || query= || body=['(id)']
+POST   /api/ml/v1/dev-machine/stop  || desc= || query= || body=['(id)']
+POST   /api/ml/v1/dev-machine/delete  || desc= || query= || body=['(id)']
+POST   /api/ml/v1/dev-machine/rename  || desc= || query= || body=['(id,new_name)']
+GET    /api/ml/v1/training/list  || desc= || query={'query': ['page', 'size', '(其它过滤)']} || body=
+GET    /api/ml/v1/training/list-monitor  || desc= || query={'query': ['ids(可多值)']} || body=
+GET    /api/ml/v1/training/code_upload_url  || desc= || query={'query': ['file_name']} || body=
+POST   /api/ml/v1/training/create  || desc= || query= || body=['(训练任务对象 e)']
+POST   /api/ml/v1/training/stop  || desc= || query= || body=['(id)']
+POST   /api/ml/v1/training/delete  || desc= || query= || body=['(id)']
+POST   /api/ml/v1/training/update_name  || desc= || query= || body=['(id,name)']
+POST   /api/ml/v1/training/extend_duration  || desc= || query= || body=['(id,duration等)']
+GET    /api/ml/v1/dataset/mount-list  || desc= || query={'query': ['(params:e,可能含 dev_machine_id)']} || body=
+GET    /api/ml/v1/mirrors  || desc= || query={'query': ['page', 'size', 'keyword', 'building_status', 'category', 'sort_type']} || body=
+POST   /api/ml/v1/mirrors  || desc= || query= || body=['category', 'name', 'basic_mirror_id', 'resource_id', 'build_config_method', 'build_config.dockerfile_content', '(更多 build_config 字段)']
+GET    /api/ml/v1/mirrors/limit  || desc= || query= || body=
+GET    /api/ml/v1/mirrors/{id}  || desc= || query={'path': ['id']} || body=
+PUT    /api/ml/v1/mirrors/{id}  || desc= || query={'path': ['id']} || body=['category', 'name', 'basic_mirror_id', 'resource_id', 'build_config_method', 'build_config.dockerfile_content']
+DELETE /api/ml/v1/mirrors/{id}  || desc= || query={'path': ['id']} || body=
+GET    /api/ml/v1/inference/list  || desc= || query={'query': ['page', 'size', '(其它过滤 ...)']} || body=
+GET    /api/ml/v1/inference/share_list  || desc= || query={'query': ['page', 'size', '(过滤)']} || body=
+GET    /api/ml/v1/inference/view  || desc= || query={'query': ['(params:e,含 service_id)']} || body=
+GET    /api/ml/v1/inference/code_upload_url  || desc= || query={'query': ['file_name']} || body=
+GET    /api/ml/v1/inference/share_user_list  || desc= || query={'query': ['service_id']} || body=
+POST   /api/ml/v1/inference/create  || desc= || query= || body=['(推理服务对象 e)']
+POST   /api/ml/v1/inference/edit  || desc= || query= || body=['(e)']
+POST   /api/ml/v1/inference/start  || desc= || query= || body=['(id)']
+POST   /api/ml/v1/inference/stop  || desc= || query= || body=['(id)']
+POST   /api/ml/v1/inference/delete  || desc= || query= || body=['(id)']
+POST   /api/ml/v1/inference/rename  || desc= || query= || body=['(id,name)']
+POST   /api/ml/v1/inference/renewal  || desc= || query= || body=['(id,duration等)']
+POST   /api/ml/v1/inference/share_delete  || desc= || query= || body=['(e)']
+POST   /api/ml/v1/inference/user/call_api  || desc= || query= || body=['(e)']
+POST   /api/ml/v1/inference/query_user  || desc= || query= || body=['query_words']
+GET    /api/ml/v1/resource/capacity-cfg  || desc= || query= || body=
+GET    /api/ml/v1/resource/computility-cfg  || desc= || query= || body=
+POST   /api/ml/v1/resource/capacity-apply  || desc= || query= || body=['inc_quota_amount', 'apply_reason']
+POST   /api/ml/v1/resource/computility-apply  || desc= || query= || body=['(申请对象 e)']
+POST   /api/v1/users/auth  || desc= || query= || body=['code']
+POST   /api/v1/users/getUserInfo  || desc= || query= || body=['jwt']
+POST   /api/v1/users/logout  || desc= || query= || body=['jwt']

@@ -34,6 +34,7 @@ class CreateMailAccountReq(BaseModel):
     password: str | None = None
     secret_key: str | None = None
     mail_suffix: str | None = None
+    proxy_id: str | None = None
     enabled: bool = True
 
 
@@ -51,6 +52,10 @@ class MailQueryReq(BaseModel):
 
 class MintPairingCodeReq(BaseModel):
     label: str = ""
+
+
+class CdpClientAgentsReq(BaseModel):
+    agent_ids: list[int] = []
 
 
 class UpdateResourceReq(BaseModel):
@@ -91,16 +96,40 @@ async def _resync_resource(resource_type: str) -> None:
     )
 
 
+async def _validate_mail_proxy_id(value: dict) -> None:
+    """校验邮箱服务的出站代理绑定：proxy_id 非空必须命中代理池，否则 400。
+
+    与账号出站代理同一口径（不能把出站绑到一个不存在的条目上，查询时会静默降级
+    直连而无人察觉）。空/None = 直连，直接放行。直接读 CONFIG_FILE 的代理池全量
+    （管理端与用户端同源），不做归属过滤——绑定引用 id 而非凭据，不外泄地址。
+    """
+    proxy_id = str(value.get("proxy_id") or "").strip()
+    if not proxy_id:
+        return
+    import admin
+    from proxy_utils import find_proxy
+    proxies = admin._read_proxies()
+    if find_proxy(proxies, proxy_id) is None:
+        raise HTTPException(status_code=400, detail=f"代理 {proxy_id} 不存在，请先在代理池中添加")
+
+
 # ── 一级资源 CRUD ─────────────────────────────────────────────────────────────
 
 @router.get("/resources")
 async def list_resources(resource_type: str | None = None, user: User = Depends(get_current_user)) -> dict:
+    """列出当前用户名下的工具资源，可用 ``resource_type`` 过滤（cdp_client/mail_account/mail_address/device）。"""
     import builtin_tool_store as store
     return {"resources": await store.list_resources(resource_type, owner_user_id=str(user.id))}
 
 
 @router.post("/resources")
 async def create_resource(body: UpdateResourceReq, user: User = Depends(get_current_user)) -> dict:
+    """新建一条工具资源。
+
+    ``data.resource_type``（或 detail_type）必须是 cdp_client / mail_account /
+    mail_address / device 之一，否则返回 400。创建后触发对应内置 MCP 服务的
+    重同步（失败只记日志，不影响落库结果）。
+    """
     resource_type = str(body.data.get("resource_type") or body.data.get("detail_type") or "")
     if resource_type not in {"cdp_client", "mail_account", "mail_address", "device"}:
         raise HTTPException(status_code=400, detail="不支持的资源类型")
@@ -115,6 +144,7 @@ async def create_resource(body: UpdateResourceReq, user: User = Depends(get_curr
 
 @router.get("/resources/cdp-clients")
 async def list_cdp_clients_resource(user: User = Depends(get_current_user)) -> dict:
+    """列出当前用户的 CDP 浏览器客户端，并叠加内存里的实时连接状态与已打开页面数。"""
     import builtin_tool_store as store
     resources = await store.list_resources("cdp_client", owner_user_id=str(user.id))
     try:
@@ -127,7 +157,8 @@ async def list_cdp_clients_resource(user: User = Depends(get_current_user)) -> d
         for live in context.get("clients") or []:
             live_by_id[str(live.get("client_id") or "")] = live
     for resource in resources:
-        live = live_by_id.get(str(resource.get("id"))) or {}
+        # live 快照按客户端的对外身份（新=随机串、存量=行 id）建键。
+        live = live_by_id.get(store.cdp_client_id_of(resource)) or {}
         resource["connected"] = bool(live.get("connected"))
         resource["pages"] = live.get("pages") or []
     return {"clients": resources}
@@ -135,6 +166,7 @@ async def list_cdp_clients_resource(user: User = Depends(get_current_user)) -> d
 
 @router.post("/resources/cdp-clients")
 async def create_cdp_client_resource(body: CreateCdpClientReq, user: User = Depends(get_current_user)) -> dict:
+    """新建一个 CDP 浏览器客户端，返回客户端记录与一次性连接 token（仅在此时明文返回）。"""
     import builtin_tool_store as store
     if not body.name.strip():
         raise HTTPException(status_code=400, detail="客户端名称必填")
@@ -145,6 +177,7 @@ async def create_cdp_client_resource(body: CreateCdpClientReq, user: User = Depe
 
 @router.post("/resources/cdp-clients/{resource_id}/rotate-token")
 async def rotate_cdp_client_resource(resource_id: int, user: User = Depends(get_current_user)) -> dict:
+    """轮换 CDP 客户端连接 token（旧 token 立即失效），返回新 token。仅限本人的 cdp_client。"""
     await _owned_resource(resource_id, user, resource_type="cdp_client")
     import builtin_tool_store as store
     try:
@@ -157,6 +190,7 @@ async def rotate_cdp_client_resource(resource_id: int, user: User = Depends(get_
 
 @router.post("/resources/cdp-clients/{resource_id}/revoke-token")
 async def revoke_cdp_client_resource(resource_id: int, user: User = Depends(get_current_user)) -> dict:
+    """吊销 CDP 客户端连接 token（不再能建立连接），不删除客户端本身。"""
     await _owned_resource(resource_id, user, resource_type="cdp_client")
     import builtin_tool_store as store
     client = await store.revoke_cdp_token(resource_id)
@@ -166,25 +200,81 @@ async def revoke_cdp_client_resource(resource_id: int, user: User = Depends(get_
     return {"client": client}
 
 
+# ── CDP 客户端「可操作 agent」（权限单轨化：数据存 agent 侧 mcp_grants） ──────────
+#
+# agent 侧的 cdp_client_id grant 才是「谁能驱动这个浏览器」的唯一真相源。这两个端点
+# 只是把那个真相源按「浏览器」视角聚合/写回，读写的都是 mcp_grants，不在 cdp_client
+# 资源行上存 agent 列表（旧 agent_ids 字段已废弃移除）。
+
+@router.get("/resources/cdp-clients/{resource_id}/agents")
+async def list_cdp_client_agents(resource_id: int, user: User = Depends(get_current_user)) -> dict:
+    """该浏览器可授权给哪些 agent（当前用户可见的），含已授权标记。"""
+    import mcp_plugin_store as store
+    await _owned_resource(resource_id, user, resource_type="cdp_client")
+    from .deps import resolve_team_id
+    team_id = await resolve_team_id(str(user.id))
+    agents = await store.list_agents_authorized_for_cdp_client(
+        str(resource_id), caller=str(user.id), team_id=team_id,
+    )
+    return {"agents": agents}
+
+
+@router.put("/resources/cdp-clients/{resource_id}/agents")
+async def set_cdp_client_agents(
+    resource_id: int, body: CdpClientAgentsReq, user: User = Depends(get_current_user),
+) -> dict:
+    """全量替换该浏览器可用的 agent 集（写 agent 侧 mcp_grants 的 cdp_client_id 行）。"""
+    import mcp_plugin_store as store
+    await _owned_resource(resource_id, user, resource_type="cdp_client")
+    from .deps import resolve_team_id
+    team_id = await resolve_team_id(str(user.id))
+    try:
+        agents = await store.set_cdp_client_agents(
+            str(resource_id), body.agent_ids, caller=str(user.id), team_id=team_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"agents": agents}
+
+
 # ── 邮箱服务资源 ──────────────────────────────────────────────────────────────
 
 @router.get("/resources/mail-services")
 async def list_mail_services(user: User = Depends(get_current_user)) -> dict:
+    """列出当前用户的邮箱服务（mail_account），并把同一账号下的所有地址挂到 ``addresses`` 字段。
+
+    绑定了出站代理的账户额外带 ``proxy_name``（代理池只暴露 id/name/mode，不含地址凭据，
+    与 /api/v1/teams/proxies 同口径），供列表直接显示人类可读名而非 hash id。
+    """
     import builtin_tool_store as store
     accounts = await store.list_resources("mail_account", owner_user_id=str(user.id))
     addresses = await store.list_resources("mail_address", owner_user_id=str(user.id))
+    pool: list[dict] | None = None  # 惰性读代理池（多数账户不绑代理，避免每次读盘）
     for account in accounts:
         account["resource_id"] = int(account["id"])
         account["addresses"] = addresses
+        proxy_id = str(account.get("proxy_id") or "").strip()
+        if not proxy_id:
+            continue
+        if pool is None:
+            import admin
+            pool = admin._read_proxies()
+        from proxy_utils import find_proxy
+        entry = find_proxy(pool, proxy_id)
+        account["proxy_name"] = (entry.get("name") or entry.get("id") or "") if entry else ""
     return {"services": accounts}
 
 
 @router.post("/resources/mail-services")
 async def create_mail_service(body: CreateMailAccountReq, user: User = Depends(get_current_user)) -> dict:
+    """新建一个邮箱服务账号（名称必填；可带 provider 类型、base_url、凭据等配置）。"""
     import builtin_tool_store as store
     if not body.display_name.strip():
         raise HTTPException(status_code=400, detail="邮箱服务名称必填")
     value = body.model_dump(exclude_none=True)
+    await _validate_mail_proxy_id(value)
     row = await store.create_resource(str(user.id), "mail_account", value)
     row["resource_id"] = int(row["id"])
     row["addresses"] = []
@@ -194,6 +284,7 @@ async def create_mail_service(body: CreateMailAccountReq, user: User = Depends(g
 
 @router.delete("/resources/mail-services/{resource_id}")
 async def delete_mail_service(resource_id: int, user: User = Depends(get_current_user)) -> dict:
+    """删除一个邮箱服务（不可恢复），仅限本人名下的 mail_account；随后重同步 mail 服务。"""
     import builtin_tool_store as store
     await _owned_resource(resource_id, user, resource_type="mail_account")
     deleted = await store.delete_resource(resource_id, owner_user_id=str(user.id))
@@ -203,6 +294,7 @@ async def delete_mail_service(resource_id: int, user: User = Depends(get_current
 
 @router.post("/resources/mail-services/{resource_id}/addresses")
 async def create_mail_service_address(resource_id: int, body: CreateMailAddressReq, user: User = Depends(get_current_user)) -> dict:
+    """为指定邮箱服务新增一个可用地址（可选记录来源地址）。"""
     account = await _owned_resource(resource_id, user, resource_type="mail_account")
     import builtin_tool_store as store
     value = body.model_dump(exclude_none=True)
@@ -215,6 +307,7 @@ async def create_mail_service_address(resource_id: int, body: CreateMailAddressR
 
 @router.post("/resources/mail-services/{resource_id}/query")
 async def query_mail_service(resource_id: int, body: MailQueryReq, user: User = Depends(get_current_user)) -> dict:
+    """查询指定邮箱服务收件箱的邮件（可按 address/keyword 过滤，支持 limit/offset 分页）。"""
     await _owned_resource(resource_id, user, resource_type="mail_account")
     import builtin_tool_store as store
     try:
@@ -230,6 +323,13 @@ async def query_mail_service(resource_id: int, body: MailQueryReq, user: User = 
 
 @router.get("/resources/devices")
 async def list_devices_resource(user: User = Depends(get_current_user)) -> dict:
+    """列出当前用户的设备资源，并叠加内存实时状态（在线、能力、最后在线）。
+
+    platform 三级推导：节点上报的 ``device_info.platform`` 最权威，其次看
+    ``ios`` 块（iOS 认领时补写的身份），最后按有无 node_id 兜底。在线设备的
+    ``last_seen_at`` 取内存心跳值，离线则用落库的断连时刻。iOS 设备还会合并
+    节点 inventory 的 WDA 状态（见 ``_merge_ios_inventory``）。
+    """
     import builtin_tool_store as store
     resources = await store.list_resources("device", owner_user_id=str(user.id))
     try:
@@ -275,10 +375,16 @@ async def list_devices_resource(user: User = Depends(get_current_user)) -> dict:
     return {"devices": resources}
 
 
-# iOS 设备状态字段：以**节点 inventory** 为准（设备自报，持久且随重连重放），
-# 而不是易失的 job 快照。前端据此渲染「初始化中 42% / 就绪 / 失败」，服务端重启
-# 后依然可见——这正是「初始化后台化」的关键。
-_IOS_INVENTORY_FIELDS = ("wda_state", "wda_progress", "wda_stage", "profile_expires_at", "last_error")
+# iOS 设备状态字段表 / 归一化 / 合并逻辑已提到 ios_device_reconcile（自动扫描对账
+# 模块共用，避免循环依赖）。这里保留旧名做别名，兼容既有调用与测试。
+from .ios_device_reconcile import (  # noqa: E402
+    IOS_INVENTORY_FIELDS as _IOS_INVENTORY_FIELDS,
+    apply_inventory_to_ios_block as _apply_inventory_to_ios_block,
+    control_ready_from_wda_state as _control_ready_from_wda_state,
+    decide_reconcile as _decide_reconcile,
+    init_state_from_wda_state as _init_state_from_wda_state,
+    _INIT_STATE_BY_WDA_STATE,
+)
 
 
 async def _merge_ios_inventory(resources: list[dict]) -> None:
@@ -287,11 +393,15 @@ async def _merge_ios_inventory(resources: list[dict]) -> None:
     按 node_id 分组，每节点只取一次 inventory（避免逐设备 N+1）。节点离线或查不到
     时**保留资源里已有的值**——不能把上一次已知状态覆盖成空，否则界面会在节点抖动
     时闪回「待初始化」。
+
+    匹配键用 **udid**（稳定身份）而非 device_id：节点侧未认领时 device_id 为空，
+    按 device_id 匹配会让「服务端有行、节点丢了认领」的设备永远匹配不上 → 恒显示
+    离线。udid 认领与否都在，能正确刷新在线轴。
     """
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
     from loguru import logger
 
-    # device_id -> resource，只挑 iOS 设备（有 ios 块）。
+    # udid -> resource，只挑 iOS 设备（有 ios 块 + ios.udid）。
     targets: dict[str, dict] = {}
     by_node: dict[str, list[str]] = {}
     for r in resources:
@@ -299,41 +409,40 @@ async def _merge_ios_inventory(resources: list[dict]) -> None:
         if not ios_block:
             continue
         node_id = str(ios_block.get("node_id") or r.get("node_id") or "").strip()
-        device_id = str(r.get("device_id") or "").strip()
-        if not node_id or not device_id:
+        udid = str(ios_block.get("udid") or "").strip()
+        if not node_id or not udid:
             continue
-        targets[device_id] = r
-        by_node.setdefault(node_id, []).append(device_id)
+        targets[udid] = r
+        by_node.setdefault(node_id, []).append(udid)
 
     if not targets:
         return
 
     client = get_node_client()
-    for node_id, device_ids in by_node.items():
+    for node_id, udids in by_node.items():
         try:
             inv = await client.get_ios_devices(node_id)
         except (NodeServerUnavailable, RPCError) as exc:
             # 节点不可达：保留资源里已有的 wda_state（上一次已知），只记日志。
+            # 在线轴同理保留——节点离线不代表手机被拔了，不能把在线设备标成离线。
             logger.debug("[ios-devices] inventory unavailable for {}: {}", node_id, exc)
             continue
         for dev in inv.get("devices") or []:
-            resource = targets.get(str(dev.get("device_id") or "").strip())
+            resource = targets.get(str(dev.get("udid") or "").strip())
             if resource is None:
                 continue
             ios_block = dict(resource.get("ios") or {})
-            for field in _IOS_INVENTORY_FIELDS:
-                if field not in dev:
-                    continue
-                value = dev.get(field)
-                # 空值不覆盖：节点刚重连、清单还没填全时，别把已知状态抹掉。
-                if value in (None, ""):
-                    continue
-                ios_block[field] = value
+            _apply_inventory_to_ios_block(ios_block, dev)
             resource["ios"] = ios_block
 
 
 @router.post("/resources/device-pairing-codes")
 async def create_device_pairing_resource(body: MintPairingCodeReq, user: User = Depends(get_current_user)) -> dict:
+    """签发一个设备配对码（一次性，绑定当前用户名下的设备资源）。
+
+    返回配对码与 TTL（秒）；配对码由 device-control 协议兑换一次后即建出
+    直连资源行。Redis 不可用返回 503，迁移未完成返回 501。
+    """
     # Pairing codes are scoped to the user's device resources in the store; the
     # device-control protocol accepts the code once and creates a direct resource.
     import mcp_builtin.device_control.store as dc_store
@@ -347,13 +456,21 @@ async def create_device_pairing_resource(body: MintPairingCodeReq, user: User = 
 
 
 # ── iOS device management (capability ios_mgmt) ─────────────────────────────────
-# Hosts are selected by the *capability*, not the role: iOS device management
-# needs go-ios + usbmuxd on the host, so any node advertising ios_mgmt can serve
-# it — an execution node on a Mac/Windows box with an iPhone attached, as well
-# as the dedicated node-ios binary (role=ios_host).
+# Hosts are selected by *role*, not by a self-reported capability label. The
+# ios_mgmt label is a boot-time probe (usbmuxd reachability at node start) whose
+# negative result is sticky for the process lifetime — one unlucky register and
+# the label vanishes until the node restarts, silently hiding a perfectly good
+# host. The real verdict comes from the frames themselves: a node without the
+# iOS stack error-acks with "iOS device management is not enabled on this host",
+# which the scan UI already surfaces per-host. So: any execution/ios_host node
+# the user can reach is a candidate host; management (grouping-only) rows are
+# excluded.
 def _is_ios_host(node: dict) -> bool:
-    """True when a list_my_nodes row advertises iOS device management."""
-    return ((node.get("capabilities") or {}).get("ios_mgmt") == "true")
+    """True when a list_my_nodes row may serve iOS device management."""
+    if node.get("display_only"):
+        return False
+    role = str(node.get("node_role") or node.get("role") or "")
+    return role not in ("management", "passive_management")
 
 
 @router.get("/resources/ios-hosts")
@@ -520,13 +637,33 @@ async def claim_ios_device(
     node_id = (body.get("node_id") or "").strip()
     udid = (body.get("udid") or "").strip()
     label = (body.get("label") or "").strip()
+    # force=重新配对：修复「节点仍持有认领、服务端已无行」的孤儿（删除时节点离线、
+    # 或认领中途失败留下的半成品）。先 force-release 再走正常认领。
+    force = bool(body.get("force"))
     if not node_id or not udid:
         raise HTTPException(status_code=400, detail="node_id and udid are required")
 
     if not await nodes_service.user_can_use_node(user.id, node_id):
         raise HTTPException(status_code=403, detail="您无权访问此节点")
 
+    if force:
+        # 孤儿修复：节点可能仍持该 UDID 的认领（dev.claimed=true），此时正常 Claim
+        # 会撞 "already claimed"。先 force-release（删节点凭据 + devices.json 条目）
+        # 把节点打回未认领。忽略 not_found / 节点离线——后面的认领会给出真正的错误。
+        #
+        # 竞态安全：节点 Release 在锁内先改 claimed=false 并同步移除 devices.json
+        # 条目、**然后**才 ack；我们 await 到 ack 后才派发 Claim，此刻必然未认领。
+        # device_id 传空串走 udid 匹配（孤儿的 device_id 可能与已知的不同）。
+        try:
+            await get_node_client().ios_release_device(node_id, "", udid, delete_credential=True)
+        except (NodeServerUnavailable, RPCError):
+            pass
+
     # Conflict check: is this UDID already claimed by anyone?
+    #
+    # 自愈：查到同 UDID 的行时，先核对节点侧是否真的还持有认领——「服务端有行、
+    # 节点无认领」是脏状态（节点重启/换版本/被释放后行没清），此时应删掉陈旧行让
+    # 本次认领继续，而不是拿一个 409 把用户永久挡在门外。
     existing = await builtin_tool_store.list_resources(
         owner_user_id=None, resource_type="device"
     )
@@ -534,10 +671,31 @@ async def claim_ios_device(
         # list_resources 返回 _resource_value 扁平化后的 DTO（无 "data" 层）。
         # 此前读 res["data"] 恒为 {}，冲突检查形同虚设——同一台 iPhone 能被
         # 重复认领。
-        info = res.get("device_info") or {}
         ios_info = res.get("ios") or {}
-        if ios_info.get("udid") == udid:
-            raise HTTPException(status_code=409, detail=f"UDID {udid} 已被认领")
+        if ios_info.get("udid") != udid:
+            continue
+        stale = await _ios_row_is_stale(res, udid)
+        if stale:
+            # 陈旧行：删掉它（顺带释放节点残留），继续本次认领。
+            await _release_ios_claim(
+                str(ios_info.get("node_id") or "").strip(),
+                str(res.get("device_id") or "").strip(),
+                udid,
+            )
+            try:
+                await builtin_tool_store.delete_resource(int(res["id"]))
+                await _resync_builtin("device-control")
+                from loguru import logger
+
+                logger.info(
+                    "[ios-claim] deleted stale row id=%s udid=%s (node holds no claim)",
+                    res.get("id"), udid,
+                )
+            except Exception:  # noqa: BLE001 — 删失败则保守 409（别建重复行）
+                raise HTTPException(status_code=409, detail=f"UDID {udid} 已被认领")
+            break
+        # 节点仍持认领：真的被占，保持 409。
+        raise HTTPException(status_code=409, detail=f"UDID {udid} 已被认领")
 
     # Mint a one-time pairing code
     try:
@@ -588,6 +746,7 @@ async def _adopt_claimed_ios_resource(
     只记日志——用户重新扫描时 inventory 里已有 claimed 标记。
     """
     from server import builtin_tool_store
+    from .node_client import get_node_client
     from loguru import logger
 
     try:
@@ -628,6 +787,148 @@ async def _adopt_claimed_ios_resource(
         {"ios": ios_payload, "platform": "ios", "name": label or row.get("name") or udid},
     )
     return int(row["id"])
+
+
+async def ios_device_is_present(node_id: str, udid: str) -> bool:
+    """这台手机此刻是否被宿主节点通过 usbmuxd 枚举到（= 在线）。
+
+    在线轴的定义就是「go-ios 扫得到」：手机插着、被系统识别，就算在线；拔了就
+    不算。刻意不看 device_control_online（守护 WS）——守护要 WDA 装好之后才起来，
+    拿它当门禁会让第一次初始化永远开始不了。
+
+    节点不可达时返回 False（宁可拦住，也不要对着一个联系不上的节点派发）。
+    """
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+
+    node_id = (node_id or "").strip()
+    udid = (udid or "").strip()
+    if not node_id or not udid:
+        return False
+    try:
+        inv = await get_node_client().get_ios_devices(node_id)
+    except (NodeServerUnavailable, RPCError):
+        return False
+    for d in (inv.get("devices") or []) if isinstance(inv, dict) else []:
+        if str(d.get("udid") or "").strip() == udid:
+            return bool(d.get("present"))
+    return False
+
+
+async def _ensure_ios_device_online(ios_info: dict, *, action: str) -> None:
+    """下发前的在线门禁：离线直接 409，不让请求走到节点再以 device_not_present 失败。
+
+    用户在界面上看到的是「设备离线」，那就应该在这里被拦住并说清楚，而不是让
+    一个必然失败的 job 跑到流水线深处。
+    """
+    node_id = str((ios_info or {}).get("node_id") or "").strip()
+    udid = str((ios_info or {}).get("udid") or "").strip()
+    if not node_id or not udid:
+        raise HTTPException(status_code=400, detail="设备缺少 iOS 节点绑定信息")
+    if not await ios_device_is_present(node_id, udid):
+        raise HTTPException(
+            status_code=409,
+            detail=f"设备不在线，无法{action}。请确认 iPhone 已连接宿主节点并被识别后重试。",
+        )
+
+
+@router.post("/resources/{resource_id}/ios-config")
+async def save_ios_device_config(
+    resource_id: int, body: dict, user: User = Depends(get_current_user)
+) -> dict:
+    """保存 iOS 设备的初始化配置，并在设备在线时下发给宿主节点。
+
+    这是「初始化配置」唯一的落点——此前 NodeIosConfigureDevice 这条 RPC 端到端
+    都在（proto → node_server → node_client → 节点 manager），却没有 HTTP 路由和
+    任何调用方；前端那个 bundle id 输入框是纯局部 state，只在 prepare 时当一次性
+    参数用，不落库、不生效。
+
+    body: {
+      signing_profile_id?: int, wda_bundle_id?: str, xctest_config_name?: str,
+      transport?: "usb"|"network", renew_before_days?: int, auto_renew?: bool,
+    }
+
+    离线时**只落库不下发**，等设备上线后由节点侧等待段接上；在线则立刻下发。
+    """
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+    import builtin_tool_store as store
+
+    resource = await _owned_resource(resource_id, user, resource_type="device")
+    # _owned_resource → get_resource 返回扁平化 DTO（无 "data" 层）。
+    ios_info = dict(resource.get("ios") or {})
+    node_id = str(ios_info.get("node_id") or "").strip()
+    udid = str(ios_info.get("udid") or "").strip()
+    device_id = str(resource.get("device_id") or "").strip()
+    if not node_id or not udid:
+        raise HTTPException(status_code=400, detail="此设备缺少 iOS 节点绑定信息")
+
+    # 收集本次要写的配置（只写显式传了的键，避免把未提交的字段清空）。
+    patch: dict[str, object] = {}
+    if "signing_profile_id" in body:
+        raw = body.get("signing_profile_id")
+        patch["signing_profile_id"] = int(raw) if raw not in (None, "") else None
+    if "wda_bundle_id" in body:
+        patch["wda_bundle_id"] = str(body.get("wda_bundle_id") or "").strip()
+    if "xctest_config_name" in body:
+        patch["xctest_config_name"] = str(body.get("xctest_config_name") or "").strip()
+    if "transport" in body:
+        transport = str(body.get("transport") or "").strip().lower()
+        if transport not in ("", "usb", "network"):
+            raise HTTPException(status_code=400, detail="transport 必须是 usb|network")
+        patch["transport"] = transport
+    if "renew_before_days" in body:
+        try:
+            days = int(body.get("renew_before_days") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="renew_before_days 必须是整数")
+        patch["renew_before_days"] = max(days, 0) or 14
+    if "auto_renew" in body:
+        patch["auto_renew"] = bool(body.get("auto_renew"))
+
+    if not patch:
+        raise HTTPException(status_code=400, detail="没有需要保存的配置项")
+
+    # config_revision 单调递增：节点按 revision 幂等（manager.go ConfigureDevice），
+    # 重放/乱序的旧配置不会把设备回滚。
+    revision = int(ios_info.get("config_revision") or 0) + 1
+    patch["config_revision"] = revision
+    ios_info.update(patch)
+
+    online = await ios_device_is_present(node_id, udid)
+    # 离线也保存：配置是「意愿」，下发是「动作」。用户拔着线配好、插上就生效，
+    # 不该逼他一直插着才能改配置。
+    await store.update_resource(resource_id, {"ios": ios_info})
+
+    if not online:
+        return {
+            "saved": True,
+            "dispatched": False,
+            "config_revision": revision,
+            "detail": "配置已保存。设备当前不在线，接入宿主节点后会自动生效。",
+        }
+
+    client = get_node_client()
+    try:
+        await client.ios_configure_device(
+            node_id,
+            device_id,
+            udid,
+            revision,
+            transport=str(patch.get("transport") or ""),
+            wda_bundle_id=str(patch.get("wda_bundle_id") or ""),
+            xctest_config_name=str(patch.get("xctest_config_name") or ""),
+            auto_prepare=False,
+            renew_before_days=int(patch.get("renew_before_days") or 14),
+        )
+    except NodeServerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RPCError as exc:
+        if exc.code == "failed_precondition":
+            raise HTTPException(status_code=412, detail=exc.message) from exc
+        if exc.code == "deadline_exceeded":
+            raise HTTPException(status_code=504, detail=exc.message) from exc
+        raise HTTPException(status_code=500, detail=exc.message) from exc
+
+    return {"saved": True, "dispatched": True, "config_revision": revision}
 
 
 @router.post("/resources/{resource_id}/runner-control")
@@ -672,11 +973,61 @@ async def ios_runner_control(resource_id: int, body: dict, user: User = Depends(
         raise HTTPException(status_code=500, detail=exc.message) from exc
 
 
+async def _release_ios_claim(node_id: str, device_id: str, udid: str) -> tuple[bool, str | None]:
+    """让宿主节点丢掉对这台 iPhone 的认领（删凭据 + devices.json 条目）。
+
+    best-effort，**绝不抛**：返回 ``(released, error_message)``。节点离线/RPC 失败
+    返回 ``(False, 原因)``，由调用方决定是否继续（删除路径继续删行，只是把未释放
+    的原因透出给用户，好让他上线后重新扫描并「重新配对」）。
+
+    为什么要抽出来：``delete_resource`` 与 ``release_ios_device`` 都需要这一步。
+    此前 ``delete_resource`` 只删服务端行、从不通知节点，节点侧凭据残留 → 扫描仍报
+    ``claimed`` 而服务端已无行 → 「找不到该设备的资源 id」且无法重新接入（孤儿）。
+    """
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+
+    if not node_id or not udid:
+        return False, "设备缺少节点绑定信息"
+    try:
+        await get_node_client().ios_release_device(node_id, device_id, udid, delete_credential=True)
+        return True, None
+    except NodeServerUnavailable as exc:
+        return False, str(exc) or "节点离线"
+    except RPCError as exc:
+        return False, getattr(exc, "message", None) or str(exc)
+
+
+async def _ios_row_is_stale(res: dict, udid: str) -> bool:
+    """判断一条 iOS 资源行是否「陈旧」——节点侧已无该设备的认领。
+
+    认领路径冲突检查的自愈依据：节点清单里该 UDID ``claimed=false``（节点不认它了）
+    或清单里**根本没有**该 UDID（节点可达但没这台设备）→ 陈旧，可删行让本次认领继续。
+
+    **保守**：节点不可达 / 读清单失败 → 返回 False（当作不陈旧，保持 409）——宁可拦，
+    也不要在拿不到真相时误删一行好记录。
+    """
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+
+    ios_info = res.get("ios") if isinstance(res.get("ios"), dict) else {}
+    node_id = str(ios_info.get("node_id") or "").strip()
+    if not node_id or not udid:
+        # 缺绑定信息：无法核对，保守当作不陈旧。
+        return False
+    try:
+        inv = await get_node_client().get_ios_devices(node_id)
+    except (NodeServerUnavailable, RPCError):
+        return False
+    for dev in (inv.get("devices") or []) if isinstance(inv, dict) else []:
+        if str(dev.get("udid") or "").strip() == udid:
+            # 节点知道这台设备：认领还在 → 不陈旧；认领没了 → 陈旧。
+            return not bool(dev.get("claimed"))
+    # 节点可达但清单里没有这台设备：行是陈旧的。
+    return True
+
+
 @router.post("/resources/{resource_id}/release-device")
 async def release_ios_device(resource_id: int, user: User = Depends(get_current_user)) -> dict:
     """Release a claimed iOS device: dispatch release frame, stop the node-side goroutine."""
-    from .node_client import get_node_client, NodeServerUnavailable, RPCError
-
     resource = await _owned_resource(resource_id, user, resource_type="device")
     # _owned_resource → get_resource 返回扁平化 DTO（无 "data" 层）。
     data = resource
@@ -690,13 +1041,8 @@ async def release_ios_device(resource_id: int, user: User = Depends(get_current_
             status_code=400, detail="此设备不是 iOS 设备或缺少节点绑定信息"
         )
 
-    client = get_node_client()
-    try:
-        await client.ios_release_device(node_id, device_id, udid, delete_credential=True)
-    except NodeServerUnavailable:
-        pass  # node offline: the device is already disconnected
-    except RPCError:
-        pass  # node-side failure: still revoke the resource
+    # best-effort 释放（节点离线/RPC 失败不阻断后面的 revoke）。
+    await _release_ios_claim(node_id, device_id, udid)
 
     # Revoke the device resource (same as the existing Android path)
     from server import builtin_tool_store
@@ -719,18 +1065,86 @@ async def revoke_device_resource(resource_id: int, user: User = Depends(get_curr
     return {"device": device}
 
 
+# ── 设备远程控制命令（网页「查看设备」操作面板用）──────────────────────────────
+# Android 与 iOS 走**同一条** device-control WS（spec v0，同一 driver 注册表）：
+# Android 是 App 自己拨号，iOS 是宿主节点替配对的 iPhone 拨号，所以这里不分平台。
+# 鉴权走会话 cookie + 资源归属；MCP 工具面（device_control_plugin）按 MCP token
+# 反查设备是另一条独立路径，两者都汇到 driver.call。
+
+class DeviceCommandReq(BaseModel):
+    cmd: str
+    args: dict[str, Any] = {}
+    timeout_ms: int | None = None
+
+
+# 设备报错码（spec §12）→ 用户可读的引导语。code 本身仍拼在消息前，便于排障。
+_DEVICE_ERROR_HINTS = {
+    "unsupported": "设备不支持该操作",
+    "bad_args": "参数不合法",
+    "stale_node": "屏幕内容已变化，请刷新屏幕后重试",
+    "not_found": "目标不存在",
+    "timeout": "设备响应超时",
+    "cancelled": "已取消",
+    "duplicate_request": "重复请求",
+    "overloaded": "设备繁忙，请稍后重试",
+    "permission_denied": "设备端权限未开启（如无障碍服务）",
+    "not_ready": "设备端尚未就绪，请稍后重试",
+    "device_error": "设备执行失败",
+}
+
+
+@router.post("/resources/{resource_id}/device-command")
+async def device_command(resource_id: int, body: DeviceCommandReq, user: User = Depends(get_current_user)) -> dict:
+    """向一台已配对的设备下发一条 device-control 命令并等结果。
+
+    cmd 必须在协议词汇表（spec §8）内；能力集由设备 register 时声明，driver
+    自己 gate（未声明的命令设备端根本不会收到）。截图类结果（get_screen_state
+    的 screenshot.b64）base64 JPEG 原样透传，前端拼 data URL 显示。
+    """
+    from mcp_builtin.device_control import driver as dc_driver
+    from mcp_builtin.device_control import protocol as proto
+
+    resource = await _owned_resource(resource_id, user, resource_type="device")
+    device_id = str(resource.get("device_id") or "")
+    if not device_id:
+        raise HTTPException(status_code=409, detail="设备尚未完成配对，无法下发命令")
+    if body.cmd not in proto.COMMANDS:
+        raise HTTPException(status_code=400, detail=f"不支持的命令：{body.cmd}")
+    driver = dc_driver.get_driver()
+    ctx = driver.get(device_id) if driver is not None else None
+    if ctx is None or ctx.closed:
+        raise HTTPException(status_code=409, detail="设备离线，连上服务端后才能操作")
+    try:
+        data = await ctx.call(body.cmd, body.args or {}, body.timeout_ms)
+    except dc_driver.DeviceOffline:
+        raise HTTPException(status_code=409, detail="设备连接已断开，请稍后重试") from None
+    except proto.DeviceError as exc:
+        hint = _DEVICE_ERROR_HINTS.get(exc.code, "设备执行失败")
+        message = f"{hint}：{exc.message}" if exc.message else hint
+        raise HTTPException(status_code=502, detail=f"[{exc.code}] {message}") from exc
+    return {"cmd": body.cmd, "data": data}
+
+
 # ── 通用资源 CRUD（动态 {resource_id}）——必须注册在所有静态子路径之后，
 # 否则 FastAPI 会把 "cdp-clients"/"mail-services" 等当作 resource_id 解析而 422。
 @router.get("/resources/{resource_id}")
 async def get_resource(resource_id: int, user: User = Depends(get_current_user)) -> dict:
+    """按 id 取一条工具资源详情，仅限本人名下；不存在或越权返回 404。"""
     return await _owned_resource(resource_id, user)
 
 
 @router.patch("/resources/{resource_id}")
 @router.put("/resources/{resource_id}")
 async def update_resource(resource_id: int, body: UpdateResourceReq, user: User = Depends(get_current_user)) -> dict:
+    """整体覆盖资源的 ``data`` 配置（PATCH/PUT 同路径，行为一致）。
+
+    ``expected_revision`` 传入时做乐观锁：版本不匹配返回 409（说明配置已被他人改动）。
+    写成功后重同步对应的内置 MCP 服务；资源不存在返回 404。
+    """
     import builtin_tool_store as store
     existing = await _owned_resource(resource_id, user)
+    if str(existing.get("resource_type") or "") == "mail_account" and "proxy_id" in body.data:
+        await _validate_mail_proxy_id(body.data)
     try:
         row = await store.update_resource(
             resource_id, body.data, owner_user_id=str(user.id), expected_revision=body.expected_revision
@@ -745,11 +1159,38 @@ async def update_resource(resource_id: int, body: UpdateResourceReq, user: User 
 
 @router.delete("/resources/{resource_id}")
 async def delete_resource(resource_id: int, user: User = Depends(get_current_user)) -> dict:
+    """删除资源。iOS 设备「删除即释放」——先通知宿主节点丢掉认领（删凭据），再删行。
+
+    此前只删服务端行、从不通知节点：节点 devices.json + 凭据残留，下次扫描仍报
+    ``claimed``，而服务端已无行 → 设备既接不进来也初始化不了（「找不到该设备的
+    资源 id」）。这里补上释放，让删除后能重新扫描接入。
+
+    判据用 ``ios.udid`` **且** ``ios.node_id`` 非空（release 需要的正是这对），
+    不用 ``platform=="ios"``——platform 只在 list_devices_resource 里算，且裸行
+    可能带 platform 而无 udid。android/cdp/mail 三种类型完全走原路径。
+
+    节点离线时**仍删行**，但返回 ``released:false`` + ``release_error``，前端据此
+    告警（否则会再造一个孤儿）。
+    """
     import builtin_tool_store as store
-    existing = await _owned_resource(resource_id, user)
+
+    existing = await _owned_resource(resource_id, user)  # 扁平化 DTO（无 "data" 层）
+    resource_type = str(existing.get("resource_type") or "")
+
+    released: bool | None = None
+    release_error: str | None = None
+    if resource_type == "device":
+        ios_info = existing.get("ios") if isinstance(existing.get("ios"), dict) else {}
+        udid = str(ios_info.get("udid") or "").strip()
+        node_id = str(ios_info.get("node_id") or "").strip()
+        if udid and node_id:
+            released, release_error = await _release_ios_claim(
+                node_id, str(existing.get("device_id") or ""), udid
+            )
+
     deleted = await store.delete_resource(resource_id, owner_user_id=str(user.id))
-    await _resync_resource(str(existing.get("resource_type") or ""))
-    return {"deleted": deleted}
+    await _resync_resource(resource_type)
+    return {"deleted": deleted, "released": released, "release_error": release_error}
 
 
 # ── 外部 MCP 接入说明与 CDP connection info ───────────────────────────────────
@@ -759,6 +1200,11 @@ _BUILTIN_MCP_SERVICE_NAMES = {"cdp": "cdp-bridge", "mail": "mail", "device": "de
 
 @router.get("/mcp-integration/{tool_kind}")
 async def mcp_integration_metadata(tool_kind: str, user: User = Depends(get_current_user)) -> dict:
+    """返回内置工具（cdp/mail/device）对应的 MCP 服务的接入说明。
+
+    包括服务名、显示名、SSE 地址（含带 token 的完整 URL）、暴露的工具列表与
+    运行状态；tool_kind 非法返回 400，内置服务不存在返回 404。
+    """
     import mcp_plugin_store
     from mcp_runtime.configuration import _manifest_for_service
     from mcp_runtime.sse_gateway import _tools_for_service
@@ -793,6 +1239,7 @@ async def mcp_integration_metadata(tool_kind: str, user: User = Depends(get_curr
 
 @router.get("/cdp/connection-info")
 async def cdp_connection_info(user: User = Depends(get_current_user)) -> dict:
+    """返回 Chrome 扩展接入 CDP 桥所需的连接信息（WS 会话地址与扩展下载地址）。"""
     from mcp.api import _runtime_public_base
     base = _runtime_public_base()
     ws_base = base.replace("http://", "ws://", 1).replace("https://", "wss://", 1)

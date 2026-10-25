@@ -356,12 +356,16 @@ class GatewayLLMBridge:
         thinking_enabled: bool = False,
         reasoning_effort: str = "",
         session_id: str | None = None,
+        subagent_id: str | None = None,
         max_retries: int = 0,
     ):
         self.api_key = api_key or ""
         self.api_key_name = api_key_name or ""
         self.model = model
         self.session_id = session_id
+        # 子 agent 血缘：非空时，这次上游请求在 request_logs 记 subagent_id，
+        # 使父子成本可分开归因（session_id 仍是同一个 conv_id，对话视图不碎）。
+        self.subagent_id = subagent_id
         self.provider_whitelist = set(provider_whitelist or set())
         self.provider_blacklist = set(provider_blacklist or set())
         self.thinking_enabled = bool(thinking_enabled)
@@ -378,6 +382,7 @@ class GatewayLLMBridge:
         model: str | None = None,
         *,
         session_id: str | None = None,
+        subagent_id: str | None = None,
         thinking_enabled: bool | None = None,
         reasoning_effort: str | None = None,
     ) -> "GatewayLLMBridge":
@@ -391,6 +396,7 @@ class GatewayLLMBridge:
             thinking_enabled=self.thinking_enabled if thinking_enabled is None else thinking_enabled,
             reasoning_effort=self.reasoning_effort if reasoning_effort is None else reasoning_effort,
             session_id=self.session_id if session_id is None else session_id,
+            subagent_id=self.subagent_id if subagent_id is None else subagent_id,
             max_retries=self.max_retries,
         )
 
@@ -407,10 +413,21 @@ class GatewayLLMBridge:
         import main as _main
 
         body = self._build_body(messages, tools, stream)
-        # 不向 dispatch_entry 传 on_retry：网关内部重试（换候选 / 渠道内层 / 模型组
-        # 不可用 / 回退备份组）是 LLM 服务的内部容错，和普通 /v1/chat/completions 调用
-        # 一样后台静默进行，不该冒泡到 agent 对话界面。网关自身已按 request_id 把
-        # 每次尝试落 request_logs，要看链路走管理端请求详情，不走用户对话。
+        # 会话血缘：把 agent 会话 id 透传给网关，落 request_logs.session_id（与
+        # editor 路径的 editor_session_id 同一套模式），请求日志页的 session 列/
+        # 过滤器就能按 agent 会话把一次对话的所有上游请求串起来。用 `session_id`
+        # 键而非 `client_session_id`：后者会被渠道 header 模板（{{client_session_id}}）
+        # 与 opencode preset 消费，等于伪造客户端的会话身份；`session_id` 是网关
+        # 内部血缘键（main.py 优先取它），不下发到上游。
+        extra: dict = {}
+        if self.session_id:
+            extra["session_id"] = str(self.session_id)
+        if self.subagent_id:
+            extra["subagent_id"] = str(self.subagent_id)
+        # 不向网关传 on_retry：网关内部重试（渠道内层同账号 / 换候选 / 组回退）是平台
+        # 选路细节，绝不该冒泡到对话 UI——用户在对话层看到「切换候选 xxx/yyy」是架构
+        # 越界。网关重试完全静默（RequestLogs 照旧可见），对话层只显示 agent 自己的
+        # 重试（agent_loop 的 429 退避 / 直连桥网络重试，见 _emit_loop_retry）。
         return await _main.dispatch_entry(
             endpoint="/v1/chat/completions",
             body=body,
@@ -422,13 +439,14 @@ class GatewayLLMBridge:
             request_protocol="openai",
             chat_method="chat",
             client_type="agent",
+            extra_kwargs=extra or None,
         )
 
     async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse:
         """非流式：用网关明文 key 调主链路，收集整段结果转 LLMResponse。
 
         网关的限流/计费/日志/内部重试在 dispatch_entry 内完成，本层只解析结果。
-        网关内部重试静默，不向 agent 冒泡（与普通 /v1/chat/completions 调用一致）。
+        网关内部选路重试对对话层完全静默（不向 UI 冒泡供应商/候选切换）。
         """
         import main as _main
 
@@ -444,7 +462,10 @@ class GatewayLLMBridge:
         messages: list[dict],
         tools: list[dict] | None = None,
     ) -> AsyncGenerator[LLMResponse, None]:
-        """流式：迭代网关 SSE 生成器，复用 LLMBridge 的 SSE 解析逐 chunk yield LLMResponse。"""
+        """流式：迭代网关 SSE 生成器，复用 LLMBridge 的 SSE 解析逐 chunk yield LLMResponse。
+
+        不接受 on_retry：网关内部选路重试不外泄到对话层（见 _dispatch 的说明）。
+        """
         dispatch = await self._dispatch(messages, tools, stream=True)
         generator = dispatch["generator"]
         if not dispatch.get("stream"):

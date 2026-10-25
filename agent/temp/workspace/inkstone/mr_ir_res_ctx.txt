@@ -1,0 +1,37 @@
+
+===== mirrors GET list params =====
+
+===== mirrors base O= =====
+
+===== inference base= =====
+
+--- @ 252553 ---
+O="/api/ml/v1/inference",Ea=async e=>{const{page:t=1,size:n=16}=e;try{const a=await S.http.get(`${O}/list`,{params:{...e,page:t,size:n}});if(a?.code===0&&a?.data)return{list:a.data.list||[],total:a.data.total||0,next_token:a.data.next_token};throw new Error("Invalid response")}catch(a){return console.error("获取推理服务列表失败:",a),null}},Zf=async e=>{const{page:t=1,size:n=16}=e;try{const a=await S.http.get(`${O}/share_list`,{params:{...e,page:t,size:n}});if(a?.code===0&&a?.data)return{list:a.data.list||[],total:a.data.total||0,next_token:a.data.next_token};throw new Error("Invalid response")}catch(a){return console.error("获取分享列表失败:",a),null}},Jf=async e=>{try{const t=await S.http.get(`${O}/view`,{params:e});if(t?.code===0&&t?.data)return t.data;throw new Error("Invalid response")}catch(t){return console.error("获取推理服务详情失败:",t),null}},Yf=async e=>await S.http.post(`${O}/create`,{data:e}),Xf=async e=>await S.http.post(`${O}/edit`,{data:e}),Kf=async e=>await S.http.post(`${O}/start`,{data:e}),Qf=async e=>await S.http.post(`${O}/stop`,{data:e}),ep=async e=>await S.http.post(`${O}/delete`,{data:e}),tp=async e=>await S.http.post(`${O}/rename`,{data:e}),np=async e=>await S.http.post(`${O}/renewal`,{data:e}),ap=async e=>await S.http.post(`${O}/share_delete`,{data:e}),rp=e=>S.http.get(`${O}/code_upload_url`,{params:{file_name:e}}),ip=async e=>await S.http.post(`${O}/user/call_api`,{data:e}),op=async e=>{try{return await S.http.post(`${O}/query_user`,{data:{query_words:e}})}catch(t){console.warn("搜索用户失败:",t)}return null},sp=async e=>{try{const t=await S.http.get(`${O}/share_user_list`,{params:{service_id:e}});if(t?.
+
+===== resource capacity-cfg =====
+
+--- @ 246296 ---
+rror("获取文件名称失败:",t),{code:9999,msg:"获取文件名称失败",data:{}}}},Ff=async()=>{try{const e=await S.http.get("/api/ml/v1/resource/capacity-cfg");return e.code===0&&e.data?{code:e.code||0,msg:e.msg||"获取云盘资源申请选项配置失败",data:e.data||{}}:{code:9999,msg:"获取云盘资源申请选项配置失败",data:{}}}catch(e){return console.error("获取云盘资源申请选项配置失败:",e),{code:9999,msg:"获取
+
+===== resource computility-cfg =====
+
+--- @ 240233 ---
+tebook_total:10,notebook_used:2,notebook_remaining:8}}}},Sf=async()=>{try{const e=await S.http.get("/api/ml/v1/resource/computility-cfg");return e.code===0&&e.data?{code:e.code,msg:e.msg||"获取配置成功",data:{total:e.data.total||0,items:e.data.items||[]}}:{code:e?.code||9999,msg:e?.msg||"获取配置失败",data:{total:0,items:[]}}}catch(e){return con
+
+===== resource capacity-apply =====
+
+--- @ 246676 ---
+nst t={inc_quota_amount:e.inc_quota_amount||0,apply_reason:e.apply_reason||""},n=await S.http.post("/api/ml/v1/resource/capacity-apply",{data:t});return{code:n.code||0,msg:n.msg||"云盘容量申请成功",data:n.data??{}}}catch(t){return console.error("云盘容量申请失败:",t),{code:9999,msg:"云盘容量申请失败",data:{}}}},lu=e=>e.showInProd!==!1,du=[{key:"devMachine",label:"我的开发机",icon:
+
+===== resource computility-apply =====
+
+--- @ 240590 ---
+",e),{code:9999,msg:"获取配置失败",data:{total:0,items:[]}}}},kf=async e=>{try{const t=await S.http.post("/api/ml/v1/resource/computility-apply",{data:e});return t.code===0?{code:t.code,msg:t.msg||"申请成功",data:t.data}:{code:t?.code||9999,msg:t?.msg||"申请失败",data:null}}catch(t){return console.error("申请算力点失败:",t),{code:9999,msg:"申请失败",data:null}}},nu=()=>{const{bas
+
+===== mirrors create POST =====
+
+--- @ 250061 ---
+uild_time:e.build_time,logs:e.logs}),_a=async e=>{try{const t=await S.http.get("/api/ml/v1/mirrors",{params:{page:e.page,size:e.size,keyword:e.keyword||void 0,building_status:e.building_status||void 0,category:e.category||void 0,sort_type:e.sort_type||"update_time_desc"}});if(t&&t.code===0&&t.data){const{data:n}=t;return{list:(n.list||[]).map(mu),total:n?.pagination?.total??n?.list?.length??0,max
+
+--- @ 251669 ---
+erfile_content=e.build_config.dockerfile_content);try{return await S.http.post("/api/ml/v1/mirrors",{data:t})}catch(n){return console.error("创建镜像失败:",n),{code:-1,msg:"创建失败",data:{id:"",name:"",status:"failed"}}}},Gf=async(e,t)=>{const n={category:t.use_scene,name:t.name,basic_mirror_id:t.base_image_id,resource_id:t.resource_config_id,build_config_method:t.build_config.type};t.build_config.type===

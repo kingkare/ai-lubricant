@@ -75,6 +75,12 @@ class OnboardNodeReq(BaseModel):
     manager_node_id: str | None = None  # execution role only; empty = synthetic manager
     labels: dict[str, str] | None = None
     proxy_config_id: str = ""  # 该节点绑定的出口代理池条目；空=直连
+    # 该节点要拨号的服务端地址（含端口）。空 = 用全局配置/请求 origin 兜底。
+    #
+    # 为什么要按节点单独指定：同一个服务端下不同节点网络位置不同——局域网里的
+    # 节点该拨内网地址，跑在公网托管平台（创空间等）的节点该拨公网地址，一个全局
+    # 值满足不了两边。前端预填当前服务地址+节点端口，用户可改。
+    server_address: str = ""
 
 
 class BindNodeReq(BaseModel):
@@ -115,6 +121,7 @@ _REASON_STATUS = {
     "group_not_found": 404,
     "node_not_found": 404,
     "node_not_bound": 404,
+    "not_found": 404,
     "node_id_required": 400,
     "no_manage_rights": 403,
     # 数据侧 select/解析类错误，与控制面 RPC 同名代码对齐（412/400）。
@@ -215,15 +222,21 @@ async def _guard(coro):
 
 @admin_router.get("/nodes")
 async def admin_list_nodes(status: str | None = None, _: User = Depends(_require_admin)) -> dict:
+    """列出全部节点（可按 status 过滤）；节点服务关闭时返回 503。"""
     return await _guard(nodes_service.list_nodes(status))
 
 
-def _node_server_url(request: Request) -> str:
+def _node_server_url(request: Request, explicit: str = "") -> str:
     """Public origin a remote node agent dials back to.
 
-    Prefers the configured ``node_server_public_url`` (set behind a reverse
-    proxy / for a stable console URL); otherwise derives it from the current
-    request origin so a single-host deployment needs no extra config.
+    Priority: **per-node explicit** > configured ``node_server_public_url`` >
+    request origin.
+
+    The per-node value is authoritative because one global address cannot serve
+    every node: a node inside the LAN must dial the LAN address, while a node on
+    a public hosting platform (ModelScope Studio etc.) must dial a publicly
+    reachable one. The console prefills the current origin + control port so the
+    common case needs no typing.
 
     Note this is the DIAL-BACK origin, not the control-plane address: the node
     control process is separate (``python -m node_server``), and this data
@@ -232,6 +245,14 @@ def _node_server_url(request: Request) -> str:
     surface HTTP 503.
     """
     from . import config
+
+    # 节点自带的地址优先。只补协议、剥尾斜杠，不做别的猜测——用户可能填
+    # ``192.168.1.5:8003`` 或 ``node.example.com:8003``。
+    node_specific = (explicit or "").strip().rstrip("/")
+    if node_specific:
+        if not node_specific.lower().startswith(("http://", "https://")):
+            node_specific = "http://" + node_specific
+        return node_specific
 
     configured = (config.settings.node_server_public_url or "").strip().rstrip("/")
     if configured:
@@ -256,6 +277,12 @@ def _node_server_url(request: Request) -> str:
 async def admin_onboard_node(
     body: OnboardNodeReq, request: Request, _: User = Depends(_require_admin)
 ) -> dict:
+    """入驻一个新节点（管理/执行），返回 node_id + secret 并写入短期 bootstrap。
+
+    可安装节点（返回 secret）会把自包含 bootstrap 脚本所需信息（拨回地址、
+    角色、代理）存入 Redis，新机器按 node_id 即可取用，无需管理员会话；
+    Redis 写入失败只告警，不影响入驻结果本身。
+    """
     result = await _guard(
         nodes_service.onboard_node(
             role=body.role,
@@ -276,7 +303,7 @@ async def admin_onboard_node(
             await save_node_bootstrap(
                 result["node_id"],
                 secret=result["secret"],
-                server_url=_node_server_url(request),
+                server_url=_node_server_url(request, body.server_address),
                 role=(result.get("node") or {}).get("role") or body.role,
                 startup_method=(result.get("node") or {}).get("startup_method") or body.startup_method,
                 proxy_config_id=body.proxy_config_id,
@@ -292,11 +319,13 @@ async def admin_onboard_node(
 
 @admin_router.post("/nodes/{node_id}/approve")
 async def admin_approve_node(node_id: str, _: User = Depends(_require_admin)) -> dict:
+    """审批通过一个节点（管理端控制面动作）。"""
     return await _guard(nodes_service.approve_node(node_id))
 
 
 @admin_router.post("/nodes/{node_id}/revoke")
 async def admin_revoke_node(node_id: str, _: User = Depends(_require_admin)) -> dict:
+    """撤销一个节点：记录保留为 REVOKED 状态以便留痕（硬删除见 delete）。"""
     return await _guard(nodes_service.revoke_node(node_id))
 
 
@@ -304,6 +333,10 @@ async def admin_revoke_node(node_id: str, _: User = Depends(_require_admin)) -> 
 async def admin_node_shell_approval_catalog(
     node_id: str, _: User = Depends(_require_admin)
 ) -> dict:
+    """返回节点可用的 shell 审批预设命令目录（按 shell 类型分组）。
+
+    附带推断出的节点实际 shell flavor，供管理端渲染预置项。
+    """
     node = await _require_execution_node(node_id)
     grouped = {flavor: [] for flavor in ("posix", "powershell", "cmd", "unknown")}
     for item in PRESET_APPROVAL_CATALOG:
@@ -319,6 +352,7 @@ async def admin_node_shell_approval_catalog(
 async def admin_list_node_shell_approval(
     node_id: str, _: User = Depends(_require_admin)
 ) -> dict:
+    """列出节点当前的 shell 命令审批策略。"""
     node = await _require_execution_node(node_id)
     return {
         "node_id": node_id,
@@ -335,6 +369,10 @@ async def admin_put_node_shell_approval(
     request: Request,
     user: User = Depends(_require_admin),
 ) -> dict:
+    """新增/更新一条节点的 shell 命令审批策略，并记录审计。
+
+    note 超过 255 字返回 422；command_key 按 shell 类型校验规范化。
+    """
     await _require_execution_node(node_id)
     shell = _normalize_shell(body.shell_flavor)
     if len(body.note or "") > 255:
@@ -357,6 +395,7 @@ async def admin_delete_node_shell_approval(
     request: Request,
     user: User = Depends(_require_admin),
 ) -> dict:
+    """删除一条节点的 shell 审批策略，并记录审计；command_key 为空返回 422。"""
     await _require_execution_node(node_id)
     shell = _normalize_shell(shell_flavor)
     key = (command_key or "").strip().lower()
@@ -378,6 +417,7 @@ async def admin_clear_node_shell_approval(
     shell_flavor: str | None = None,
     user: User = Depends(_require_admin),
 ) -> dict:
+    """清空节点的 shell 审批策略（可选按 shell_flavor 限定），并记录审计。"""
     await _require_execution_node(node_id)
     shell = _normalize_shell(shell_flavor) if shell_flavor is not None else None
     deleted = await shell_approval_service.clear_node_policy(node_id, shell)
@@ -403,6 +443,7 @@ async def admin_delete_node(node_id: str, _: User = Depends(_require_admin)) -> 
 
 @admin_router.delete("/nodes/{node_id}/onboard")
 async def admin_revoke_onboard_node(node_id: str, _: User = Depends(_require_admin)) -> dict:
+    """撤销节点的入驻（未注册的删记录，已注册的按入驻回退处理）。"""
     return await _guard(nodes_service.revoke_onboard_node(node_id))
 
 
@@ -461,13 +502,14 @@ async def admin_update_node_global_config(
     )
 
 
-    manager_node_id: str
-
-
 class NodeCapacityReq(BaseModel):
     max_sessions: int | None = None
     cpu_total: float | None = None
     memory_total: int | None = None
+
+
+class MoveNodeReq(BaseModel):
+    manager_node_id: str
 
 
 @admin_router.patch("/nodes/{node_id}/capacity")
@@ -487,8 +529,40 @@ async def admin_set_node_capacity(
 async def admin_move_node(
     node_id: str, body: MoveNodeReq, _: User = Depends(_require_admin)
 ) -> dict:
-    """把执行节点挪到 body.manager_node_id 指定的管理节点下。"""
+    """把执行节点挪到 body.manager_node_id 指定的管理节点下。
+
+    **spec ``movable=False`` 的类型拒绝移动**（后端是最终防线，不能只在前端藏按钮）：
+    如创空间子节点依赖其管理节点的 ModelScope 令牌，挪走就失凭据。
+    """
+    await _guard_move_movable(node_id)
     return await _guard(nodes_service.move_node(node_id, body.manager_node_id))
+
+
+async def _guard_move_movable(node_id: str) -> None:
+    """按「当前所属管理节点」的 spec ``movable`` 决定能否移动。缺 spec/无绑定 → 放行。"""
+    from fastapi import HTTPException
+
+    try:
+        from .models_carrier import NodeCarrierBinding
+        from .carrier_service import load_spec_for_binding
+
+        child = await NodeCarrierBinding.get_or_none(node_id=node_id)
+        if child is None or not str(child.manager_node_id or "").strip():
+            return  # 没有管理节点归属（老节点/独立执行节点）：不拦
+        mgr = await NodeCarrierBinding.get_or_none(node_id=child.manager_node_id)
+        if mgr is None:
+            return
+        spec = await load_spec_for_binding(mgr)
+        manifest = dict(getattr(spec, "MANIFEST", {}) or {})
+        if manifest.get("movable") is False:
+            raise HTTPException(
+                status_code=400,
+                detail=f"该类型管理节点（{manifest.get('label') or mgr.carrier_name}）的子节点"
+                       f"不支持移动到其它管理节点（spec movable=False）")
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 - 载体层不可用时不拦（普通节点移动照常）
+        return
 
 
 @admin_router.post("/nodes/{node_id}/editors/{editor}/install")
@@ -699,6 +773,17 @@ async def admin_node_upgrade_defaults(node_id: str, _: User = Depends(_require_a
     return {"last_proxy_id": last_proxy}
 
 
+@admin_router.get("/nodes/{node_id}/upgrade-status")
+async def admin_node_upgrade_status(node_id: str, _: User = Depends(_require_admin)) -> dict:
+    """升级进度快照（runtime / 节点程序两步：阶段 + 下载字节 + 终态）。
+
+    控制面内存态、按 node_id 跨重连存活——节点程序替换必然断连，重启窗口
+    正是轮询最需要的时候，所以这里不做在线检查。404=该节点没跑过升级
+    （前端弹窗据此区分「暂无进度」与「进行中」）。
+    """
+    return await _guard(nodes_service.upgrade_status(node_id))
+
+
 # ── admin: node agent binaries (served by ai-lubricant, not agent-compose) ────
 # Per the install guide, the daemon no longer hosts the binary; the management
 # console does. These endpoints list + stream the platform builds placed under
@@ -743,11 +828,13 @@ async def admin_get_node_detail(node_id: str, _: User = Depends(_require_admin))
 
 @admin_router.get("/groups/{group_id}/nodes")
 async def admin_list_group_nodes(group_id: str, _: User = Depends(_require_admin)) -> dict:
+    """列出某分组当前绑定的全部节点。"""
     return await _guard(nodes_service.list_group_nodes(group_id))
 
 
 @admin_router.post("/groups/{group_id}/nodes")
 async def admin_bind_group_node(group_id: str, body: BindNodeReq, _: User = Depends(_require_admin)) -> dict:
+    """把一个节点绑定到指定分组（管理端节点↔分组关系）。"""
     return await _guard(nodes_service.bind_node_to_group(group_id, body.node_id))
 
 
@@ -755,6 +842,7 @@ async def admin_bind_group_node(group_id: str, body: BindNodeReq, _: User = Depe
 async def admin_unbind_group_node(
     group_id: str, node_id: str, request: Request, user: User = Depends(_require_admin)
 ) -> dict:
+    """解绑分组下的节点并记录审计；绑定不存在返回 404。"""
     ok = await _guard(nodes_service.unbind_node_from_group(group_id, node_id))
     if not ok:
         raise HTTPException(status_code=404, detail="绑定不存在")
@@ -814,6 +902,7 @@ async def team_list_proxies(user: User = Depends(get_current_user)) -> list[dict
 async def team_list_group_nodes(
     group_id: str, team_id: str = Depends(get_current_team_id)
 ) -> dict:
+    """列出本团队分组绑定的节点（团队自助视图，校验分组归属）。"""
     return await _guard(nodes_service.list_team_group_nodes(team_id, group_id))
 
 
@@ -821,6 +910,7 @@ async def team_list_group_nodes(
 async def team_group_node_picker(
     group_id: str, team_id: str = Depends(get_current_team_id)
 ) -> dict:
+    """返回分组节点选择器用的候选节点列表（团队自助）。"""
     return await _guard(nodes_service.list_group_node_picker(team_id, group_id))
 
 
@@ -832,6 +922,7 @@ async def team_bind_group_node(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """把节点绑定到本团队分组，并记录 group.bind_node 审计。"""
     result = await _guard(nodes_service.bind_team_group_node(team_id, group_id, body.node_id))
     ip, ua = client_meta(request)
     await team_users_service.record_audit(
@@ -850,6 +941,7 @@ async def team_unbind_group_node(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """解绑本团队分组下的节点并记录审计；绑定不存在返回 404。"""
     deleted = await _guard(nodes_service.unbind_team_group_node(team_id, group_id, node_id))
     if not deleted:
         raise HTTPException(status_code=404, detail="绑定不存在")
@@ -879,6 +971,10 @@ async def team_approve_node(node_id: str, user: User = Depends(get_current_user)
 async def team_install_node_editor(
     node_id: str, editor: str, user: User = Depends(get_current_user)
 ) -> dict:
+    """成员侧安装受支持的编辑器 CLI（claude/codex/gemini/opencode）。
+
+    编辑器不在支持列表返回 400；``user_can_use_node`` 派生不到管理权返回 403。
+    """
     if editor not in SUPPORTED_EDITORS:
         raise HTTPException(status_code=400, detail="不支持该编辑器")
     if await nodes_service.user_can_use_node(str(user.id), node_id) is None:
@@ -902,6 +998,12 @@ async def team_install_node_host_tool(
 async def team_install_node_tool(
     node_id: str, tool: str, user: User = Depends(get_current_user)
 ) -> dict:
+    """成员侧安装 ocr 工具，并在下发前预检节点是否具备 npm。
+
+    权限口径与其他 team 节点路由一致（``user_can_use_node``）。节点能力快照里
+    没有 npm_version 时不派发注定失败的命令，改为 422 + 结构化引导
+    ``{code: missing_runtime, missing: npm, guide: docker|standalone}``。
+    """
     if tool != "ocr":
         raise HTTPException(status_code=400, detail="不支持该工具")
     if await nodes_service.user_can_use_node(str(user.id), node_id) is None:
@@ -958,6 +1060,7 @@ async def team_create_execution_node(
     request: Request,
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """在分组下创建执行节点（用户侧自助），拨回地址由当前请求 origin 推导。"""
     return await _guard(
         nodes_service.create_group_execution_node(
             team_id, group_id,
@@ -978,6 +1081,7 @@ async def team_delete_execution_node(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """删除分组下的执行节点并记录 node.delete 审计（归属由 team+group 校验）。"""
     result = await _guard(
         nodes_service.delete_group_execution_node(team_id, group_id, node_id)
     )
@@ -1037,6 +1141,19 @@ async def team_node_upgrade_defaults(
     """该节点上次成功升级用的代理 id，供升级弹窗预选（空=直连）。"""
     row = await _require_user_node(user, node_id, execution_only=True)
     return {"last_proxy_id": str(row.get("last_proxy_config_id") or "")}
+
+
+@team_router.get("/nodes/{node_id}/upgrade-status")
+async def team_node_upgrade_status(
+    node_id: str, user: User = Depends(get_current_user)
+) -> dict:
+    """用户侧升级进度轮询：与 POST /upgrade 同权（只读）。
+
+    权限与下发动作一致（执行节点归属校验）——进度本身不敏感，但只有被授权
+    操作该节点的用户才看得到它的运行状态。
+    """
+    await _require_user_node(user, node_id, execution_only=True)
+    return await _guard(nodes_service.upgrade_status(node_id))
 
 
 class TeamUpgradeNodeReq(BaseModel):

@@ -16,6 +16,9 @@ SELECTION_STRATEGIES = ("sequential", "random_member", "model_random", "random_a
 DEFAULT_SELECTION_STRATEGY = "intelligent"
 EDITOR_PROVIDERS = {"claude", "codex", "opencode", "cursor"}
 
+# 元数据取值模式归一化（min/max/avg/model）与 model_catalog 同源，避免两处口径漂移。
+from model_catalog import normalize_group_metadata_mode as _normalize_metadata_mode
+
 
 def get_db_config() -> dict:
     return get_postgres_config()
@@ -60,6 +63,8 @@ class PostgresClient:
         await cls.create_multi_agent_tables()
         await cls.create_builtin_tool_tables()
         await cls.create_attachment_tables()
+        await cls.create_browser_password_tables()
+        await cls.create_totp_credential_tables()
         if lightweight:
             logger.info("postgres 连接成功 (lightweight: 跳过回填/规范化/迁移)")
             return
@@ -183,6 +188,7 @@ class PostgresClient:
                     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
                     client_type TEXT,
                     session_id TEXT,
+                    subagent_id TEXT,
                     router_request_path TEXT,
                     upstream_status TEXT,
                     error TEXT,
@@ -219,6 +225,7 @@ class PostgresClient:
             await conn.execute("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS attempt_no INTEGER")
             await conn.execute("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS client_type TEXT")
             await conn.execute("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS session_id TEXT")
+            await conn.execute("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS subagent_id TEXT")
             await conn.execute("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS editor_id TEXT")
             await conn.execute("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS editor_session_id TEXT")
             await conn.execute("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS task_id TEXT")
@@ -255,6 +262,7 @@ class PostgresClient:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_api_key ON request_logs(api_key)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_editor ON request_logs(editor_id) WHERE editor_id IS NOT NULL")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_editor_session ON request_logs(editor_session_id) WHERE editor_session_id IS NOT NULL")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_subagent ON request_logs(subagent_id) WHERE subagent_id IS NOT NULL")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_task ON request_logs(task_id) WHERE task_id IS NOT NULL")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_success ON request_logs(success)")
@@ -479,6 +487,22 @@ class PostgresClient:
             await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS model_whitelist JSONB NOT NULL DEFAULT '[]'::jsonb")
             await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS model_blacklist JSONB NOT NULL DEFAULT '[]'::jsonb")
             await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS selection_strategy TEXT NOT NULL DEFAULT 'intelligent'")
+            # 压缩模型（有序候选列表）：命中「上下文压缩」时按顺序取第一个可路由且放行的候选；
+            # 全不可用则回退原模型。JSONB 数组。与 selection_strategy 同族的路由策略，挂在 Key 上
+            # 而非模型元数据，避免污染 /v1/models。
+            await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS compress_model JSONB NOT NULL DEFAULT '[]'::jsonb")
+            # 兼容本特性早期以 TEXT 单值形态存在过的开发库：空串→空数组，单值→单元素数组。
+            _col = await conn.fetchrow(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name='api_keys' AND column_name='compress_model'"
+            )
+            if _col and _col["data_type"] == "text":
+                await conn.execute(
+                    "ALTER TABLE api_keys ALTER COLUMN compress_model TYPE jsonb "
+                    "USING CASE WHEN compress_model IS NULL OR compress_model = '' "
+                    "THEN '[]'::jsonb ELSE jsonb_build_array(compress_model) END"
+                )
+                await conn.execute("ALTER TABLE api_keys ALTER COLUMN compress_model SET DEFAULT '[]'::jsonb")
             # upstream 平台归属（可空）：user_id 绑定 C 端用户；vm_id 绑定临时下发 key 的虚拟机。
             # 仅作归属/审计标记，不参与路由/限流/预占；未绑定的存量 key 全部为 NULL，行为不变。
             await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS user_id TEXT")
@@ -709,12 +733,27 @@ class PostgresClient:
                     account_tpm INTEGER,
                     extra_config JSONB NOT NULL DEFAULT '{}'::jsonb,
                     enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    cost_multiplier DOUBLE PRECISION,
                     PRIMARY KEY (provider, upstream_model_id)
                 )
             """)
             await conn.execute("ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS account_tpm INTEGER")
             await conn.execute("ALTER TABLE provider_models ALTER COLUMN account_tpm DROP NOT NULL")
             await conn.execute("ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS extra_config JSONB NOT NULL DEFAULT '{}'::jsonb")
+            # 积分倍率独立列：上游 spec 透传的展示键 _cost_multiplier 在写库边界提成本列，
+            # 不再塞在 extra_config 里（后者是展示快照，重拉上游会被整组覆盖；倍率需要
+            # 可手填、可查询、能被上游覆盖，所以单独存）。DOUBLE PRECISION 与前端 number 对齐
+            # （NUMERIC 经 asyncpg 会变 Decimal，JSON 化成字符串）。
+            await conn.execute("ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS cost_multiplier DOUBLE PRECISION")
+            # 一次性回填：老行的倍率快照（extra_config._cost_multiplier）搬进独立列，并把
+            # 旧键从 JSONB 里摘掉（单一真相源）。只认能转成数字的值；脏值留在原处不动。
+            await conn.execute("""
+                UPDATE provider_models
+                   SET cost_multiplier = (extra_config->>'_cost_multiplier')::double precision,
+                       extra_config = extra_config - '_cost_multiplier'
+                 WHERE extra_config->>'_cost_multiplier'
+                       ~ '^-?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$'
+            """)
             # 行级启用开关：False = 模型保留在表中但运行时不路由（渠道编辑弹框模型 tab 可切换）。
             await conn.execute("ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE")
             # 旧版渠道模型表上的 max_tokens / thinking_mode / thinking_max_tokens 字段已废弃：
@@ -740,6 +779,7 @@ class PostgresClient:
                     backup_group TEXT NOT NULL DEFAULT '',
                     response_model TEXT NOT NULL DEFAULT '',
                     metadata_model TEXT NOT NULL DEFAULT '',
+                    metadata_mode TEXT NOT NULL DEFAULT '',
                     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                     schemes JSONB NOT NULL DEFAULT '[]'::jsonb,
                     active_scheme TEXT NOT NULL DEFAULT '',
@@ -762,6 +802,12 @@ class PostgresClient:
             await conn.execute(
                 "ALTER TABLE model_groups ADD COLUMN IF NOT EXISTS metadata_model TEXT NOT NULL DEFAULT ''"
             )
+            # 模型元数据取值模式：min（默认，按成员逐字段取最小值）/ max / avg /
+            # model（采用 metadata_model 指定真实模型的原值）。空串按「有 metadata_model
+            # 即 model，否则 min」归一化，保持旧数据语义不变。
+            await conn.execute(
+                "ALTER TABLE model_groups ADD COLUMN IF NOT EXISTS metadata_mode TEXT NOT NULL DEFAULT ''"
+            )
             await conn.execute(
                 "ALTER TABLE model_groups ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb"
             )
@@ -774,6 +820,12 @@ class PostgresClient:
             await conn.execute(
                 "ALTER TABLE model_groups ADD COLUMN IF NOT EXISTS active_scheme TEXT NOT NULL DEFAULT ''"
             )
+            # 压缩模型（有序候选列表）：这个模型（自定义模型/模型策略/真实模型 id）的对话发生
+            # 「上下文压缩」时，改按此列表选路。JSONB 数组。挂在模型/策略行上而非 api_key 上，
+            # 因为压缩模型取决于「被压缩的是哪个模型」（窗口/成本），不取决于哪把 key 调用。
+            await conn.execute(
+                "ALTER TABLE model_groups ADD COLUMN IF NOT EXISTS compress_models JSONB NOT NULL DEFAULT '[]'::jsonb"
+            )
             # 自定义模型的 API Key 范围收敛到 API Key 侧（模型白/黑名单），废弃组上的相关列。
             await conn.execute("ALTER TABLE model_groups DROP COLUMN IF EXISTS use_all_api_keys")
             await conn.execute("ALTER TABLE model_groups DROP COLUMN IF EXISTS api_key_ids")
@@ -784,6 +836,7 @@ class PostgresClient:
             await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS selection_strategy TEXT NOT NULL DEFAULT 'intelligent'")
             await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS model_whitelist JSONB NOT NULL DEFAULT '[]'::jsonb")
             await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS model_blacklist JSONB NOT NULL DEFAULT '[]'::jsonb")
+            await conn.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS compress_model JSONB NOT NULL DEFAULT '[]'::jsonb")
 
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS provider_limit_policies (
@@ -899,7 +952,7 @@ class PostgresClient:
                     source TEXT DEFAULT 'api',
                     model TEXT,
                     current_turn INT DEFAULT 0,
-                    max_turns INT DEFAULT 80,
+                    max_turns INT DEFAULT 200,
                     total_tokens INT DEFAULT 0,
                     error TEXT,
                     session_id TEXT,
@@ -956,6 +1009,10 @@ class PostgresClient:
             # 同一个 Agent 的不同定时任务可以各用一个模型（比如日报用便宜的、巡检用强的）。
             await conn.execute("ALTER TABLE agent_scheduled_tasks ADD COLUMN IF NOT EXISTS api_key_id INTEGER")
             await conn.execute("ALTER TABLE agent_scheduled_tasks ADD COLUMN IF NOT EXISTS model VARCHAR(200)")
+            # notify_on_failure：任务级「异常通知」开关。终态失败(failed)/被拦截(blocked)时经
+            # notify_core 发 task.scheduled_failed 事件；能否收到仍取决于用户在通知中心的
+            # 事件订阅+渠道绑定（框架 opt-in，见 tests/test_system_notification_optin.py）。
+            await conn.execute("ALTER TABLE agent_scheduled_tasks ADD COLUMN IF NOT EXISTS notify_on_failure BOOLEAN NOT NULL DEFAULT FALSE")
             # 脚本型任务没有 prompt：放宽 NOT NULL，让 task_kind='script' 也能建。
             await conn.execute("ALTER TABLE agent_scheduled_tasks ALTER COLUMN task_prompt DROP NOT NULL")
             # ── 定时任务执行记录：每次执行一行（历史），不再只有 last_* 单快照 ──
@@ -1070,7 +1127,7 @@ class PostgresClient:
                     api_key VARCHAR(500) NOT NULL,
                     model VARCHAR(200) NOT NULL,
                     system_prompt TEXT DEFAULT '',
-                    max_turns INT DEFAULT 80,
+                    max_turns INT DEFAULT 200,
                     enabled BOOLEAN DEFAULT TRUE,
                     memory_enabled BOOLEAN DEFAULT TRUE,
                     skill_auto_learn BOOLEAN DEFAULT TRUE,
@@ -2070,7 +2127,72 @@ class PostgresClient:
             """)
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_goal_states_agent ON agent_goal_states(agent_id)")
 
+            # ── 工作流：定义（版本化）+ 运行记录（节点级日志）──
+            # 工作流是**用户资产**（user_id 归属），与 agent 完全解耦：agent 只能
+            # 启动一个 run，怎么执行由工作流自己的步骤决定（每步自带浏览器/MCP/
+            # 目标 Agent 的选择）。历史 agent_id 列已无消费方（遗留列，不迁移）。
+            # workflow_defs: 每次保存插一个新版本行（旧版本保留）；运行记录指向
+            #   (def_id, version)，模板改动绝不改写历史。name 唯一性按 (user_id, name)。
+            # workflow_runs: 每次执行一行；nodes JSONB 按节点完成即合并写入
+            #   （节点级日志：状态/输出/错误/命中决策/耗时），context JSONB 存
+            #   运行期变量快照。大段原文（stdout/响应体/agent 轨迹）有
+            #   MAX_NODE_OUTPUT_CHARS 上限 + agent 轨迹走对话库指针，不塞 DB。
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS workflow_defs (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    user_id TEXT,
+                    version INT NOT NULL DEFAULT 1,
+                    definition JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            # 旧的全局 (name, version) 唯一索引会被两个 owner 的同名工作流撞——
+            # 换成 per-owner 口径（user_id 可空，用 COALESCE 收进表达式索引）。
+            await conn.execute("DROP INDEX IF EXISTS uq_workflow_defs_name_version")
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_defs_owner_name_version "
+                "ON workflow_defs(COALESCE(user_id, ''), name, version)"
+            )
+            # 定时触发：cron 挂在**最新版本行**上（enabled + cron 才注册进调度器）。
+            # cron 触发的运行以 def 的 owner 身份跑（run_session/web/MCP 全按 owner 解析）。
+            # 工作流中文名（必填，创建时收）。name 是机器标识（owner 内唯一），
+            # label 是给人看的；显示处一律 label || name。
+            await conn.execute("ALTER TABLE workflow_defs ADD COLUMN IF NOT EXISTS label TEXT NOT NULL DEFAULT ''")
+            await conn.execute("ALTER TABLE workflow_defs ADD COLUMN IF NOT EXISTS cron_expression TEXT")
+            await conn.execute("ALTER TABLE workflow_defs ADD COLUMN IF NOT EXISTS schedule_enabled BOOLEAN NOT NULL DEFAULT FALSE")
+            await conn.execute("ALTER TABLE workflow_defs ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMPTZ")
+            await conn.execute("ALTER TABLE workflow_defs ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ")
+            await conn.execute("ALTER TABLE workflow_defs ADD COLUMN IF NOT EXISTS last_run_status TEXT")
+            # 服务重启时在跑的 run：默认重跑一遍（retry_on_reboot=false 关掉）。
+            await conn.execute(
+                "ALTER TABLE workflow_defs ADD COLUMN IF NOT EXISTS retry_on_reboot BOOLEAN NOT NULL DEFAULT TRUE"
+            )
+            # agent_id 已无消费方（工作流与 agent 解耦）：新装库没有该列，存量库删掉。
+            await conn.execute("ALTER TABLE workflow_defs DROP COLUMN IF EXISTS agent_id")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS workflow_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    def_id BIGINT NOT NULL REFERENCES workflow_defs(id) ON DELETE CASCADE,
+                    version INT NOT NULL,
+                    trigger TEXT NOT NULL DEFAULT 'manual',
+                    args JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    context JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    nodes JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    error TEXT NOT NULL DEFAULT '',
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    finished_at TIMESTAMPTZ
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_workflow_runs_def ON workflow_runs(def_id, started_at DESC)"
+            )
+
             # ── agent_subagent_messages 表 ──
+            # 保留历史数据（父/子信箱协议已删；Phase 2 sub-agent 走 WS 总线）。
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS agent_subagent_messages (
                     id BIGSERIAL PRIMARY KEY,
@@ -2086,6 +2208,27 @@ class PostgresClient:
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_subagent_msg_lookup "
                 "ON agent_subagent_messages(parent_task_id, subagent_task_id, direction, consumed)"
+            )
+
+            # ── agent_tool_audit_logs 表 ──
+            # 工具执行审计（code_run / 越界写入的授权与结果）。建表放这里而非
+            # 每次写入时跑 DDL：审计写入是热路径（每个审批工具一次），DDL 挪到
+            # schema 初始化，写入只 INSERT。
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS agent_tool_audit_logs (
+                    id BIGSERIAL PRIMARY KEY,
+                    agent_id INTEGER,
+                    conversation_id TEXT NOT NULL,
+                    caller_id TEXT,
+                    tool_name TEXT NOT NULL,
+                    approval_id TEXT,
+                    outcome TEXT NOT NULL,
+                    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tool_audit_conv ON agent_tool_audit_logs(conversation_id, created_at DESC)"
             )
 
             # ── agent_llm_configs 表（agent 服务专用 LLM 配置，独立于主系统渠道） ──
@@ -2148,6 +2291,22 @@ class PostgresClient:
             # 用户端 Agent 聊天页不受此开关影响（照旧走审批流程）。
             await conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS browser_code_run_enabled BOOLEAN DEFAULT FALSE")
 
+            # ── 上下文压缩（agent 级配置）──
+            # auto_compact：agent_loop 每轮 LLM 调用前是否自动跑 compress_history +
+            #   trim_messages_async（历史截断+摘要）。默认开，与历史行为一致；关掉则
+            #   只在收到手动 /compact 或用户点压缩按钮时才压缩。
+            # compact_threshold：上下文占用比例阈值（0~1），前端 token 卡/面板用量环
+            #   占比达到此值时主动弹框提醒压缩。仅作展示提醒，不改后端压缩时机。
+            await conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS auto_compact BOOLEAN DEFAULT TRUE")
+            await conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS compact_threshold REAL DEFAULT 0.8")
+
+            # ── max_turns 默认收敛（80→200） ──
+            # 代码里默认值统一到 agent.config.DEFAULT_MAX_TURNS（200）。历史列默认是
+            # 80，CREATE TABLE IF NOT EXISTS 不会改已有库的列默认；这里把列默认提到
+            # 200，并把仍停在旧默认 80 的行迁到 200（用户显式配过其他值的行不动）。
+            await conn.execute("ALTER TABLE agents ALTER COLUMN max_turns SET DEFAULT 200")
+            await conn.execute("UPDATE agents SET max_turns = 200 WHERE max_turns = 80")
+
             # ── Agent LLM 走网关秘钥（计费/限流/归属闭环） ──
             # 主/子 Agent 各自绑定一个网关 api_keys.id + 模型名，运行时经 dispatch_entry
             # 主链路调用（而非独立上游），使 token/TPM/归属可控。旧列 api_key/model/
@@ -2156,6 +2315,11 @@ class PostgresClient:
             await conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS main_model VARCHAR(200)")
             await conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS subagent_api_key_id INTEGER")
             await conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS subagent_model VARCHAR(200)")
+            # 子 Agent 岗位/难度 → 模型映射：{"roles":{...},"categories":{...}}，值是
+            # 网关模型 id 字符串。空 map = 未配 → 运行时逐层回落（subagent_model →
+            # 跟随主），旧行为逐字不变。与 *_api_key_id 分开存——key 一把、模型按岗
+            # 位查表（OMO 两张表思想）。
+            await conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS subagent_model_map JSONB NOT NULL DEFAULT '{}'::jsonb")
             # 定时任务默认模型：无人值守场景往往要跟交互态用不同的模型（省钱/长稳），
             # 且不该借用 subagent_* —— 那是「主 agent 派生的并行子任务」的语义。留空则
             # 回退主 Agent，行为与改动前一致。任务级 api_key_id/model 再覆盖这一层。
@@ -2520,6 +2684,13 @@ class PostgresClient:
                 "CREATE INDEX IF NOT EXISTS idx_builtin_tool_resources_type "
                 "ON builtin_tool_resources(resource_type)"
             )
+            # agent 授权已单轨化到 agent 侧 mcp_grants：cdp_client 资源行里残留的
+            # agent_ids 字段不再被任何读路径消费，这里清掉存量（幂等，可重复执行）。
+            await conn.execute(
+                "UPDATE builtin_tool_resources SET data = data - 'agent_ids', "
+                "revision = revision + 1, updated_at = now() "
+                "WHERE resource_type='cdp_client' AND data ? 'agent_ids'"
+            )
             # resource_type 白名单：老库（曾是 details）的 CHECK 还叫 detail_type 口径，
             # 按定义里出现 resource_type（或 detail_type）找并全部 drop，再补具名约束，
             # 新老库重复执行都无害。
@@ -2539,8 +2710,26 @@ class PostgresClient:
                     ALTER TABLE builtin_tool_resources
                         ADD CONSTRAINT builtin_tool_resources_resource_type_check
                         CHECK (resource_type IN ('cdp_client', 'mail_account',
-                                                 'mail_address', 'device'));
+                                                 'mail_address', 'device', 'site'));
                 END $$;
+            """)
+
+            # ── site 形态迁移（code 形态硬切换，幂等）────────────────────────
+            # 旧声明式站点（browsers/init/methods/steps）无法转成 Python 类，停用待重写。
+            # 只处理仍带旧 shape、且没有 code 字段的行；停用后列表可见、加载不崩
+            # （runtime.load_site_class 对空 code 报错，start_all_enabled 逐个跳过）。
+            # 保留 id → 已签发的站点 token / grant 不悬空。
+            await conn.execute("""
+                UPDATE builtin_tool_resources
+                   SET data = jsonb_build_object(
+                           'name', COALESCE(data->>'name', ''),
+                           'remark', '',
+                           'code', '',
+                           'enabled', false
+                       ),
+                       secret_data = '{}'::jsonb
+                 WHERE resource_type = 'site'
+                   AND NOT (data ? 'code')
             """)
 
             # ── builtin_tool_tokens：统一 MCP 访问 token（内置工具 + 外部 MCP 共用） ──
@@ -2758,6 +2947,83 @@ class PostgresClient:
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_attachments_sha "
                 "ON attachments(sha256)"
+            )
+
+    @classmethod
+    async def create_browser_password_tables(cls):
+        """浏览器插件密码管理器表。
+
+        一行 = 一条用户在浏览器登录成功后保存的凭据（按 owner_user_id 归属，
+        来源 = 已鉴权 CDP 客户端 token → client_id → owner_user_id）。
+        ``password_enc`` 恒为 AES-256-GCM 密文（见 ``browser_password_crypto``），
+        不存明文。``UNIQUE(owner_user_id, domain, username)`` 让 upsert 覆盖
+        同一站点同一账号；列表/详情接口只回 meta（不含密文与明文）。幂等。
+        """
+        async with cls.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS browser_passwords (
+                    id BIGSERIAL PRIMARY KEY,
+                    owner_user_id TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    password_enc TEXT NOT NULL,
+                    url TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'browser',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE(owner_user_id, domain, username)
+                )
+            """)
+            # 已存在的表补 source 列（幂等）：标识「浏览器插件保存」还是「用户在网页端编辑」
+            await conn.execute(
+                "ALTER TABLE browser_passwords ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'browser'"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_browser_passwords_owner_domain "
+                "ON browser_passwords(owner_user_id, domain)"
+            )
+
+    @classmethod
+    async def create_totp_credential_tables(cls):
+        """CDP 身份验证器（TOTP/Google Authenticator）表。
+
+        一行 = 一条 2FA 验证器（按 owner_user_id 归属，来源 = 已鉴权 CDP 客户端
+        token / 网页登录态 → 当前用户）。``secret_enc`` 恒为 AES-256-GCM 密文
+        （与 ``browser_password_crypto`` 同套密钥来源），**没有任何接口回明文
+        密钥**——扩展/网页只拿到「当前 6 位码 + 剩余秒数」。``domains`` 是
+        TEXT[]：一个验证器可关联多个域名（agent 按 ``= ANY(domains)`` 取码）。
+        ``UNIQUE(owner_user_id, issuer, account)`` 让扫码重录覆盖同一条而不是
+        产生重复行。幂等。
+        """
+        async with cls.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS totp_credentials (
+                    id BIGSERIAL PRIMARY KEY,
+                    owner_user_id TEXT NOT NULL,
+                    label TEXT NOT NULL DEFAULT '',
+                    issuer TEXT NOT NULL DEFAULT '',
+                    account TEXT NOT NULL,
+                    domains TEXT[] NOT NULL DEFAULT ARRAY[]::text[],
+                    note TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL DEFAULT '',
+                    secret_enc TEXT NOT NULL,
+                    digits INTEGER NOT NULL DEFAULT 6,
+                    period INTEGER NOT NULL DEFAULT 30,
+                    algorithm TEXT NOT NULL DEFAULT 'SHA1',
+                    source TEXT NOT NULL DEFAULT 'user',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE(owner_user_id, issuer, account)
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_totp_credentials_owner "
+                "ON totp_credentials(owner_user_id)"
+            )
+            # 按域名取码（agent 自动填 2FA）的主路径索引
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_totp_credentials_domains "
+                "ON totp_credentials USING GIN (domains)"
             )
 
     @classmethod
@@ -3700,6 +3966,7 @@ class PostgresClient:
             bool(data.get("routing_redis_degraded")),
             cls._dumps(data.get("routing_detail")) if data.get("routing_detail") is not None else None,
             cls._dumps(data.get("channel_retry_attempts") or []),
+            data.get("subagent_id"),
         )
 
     _REQUEST_LOG_INSERT_SQL = """
@@ -3711,9 +3978,9 @@ class PostgresClient:
             estimated_prompt_tokens, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_creation_tokens, reasoning_tokens,
             router_request_path, upstream_status, error, payload_truncated,
             route_duration_ms, candidate_collect_ms, strategy_select_ms, account_reserve_ms, routing_redis_degraded,
-            routing_detail, channel_retry_attempts
+            routing_detail, channel_retry_attempts, subagent_id
         ) VALUES(
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43::jsonb,$44::jsonb
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43::jsonb,$44::jsonb,$45
         ) ON CONFLICT (attempt_key) DO NOTHING
     """
 
@@ -3896,7 +4163,12 @@ class PostgresClient:
             )
         result_rows = []
         for row in rows:
-            result_rows.append(dict(row))
+            item = dict(row)
+            # asyncpg 默认把 JSONB 读成 str：列表行也要解析成对象，与详情（_loads_json）
+            # 口径一致，否则前端 `routing_detail?.is_compaction` 打不出「压」标签。
+            item["routing_detail"] = cls._loads_json(item.get("routing_detail"), {})
+            item["proxy_info"] = cls._loads_json(item.get("proxy_info"), {})
+            result_rows.append(item)
         return {"total": total, "rows": result_rows}
 
     @classmethod
@@ -4027,6 +4299,9 @@ class PostgresClient:
                 "backup_model_group": "",
                 "response_model": "",
                 "metadata_model": "",
+                "metadata_mode": "",
+                # real 行的压缩模型列表（顶层列，同 custom 行）。
+                "compress_models": cls._clean_string_list(cls._loads_json(group.get("compress_models"), [])),
                 "metadata": metadata,
                 "schemes": schemes,
                 "active_scheme": active["id"],
@@ -4072,6 +4347,11 @@ class PostgresClient:
             "backup_model_group": str(group.get("backup_model_group") or group.get("backup_group") or "").strip(),
             "response_model": str(group.get("response_model") or "").strip(),
             "metadata_model": str(group.get("metadata_model") or "").strip(),
+            # 元数据取值模式：min/max/avg/model；空串留给读取端按「有 metadata_model 即
+            # model，否则 min」归一化，保持旧数据语义不变。
+            "metadata_mode": _normalize_metadata_mode(group.get("metadata_mode"), group.get("metadata_model")),
+            # 压缩模型候选（jsonb 顶层列）：命中上下文压缩时按序取第一个可用改路由。
+            "compress_models": cls._clean_string_list(cls._loads_json(group.get("compress_models"), [])),
             "metadata": metadata,
             "schemes": schemes,
             "active_scheme": active_scheme,
@@ -4082,8 +4362,10 @@ class PostgresClient:
         if row is None:
             return None
         d = dict(row)
-        for field in ("models", "aliases", "provider_whitelist", "provider_blacklist"):
+        for field in ("models", "aliases", "provider_whitelist", "provider_blacklist", "compress_models"):
             d[field] = cls._loads_json(d.get(field), [])
+        if not isinstance(d.get("compress_models"), list):
+            d["compress_models"] = []
         strategy = d.get("selection_strategy") or DEFAULT_SELECTION_STRATEGY
         if strategy not in SELECTION_STRATEGIES:
             strategy = DEFAULT_SELECTION_STRATEGY
@@ -4091,6 +4373,9 @@ class PostgresClient:
         d["backup_group"] = str(d.get("backup_group") or "").strip()
         d["response_model"] = str(d.get("response_model") or "").strip()
         d["metadata_model"] = str(d.get("metadata_model") or "").strip()
+        # real 行不参与元数据聚合（无 members），空串按「有 metadata_model 即 model，
+        # 否则 min」归一化，与 custom 行同口径。
+        d["metadata_mode"] = _normalize_metadata_mode(d.get("metadata_mode"), d.get("metadata_model"))
         d["kind"] = str(d.get("kind") or "custom").strip().lower()
         if d["kind"] not in {"custom", "real"}:
             d["kind"] = "custom"
@@ -4121,7 +4406,7 @@ class PostgresClient:
         d["active_scheme"] = active_scheme
         created = d.get("created_at")
         d["created_at"] = created.timestamp() if isinstance(created, datetime) else (created or 0)
-        return {k: d.get(k) for k in ("name", "kind", "enabled", "remark", "models", "aliases", "provider_whitelist", "provider_blacklist", "selection_strategy", "backup_group", "response_model", "metadata_model", "metadata", "schemes", "active_scheme", "created_at")}
+        return {k: d.get(k) for k in ("name", "kind", "enabled", "remark", "models", "aliases", "provider_whitelist", "provider_blacklist", "selection_strategy", "backup_group", "response_model", "metadata_model", "metadata_mode", "compress_models", "metadata", "schemes", "active_scheme", "created_at")}
 
     @classmethod
     async def _refresh_model_routing_cache(cls):
@@ -4136,8 +4421,8 @@ class PostgresClient:
     async def _upsert_model_group_on_connection(cls, conn, normalized: dict):
         return await conn.fetchrow(
             """
-            INSERT INTO model_groups(name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata, schemes, active_scheme, created_at, updated_at)
-            VALUES($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, clock_timestamp(), now())
+            INSERT INTO model_groups(name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata_mode, compress_models, metadata, schemes, active_scheme, created_at, updated_at)
+            VALUES($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, $16::jsonb, $17, clock_timestamp(), now())
             ON CONFLICT(name) DO UPDATE SET
                 kind=EXCLUDED.kind,
                 enabled=EXCLUDED.enabled,
@@ -4150,11 +4435,13 @@ class PostgresClient:
                 backup_group=EXCLUDED.backup_group,
                 response_model=EXCLUDED.response_model,
                 metadata_model=EXCLUDED.metadata_model,
+                metadata_mode=EXCLUDED.metadata_mode,
+                compress_models=EXCLUDED.compress_models,
                 metadata=EXCLUDED.metadata,
                 schemes=EXCLUDED.schemes,
                 active_scheme=EXCLUDED.active_scheme,
                 updated_at=now()
-            RETURNING name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata, schemes, active_scheme, created_at
+            RETURNING name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata_mode, compress_models, metadata, schemes, active_scheme, created_at
             """,
             normalized["name"],
             normalized["kind"],
@@ -4168,6 +4455,8 @@ class PostgresClient:
             normalized["backup_model_group"],
             normalized["response_model"],
             normalized["metadata_model"],
+            normalized.get("metadata_mode") or "",
+            cls._dumps(normalized.get("compress_models") or []),
             cls._dumps(normalized["metadata"]),
             cls._dumps(normalized["schemes"]),
             normalized["active_scheme"],
@@ -4176,13 +4465,13 @@ class PostgresClient:
     @classmethod
     async def list_model_groups(cls) -> dict[str, dict]:
         async with cls.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata, schemes, active_scheme, created_at FROM model_groups ORDER BY created_at ASC, name")
+            rows = await conn.fetch("SELECT name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata_mode, compress_models, metadata, schemes, active_scheme, created_at FROM model_groups ORDER BY created_at ASC, name")
         return {row["name"]: cls._model_group_row(row) for row in rows}
 
     @classmethod
     async def get_model_group(cls, name: str) -> dict | None:
         async with cls.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata, schemes, active_scheme, created_at FROM model_groups WHERE name=$1", name)
+            row = await conn.fetchrow("SELECT name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata_mode, compress_models, metadata, schemes, active_scheme, created_at FROM model_groups WHERE name=$1", name)
         return cls._model_group_row(row)
 
     @classmethod
@@ -5477,7 +5766,7 @@ class PostgresClient:
         async with cls.pool.acquire() as conn:
             rows = await conn.fetch("""SELECT k.id, k.key, k.name, k.rate_limit, k.provider_whitelist,
                     k.provider_blacklist, k.editor_provider_whitelist, k.editor_provider_blacklist,
-                    k.model_whitelist, k.model_blacklist, k.selection_strategy,
+                    k.model_whitelist, k.model_blacklist, k.selection_strategy, k.compress_model,
                     k.thinking_config, k.disabled, k.user_id, k.vm_id, k.group_ids, k.parent_id,
                     extract(epoch from k.expires_at) AS expires_at, k.usage_limit, k.version,
                     k.label, k.scope, extract(epoch from k.created_at) AS created_at,
@@ -5517,6 +5806,7 @@ class PostgresClient:
             d["usage_limit"] = {}
             d["group_ids"] = []
             d["selection_strategy"] = DEFAULT_SELECTION_STRATEGY
+            d["compress_model"] = []
             out.append(d)
         return out
 
@@ -5542,7 +5832,7 @@ class PostgresClient:
         for fld in ("rate_limit", "thinking_config", "usage_limit"):
             value = decode_json(d.get(fld), {})
             d[fld] = dict(value) if isinstance(value, dict) else {}
-        for fld in ("provider_whitelist", "provider_blacklist", "model_whitelist", "model_blacklist", "editor_provider_whitelist", "editor_provider_blacklist"):
+        for fld in ("provider_whitelist", "provider_blacklist", "model_whitelist", "model_blacklist", "editor_provider_whitelist", "editor_provider_blacklist", "compress_model"):
             value = decode_json(d.get(fld), [])
             d[fld] = list(value) if isinstance(value, (list, tuple)) else []
         # group_ids 可能不在部分 SELECT 列里（老查询未取该列）；缺失时按空数组处理。
@@ -5751,7 +6041,7 @@ class PostgresClient:
     @classmethod
     async def get_api_key_by_key(cls, key: str) -> dict | None:
         async with cls.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id, key, name, rate_limit, provider_whitelist, provider_blacklist, editor_provider_whitelist, editor_provider_blacklist, model_whitelist, model_blacklist, selection_strategy, thinking_config, disabled, user_id, vm_id, group_ids, parent_id, extract(epoch from expires_at) AS expires_at, usage_limit, version, label, scope FROM api_keys WHERE key=$1", key)
+            row = await conn.fetchrow("SELECT id, key, name, rate_limit, provider_whitelist, provider_blacklist, editor_provider_whitelist, editor_provider_blacklist, model_whitelist, model_blacklist, selection_strategy, compress_model, thinking_config, disabled, user_id, vm_id, group_ids, parent_id, extract(epoch from expires_at) AS expires_at, usage_limit, version, label, scope FROM api_keys WHERE key=$1", key)
         return cls._api_key_row(row) if row else None
 
     @classmethod
@@ -5760,7 +6050,7 @@ class PostgresClient:
             row = await conn.fetchrow(
                 """SELECT id, key, name, rate_limit, provider_whitelist, provider_blacklist,
                     editor_provider_whitelist, editor_provider_blacklist,
-                    model_whitelist, model_blacklist, selection_strategy, thinking_config,
+                    model_whitelist, model_blacklist, selection_strategy, compress_model, thinking_config,
                     disabled, user_id, vm_id, group_ids, parent_id,
                     extract(epoch from expires_at) AS expires_at, usage_limit, version, label, scope
                 FROM api_keys WHERE id=$1""",
@@ -6293,6 +6583,7 @@ class PostgresClient:
         model_whitelist: list[str] | None = None,
         editor_provider_whitelist: list[str] | None = None,
         selection_strategy: str | None = None,
+        compress_model: str | None = None,
     ) -> dict:
         """Clone a parent key for a scoped child and return its plaintext once.
 
@@ -6308,9 +6599,9 @@ class PostgresClient:
         ``usage_limit``, which does roll up and is capped).
 
         ``model_whitelist`` / ``editor_provider_whitelist`` / ``selection_strategy``
-        override the inherited parent values when non-None (task-scope 收窄);
-        None = inherit parent verbatim so editor-scope callers are unaffected.
-        Whitelists are narrowed against the parent (subset; 父为空=不限则原样).
+        / ``compress_model`` override the inherited parent values when non-None
+        (task-scope 收窄); None = inherit parent verbatim so editor-scope callers
+        are unaffected. Whitelists are narrowed against the parent (subset; 父为空=不限则原样).
         """
         scope = (scope or "editor").strip().lower()
         if scope not in ("editor", "task"):
@@ -6394,23 +6685,31 @@ class PostgresClient:
         if child_selection_strategy not in SELECTION_STRATEGIES:
             raise ValueError("不支持的选择策略")
 
+        # 压缩模型（有序列表）与选择策略同族：子 Key 默认继承父，显式提供则覆盖（与 selection_strategy 同口径）。
+        if compress_model is None:
+            child_compress_model = [str(m).strip() for m in (parent.get("compress_model") or []) if str(m).strip()]
+        else:
+            if isinstance(compress_model, str):
+                compress_model = [compress_model] if compress_model.strip() else []
+            child_compress_model = [str(m).strip() for m in (compress_model or []) if str(m).strip()]
+
         child = await conn.fetchrow(
             """INSERT INTO api_keys(
                 key, name, rate_limit, provider_whitelist, provider_blacklist,
                 editor_provider_whitelist, editor_provider_blacklist,
-                model_whitelist, model_blacklist, selection_strategy,
+                model_whitelist, model_blacklist, selection_strategy, compress_model,
                 thinking_config, user_id, parent_id, expires_at, usage_limit,
                 version, label, scope
-            ) VALUES($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11::jsonb,$12,$13,$14,$15::jsonb,1,$16,$17)
+            ) VALUES($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16::jsonb,1,$17,$18)
             RETURNING id, key, name, rate_limit, provider_whitelist, provider_blacklist,
                 editor_provider_whitelist, editor_provider_blacklist,
-                model_whitelist, model_blacklist, selection_strategy, thinking_config,
+                model_whitelist, model_blacklist, selection_strategy, compress_model, thinking_config,
                 disabled, user_id, vm_id, group_ids, parent_id,
                 extract(epoch from expires_at) AS expires_at, usage_limit, version, label, scope""",
             key_value, name, cls._dumps(child_rate_limit), cls._dumps(parent["provider_whitelist"]),
             cls._dumps(parent["provider_blacklist"]), cls._dumps(child_editor_whitelist),
             cls._dumps(parent["editor_provider_blacklist"]),
-            cls._dumps(child_model_whitelist), cls._dumps(parent["model_blacklist"]), child_selection_strategy, cls._dumps(parent["thinking_config"]),
+            cls._dumps(child_model_whitelist), cls._dumps(parent["model_blacklist"]), child_selection_strategy, cls._dumps(child_compress_model), cls._dumps(parent["thinking_config"]),
             parent["user_id"], parent_key_id, child_expires_at, cls._dumps(child_usage_limit),
             name, scope,
         )
@@ -6797,6 +7096,52 @@ class PostgresClient:
         return dict(row) if row else None
 
     @classmethod
+    async def clear_task_provider_thread(cls, task_id: str) -> bool:
+        """Drop a Task's provider-thread binding so the next request re-binds.
+
+        Called when the runtime's provider state is deliberately wiped (a
+        "clear context" restart, i.e. ``load_session=False``). ``restartRuntime
+        (fresh=true)`` runs ``resetRuntimeState`` on the node, so the runtime
+        starts a brand-new provider thread; the platform MUST forget the old one
+        or the next request 403s ("Task API Key 与 provider 会话不匹配") against a
+        thread the runtime no longer has. Resetting the bootstrap flags too lets
+        ``bind_task_provider_thread`` re-arm its ``provider_thread_id IS NULL``
+        guard on the next dispatch. Returns True only when a binding was cleared.
+        """
+        async with cls.pool.acquire() as conn:
+            result = await conn.execute(
+                """UPDATE mc_tasks
+                      SET provider_thread_id=NULL,
+                          first_request_seen=false,
+                          bootstrap_consumed=false,
+                          updated_at=now()
+                    WHERE id=$1::uuid AND deleted_at IS NULL
+                      AND provider_thread_id IS NOT NULL""",
+                str(task_id),
+            )
+        return result == "UPDATE 1"
+        """Disable the current ``scope='task'`` child key of an owned Task.
+
+        The key row is retained (disabled) so historical request-log lineage
+        remains resolvable; only ``Task.api_key_id`` is cleared.
+        """
+        async with cls.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """UPDATE mc_tasks SET api_key_id=NULL, updated_at=now()
+                       WHERE id=$1::uuid AND user_id=$2::uuid AND deleted_at IS NULL
+                       RETURNING api_key_id""",
+                    str(task_id), str(owner_user_id),
+                )
+                if not row or not row["api_key_id"]:
+                    return None
+                await conn.execute(
+                    "UPDATE api_keys SET disabled=true WHERE id=$1",
+                    row["api_key_id"],
+                )
+        return {"task_id": str(task_id), "key_id": row["api_key_id"], "disabled": True}
+
+    @classmethod
     async def disable_task_api_key(cls, task_id: str, owner_user_id: str) -> dict | None:
         """Disable the current ``scope='task'`` child key of an owned Task.
 
@@ -7024,13 +7369,13 @@ class PostgresClient:
             row = await conn.fetchrow(
                 """INSERT INTO api_keys(key, name, rate_limit, provider_whitelist, provider_blacklist,
                     editor_provider_whitelist, editor_provider_blacklist,
-                    model_whitelist, model_blacklist, selection_strategy, thinking_config,
+                    model_whitelist, model_blacklist, selection_strategy, compress_model, thinking_config,
                     usage_limit, expires_at)
-                VALUES($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11::jsonb,
-                    $12::jsonb, CASE WHEN $13::double precision IS NULL THEN NULL ELSE to_timestamp($13::double precision) END)
+                VALUES($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11::jsonb, $12::jsonb,
+                    $13::jsonb, CASE WHEN $14::double precision IS NULL THEN NULL ELSE to_timestamp($14::double precision) END)
                 RETURNING id, key, name, rate_limit, provider_whitelist, provider_blacklist,
                     editor_provider_whitelist, editor_provider_blacklist, model_whitelist,
-                    model_blacklist, selection_strategy, thinking_config, disabled, usage_limit,
+                    model_blacklist, selection_strategy, compress_model, thinking_config, disabled, usage_limit,
                     extract(epoch from expires_at) AS expires_at""",
                 f"sk-{secrets.token_urlsafe(32)}",
                 data.get("name", ""),
@@ -7042,6 +7387,7 @@ class PostgresClient:
                 cls._dumps(data.get("model_whitelist", [])),
                 cls._dumps(data.get("model_blacklist", [])),
                 strategy,
+                cls._dumps([str(m).strip() for m in (data.get("compress_model") or []) if str(m).strip()]),
                 cls._dumps(data.get("thinking_config", {})),
                 cls._dumps(cls._normalize_usage_limit(data.get("usage_limit"))),
                 expires_at,
@@ -7216,6 +7562,7 @@ class PostgresClient:
                         ("provider_whitelist", []), ("provider_blacklist", []),
                         ("editor_provider_whitelist", []), ("editor_provider_blacklist", []),
                         ("model_whitelist", []), ("model_blacklist", []),
+                        ("compress_model", []),
                     )
                 }
                 narrowed = cls._narrow_child_config(
@@ -7226,6 +7573,14 @@ class PostgresClient:
                 ).strip()
                 if strategy not in SELECTION_STRATEGIES:
                     strategy = DEFAULT_SELECTION_STRATEGY
+                # 压缩模型（有序列表）与选择策略同族：显式提供（含空数组=清除）则覆盖，缺省继承父。
+                if data.get("compress_model") is None:
+                    compress_model = parent_json["compress_model"]
+                else:
+                    raw = data["compress_model"]
+                    if isinstance(raw, str):
+                        raw = [raw] if raw.strip() else []
+                    compress_model = [str(m).strip() for m in (raw or []) if str(m).strip()]
                 # rate_limit 不受父子约束（Redis 按单 key 独立计数），子可自定义，缺省继承父。
                 rate_limit = data.get("rate_limit")
                 if not isinstance(rate_limit, dict):
@@ -7235,15 +7590,16 @@ class PostgresClient:
                     """INSERT INTO api_keys(
                         key, name, rate_limit, provider_whitelist, provider_blacklist,
                         editor_provider_whitelist, editor_provider_blacklist,
-                        model_whitelist, model_blacklist, selection_strategy, thinking_config,
+                        model_whitelist, model_blacklist, selection_strategy, compress_model, thinking_config,
                         user_id, vm_id, parent_id, expires_at, usage_limit, version, label, scope
                     ) VALUES($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11::jsonb,
-                        $12,$13,$14,
-                        CASE WHEN $15::double precision IS NULL THEN NULL ELSE to_timestamp($15::double precision) END,
-                        $16::jsonb,1,$17,'copy')
+                        $12::jsonb,
+                        $13,$14,$15,
+                        CASE WHEN $16::double precision IS NULL THEN NULL ELSE to_timestamp($16::double precision) END,
+                        $17::jsonb,1,$18,'copy')
                     RETURNING id, key, name, rate_limit, provider_whitelist, provider_blacklist,
                         editor_provider_whitelist, editor_provider_blacklist,
-                        model_whitelist, model_blacklist, selection_strategy, thinking_config,
+                        model_whitelist, model_blacklist, selection_strategy, compress_model, thinking_config,
                         disabled, user_id, vm_id, group_ids, parent_id,
                         extract(epoch from expires_at) AS expires_at, usage_limit, version, label, scope,
                         extract(epoch from created_at) AS created_at""",
@@ -7257,6 +7613,7 @@ class PostgresClient:
                     cls._dumps(narrowed["model_whitelist"]),
                     cls._dumps(narrowed["model_blacklist"]),
                     strategy,
+                    cls._dumps(compress_model),
                     cls._dumps(parent_json["thinking_config"]),
                     parent["user_id"],
                     parent["vm_id"],
@@ -7276,6 +7633,14 @@ class PostgresClient:
         strategy = str(data.get("selection_strategy") or DEFAULT_SELECTION_STRATEGY).strip()
         if strategy not in SELECTION_STRATEGIES:
             strategy = DEFAULT_SELECTION_STRATEGY
+        # 压缩模型（有序列表）：显式传（含空数组=清除）才覆盖；省略键=保留现值，避免编辑弹窗漏传把它清空。
+        compress_model = data.get("compress_model")
+        if compress_model is None:
+            compress_model = None  # sentinel：不更新
+        else:
+            if isinstance(compress_model, str):
+                compress_model = [compress_model] if compress_model.strip() else []
+            compress_model = [str(m).strip() for m in (compress_model or []) if str(m).strip()]
         async with cls.pool.acquire() as conn:
             async with conn.transaction():
                 current = await conn.fetchrow("SELECT * FROM api_keys WHERE id=$1", int(key_id))
@@ -7334,12 +7699,13 @@ class PostgresClient:
                         provider_blacklist=$4::jsonb, editor_provider_whitelist=$5::jsonb,
                         editor_provider_blacklist=$6::jsonb, model_whitelist=$7::jsonb, model_blacklist=$8::jsonb,
                         selection_strategy=$9, thinking_config=$10::jsonb,
-                        usage_limit=$11::jsonb,
-                        expires_at=CASE WHEN $12::double precision IS NULL THEN NULL ELSE to_timestamp($12::double precision) END
-                    WHERE id=$13
+                        compress_model=COALESCE($11::jsonb, compress_model),
+                        usage_limit=$12::jsonb,
+                        expires_at=CASE WHEN $13::double precision IS NULL THEN NULL ELSE to_timestamp($13::double precision) END
+                    WHERE id=$14
                     RETURNING id, key, name, rate_limit, provider_whitelist, provider_blacklist,
                         editor_provider_whitelist, editor_provider_blacklist, model_whitelist,
-                        model_blacklist, selection_strategy, thinking_config, disabled, parent_id,
+                        model_blacklist, selection_strategy, compress_model, thinking_config, disabled, parent_id,
                         usage_limit, extract(epoch from expires_at) AS expires_at, scope""",
                     data.get("name", ""),
                     cls._dumps(data.get("rate_limit", {})),
@@ -7351,6 +7717,7 @@ class PostgresClient:
                     cls._dumps(model_blacklist),
                     strategy,
                     cls._dumps(data.get("thinking_config", {})),
+                    cls._dumps(compress_model) if compress_model is not None else None,
                     cls._dumps(usage_limit),
                     expires_at,
                     key_id,
@@ -7480,15 +7847,16 @@ class PostgresClient:
                     """INSERT INTO api_keys(
                         key, name, rate_limit, provider_whitelist, provider_blacklist,
                         editor_provider_whitelist, editor_provider_blacklist,
-                        model_whitelist, model_blacklist, selection_strategy,
+                        model_whitelist, model_blacklist, selection_strategy, compress_model,
                         thinking_config, user_id, vm_id, parent_id,
                         expires_at, usage_limit, version, label, scope
-                    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
                     RETURNING id, key, name, disabled, parent_id, expires_at, usage_limit,
                         version, label, scope""",
                     key_value, old["name"], old["rate_limit"], old["provider_whitelist"],
                     old["provider_blacklist"], old["editor_provider_whitelist"], old["editor_provider_blacklist"],
-                    old["model_whitelist"], old["model_blacklist"], old["selection_strategy"], old["thinking_config"], old["user_id"], old["vm_id"],
+                    old["model_whitelist"], old["model_blacklist"], old["selection_strategy"], old["compress_model"],
+                    old["thinking_config"], old["user_id"], old["vm_id"],
                     old["parent_id"], old["expires_at"], old["usage_limit"],
                     int(old["version"] or 1) + 1, old["label"], old["scope"],
                 )
@@ -7535,15 +7903,16 @@ class PostgresClient:
                     """INSERT INTO api_keys(
                         key, name, rate_limit, provider_whitelist, provider_blacklist,
                         editor_provider_whitelist, editor_provider_blacklist,
-                        model_whitelist, model_blacklist, selection_strategy,
+                        model_whitelist, model_blacklist, selection_strategy, compress_model,
                         thinking_config, user_id, vm_id, parent_id,
                         expires_at, usage_limit, version, label, scope
-                    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
                     RETURNING id, key, name, disabled, parent_id, expires_at, usage_limit,
                         version, label, scope""",
                     key_value, old["name"], old["rate_limit"], old["provider_whitelist"],
                     old["provider_blacklist"], old["editor_provider_whitelist"], old["editor_provider_blacklist"],
-                    old["model_whitelist"], old["model_blacklist"], old["selection_strategy"], old["thinking_config"], old["user_id"], old["vm_id"],
+                    old["model_whitelist"], old["model_blacklist"], old["selection_strategy"], old["compress_model"],
+                    old["thinking_config"], old["user_id"], old["vm_id"],
                     old["parent_id"], old["expires_at"], old["usage_limit"],
                     int(old["version"] or 1) + 1, old["label"], old["scope"],
                 )
@@ -8093,14 +8462,23 @@ class PostgresClient:
 
     @classmethod
     async def list_pending_device_code_states(cls) -> list[tuple[str, dict]]:
-        """列出未过期的 pending device_code 任务 → [(state, data)]。走复合索引，不扫全表。"""
+        """列出未过期的 pending 授权任务 → [(state, data)]。走复合索引，不扫全表。
+
+        两类都要轮询：
+        - task_type='device_code'：未迁移的存量设备码 spec（兼容层包装）。
+        - task_type='steps' 且写了 next_poll_at：**异步步骤**——迁移后的 spec 把设备码流
+          包装成步骤（begin_step_auth 返回 step.poll + step_state.poll_params），
+          扫描器继续用它的 poll_device_flow 轮询。同步步骤不写 next_poll_at，天然排除。
+        """
         if not cls.pool:
             return []
         async with cls.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT state, data FROM account_auth_states
-                WHERE task_type = 'device_code' AND status = 'pending' AND expires_at > now()
+                WHERE status = 'pending' AND expires_at > now()
+                  AND (task_type = 'device_code'
+                       OR (task_type = 'steps' AND next_poll_at IS NOT NULL))
                 """
             )
         return [(r["state"], cls._loads_json(r["data"], {})) for r in rows]
@@ -8236,7 +8614,7 @@ class PostgresClient:
                 readonly=True,
             ):
                 group_rows = await conn.fetch(
-                    "SELECT name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata, schemes, active_scheme, created_at "
+                    "SELECT name, kind, enabled, remark, models, aliases, provider_whitelist, provider_blacklist, selection_strategy, backup_group, response_model, metadata_model, metadata_mode, compress_models, metadata, schemes, active_scheme, created_at "
                     "FROM model_groups ORDER BY created_at ASC, name"
                 )
 
@@ -8350,6 +8728,23 @@ class PostgresClient:
     # 下列方法是对这类行的读写入口；custom 路由组不得被这些入口改写——同名 custom 行受保护。
 
     @classmethod
+    def _merge_window_fields(cls, effective: dict, existing_metadata) -> dict:
+        """窗口字段（max_context_tokens / max_tokens）增量保护。
+
+        metadata JSONB 是整块替换（ON CONFLICT SET metadata=EXCLUDED.metadata）：
+        负载没带或为空的窗口字段会被抹成空。这里在替换前把库内旧值回填进负载——
+        负载显式带了有效值才更新，没带就沿用旧值，手填值永不被清空。
+        单条 upsert 与 bulk_upsert 共用（两处必须同一口径）。
+        """
+        old_meta = cls._loads_json(existing_metadata, {})
+        if not isinstance(old_meta, dict):
+            return effective
+        for fld in ("max_context_tokens", "max_tokens"):
+            if not effective.get(fld) and old_meta.get(fld):
+                effective[fld] = old_meta[fld]
+        return effective
+
+    @classmethod
     def _real_metadata_normalized(cls, model_id: str, metadata: dict) -> dict:
         # 渠道标签过滤与方案（schemes）是 real 行的路由配置（顶层列），不属于 metadata
         # JSONB——从负载里摘出来单存；未提供时由调用方决定是否从既有行回填（见
@@ -8364,7 +8759,7 @@ class PostgresClient:
             active_scheme = ""
         payload = {
             str(k): v for k, v in source.items()
-            if str(k) not in {"model_id", "system_id", "id", "provider_whitelist", "provider_blacklist", "schemes", "active_scheme"}
+            if str(k) not in {"model_id", "system_id", "id", "provider_whitelist", "provider_blacklist", "schemes", "active_scheme", "compress_models"}
         }
         # 顶层过滤 = 激活方案投影；负载显式携带顶层对时，写回激活方案（旧单对入口与
         # 方案编辑共用一列，语义是「改当前方案」而非「覆盖投影」）。无方案时用负载对。
@@ -8392,6 +8787,9 @@ class PostgresClient:
             "backup_model_group": "",
             "response_model": "",
             "metadata_model": "",
+            "metadata_mode": "",
+            # 压缩模型候选（顶层列，不进 metadata JSONB，避免污染 /v1/models 源数据）。
+            "compress_models": cls._clean_string_list(source.get("compress_models", [])),
             "metadata": payload,
             "schemes": schemes,
             "active_scheme": active_scheme,
@@ -8410,7 +8808,7 @@ class PostgresClient:
         async with cls.pool.acquire() as conn:
             async with conn.transaction():
                 existing = await conn.fetchrow(
-                    "SELECT kind, provider_whitelist, provider_blacklist, schemes, active_scheme FROM model_groups WHERE name=$1",
+                    "SELECT kind, provider_whitelist, provider_blacklist, schemes, active_scheme, compress_models, metadata FROM model_groups WHERE name=$1",
                     model_id,
                 )
                 if existing is not None and existing["kind"] != "real":
@@ -8419,9 +8817,10 @@ class PostgresClient:
                     )
                 effective = dict(metadata or {})
                 if existing is not None:
-                    for fld in ("provider_whitelist", "provider_blacklist", "schemes", "active_scheme"):
+                    for fld in ("provider_whitelist", "provider_blacklist", "schemes", "active_scheme", "compress_models"):
                         if fld not in effective:
-                            effective[fld] = cls._loads_json(existing[fld], []) if fld == "schemes" else existing[fld]
+                            effective[fld] = cls._loads_json(existing[fld], []) if fld in ("schemes", "compress_models") else existing[fld]
+                    effective = cls._merge_window_fields(effective, existing["metadata"])
                 normalized = cls._real_metadata_normalized(model_id, effective)
                 row = await cls._upsert_model_group_on_connection(conn, normalized)
         return cls._model_group_row(row)
@@ -8514,16 +8913,20 @@ class PostgresClient:
                     if not model_id:
                         continue
                     existing = await conn.fetchrow(
-                        "SELECT kind, provider_whitelist, provider_blacklist, schemes, active_scheme FROM model_groups WHERE name=$1",
+                        "SELECT kind, provider_whitelist, provider_blacklist, schemes, active_scheme, compress_models, metadata FROM model_groups WHERE name=$1",
                         model_id,
                     )
                     if existing is not None and existing["kind"] != "real":
                         continue
                     effective = dict(item)
                     if existing is not None:
-                        for fld in ("provider_whitelist", "provider_blacklist", "schemes", "active_scheme"):
+                        for fld in ("provider_whitelist", "provider_blacklist", "schemes", "active_scheme", "compress_models"):
                             if fld not in effective:
-                                effective[fld] = cls._loads_json(existing[fld], []) if fld == "schemes" else existing[fld]
+                                effective[fld] = cls._loads_json(existing[fld], []) if fld in ("schemes", "compress_models") else existing[fld]
+                        # 窗口字段增量保护：负载没带或为空时沿用库内值——批量导入的条目
+                        # 常常不含窗口（目录来源不提供），整块替换 metadata 会把管理员
+                        # 手填的 max_context_tokens / max_tokens 抹成空。
+                        effective = cls._merge_window_fields(effective, existing["metadata"])
                     normalized = cls._real_metadata_normalized(model_id, effective)
                     await cls._upsert_model_group_on_connection(conn, normalized)
                     written += 1
@@ -8544,13 +8947,23 @@ class PostgresClient:
             upstream_id = (item.get("upstream_model_id") or item.get("upstream") or "").strip()
             model_id = (item.get("model_id") or item.get("model") or upstream_id).strip()
             extra_config = item.get("extra_config") if isinstance(item.get("extra_config"), dict) else {}
+            # 拷贝一份再摘旧键：不要污染调用方传入的请求体 dict。
+            extra_config = dict(extra_config)
             # 行级开关：缺省/None 视为启用（旧客户端与定时同步的 to_add 都不带该字段）。
             enabled = item.get("enabled")
+            # 积分倍率：优先顶层 cost_multiplier（新客户端），回落旧快照键
+            # extra_config._cost_multiplier（旧客户端/旧模板）。两种来源都在此归一，
+            # 并保证旧键不再留在 extra_config 里——独立列是唯一真相源，不留双写副本。
+            multiplier = item.get("cost_multiplier")
+            legacy_multiplier = extra_config.pop("_cost_multiplier", None)
+            if multiplier is None:
+                multiplier = legacy_multiplier
             return {
                 "upstream_model_id": upstream_id,
                 "model_id": model_id or upstream_id,
                 "extra_config": extra_config,
                 "enabled": True if enabled is None else bool(enabled),
+                "cost_multiplier": cls._coerce_cost_multiplier(multiplier),
             }
         if isinstance(item, str):
             # 裸字符串是「上下游同名」的模型 id。必须单独判，否则会落进下面的序列分支：
@@ -8561,6 +8974,7 @@ class PostgresClient:
                 "model_id": model_id,
                 "extra_config": {},
                 "enabled": True,
+                "cost_multiplier": None,
             }
         upstream_id = str(item[0] if len(item) > 0 else "").strip()
         model_id = str(item[1] if len(item) > 1 else upstream_id).strip() or upstream_id
@@ -8569,7 +8983,30 @@ class PostgresClient:
             "model_id": model_id,
             "extra_config": {},
             "enabled": True,
+            "cost_multiplier": None,
         }
+
+    @staticmethod
+    def _coerce_cost_multiplier(value) -> float | None:
+        """倍率列取值：只认数字（含字符串数字）；其余一律写 NULL。
+
+        - None/空串/非数字字符串 → NULL（上游没给、或前端清空了手填框）。
+        - bool 不是倍率（True==1 会把开关误存成 1.0）。
+        - 负数允许落库（上游真给了负数不拦，前端展示时自然显形）。
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+        return None
 
     @staticmethod
     def _optional_int(value) -> int | None:
@@ -8585,7 +9022,7 @@ class PostgresClient:
     async def list_provider_models(cls, provider: str | None = None, lite: bool = False) -> list[dict]:
         if not cls.pool:
             return []
-        fields = "upstream_model_id, model_id" if lite else "provider, upstream_model_id, model_id, extra_config, enabled"
+        fields = "upstream_model_id, model_id" if lite else "provider, upstream_model_id, model_id, extra_config, enabled, cost_multiplier"
         async with cls.pool.acquire() as conn:
             if provider is None:
                 rows = await conn.fetch(
@@ -8616,25 +9053,34 @@ class PostgresClient:
         *,
         extra_config: dict | None = None,
         enabled: bool | None = None,
+        cost_multiplier: float | None = None,
+        cost_multiplier_set: bool = False,
     ) -> None:
         """新增或重命名单行。enabled=None 时不动开关：新行吃列默认（启用），
-        已有行在冲突时保留原 enabled（定时同步改名路径不该重置开关）。"""
+        已有行在冲突时保留原 enabled（定时同步改名路径不该重置开关）。
+
+        cost_multiplier 同理用 cost_multiplier_set 区分「没给」与「清空」：
+        False（缺省）= 不动已有行的倍率、新行落 NULL；True = 显式写入
+        cost_multiplier 的值（可为 None，即前端把手填框清空）。
+        """
         if not cls.pool:
             return
+        set_clause = "" if not cost_multiplier_set else ",\n                    cost_multiplier=EXCLUDED.cost_multiplier"
         async with cls.pool.acquire() as conn:
             await conn.execute(
-                """
-                INSERT INTO provider_models(provider, upstream_model_id, model_id, extra_config, enabled)
-                VALUES($1, $2, $3, $4::jsonb, $5)
+                f"""
+                INSERT INTO provider_models(provider, upstream_model_id, model_id, extra_config, enabled, cost_multiplier)
+                VALUES($1, $2, $3, $4::jsonb, $5, $6)
                 ON CONFLICT(provider, upstream_model_id) DO UPDATE SET
                     model_id=EXCLUDED.model_id,
-                    extra_config=EXCLUDED.extra_config
+                    extra_config=EXCLUDED.extra_config{set_clause}
                 """,
                 provider,
                 upstream_model_id,
                 model_id,
                 cls._dumps(extra_config or {}),
                 True if enabled is None else bool(enabled),
+                cls._coerce_cost_multiplier(cost_multiplier),
             )
 
     @classmethod
@@ -8645,6 +9091,32 @@ class PostgresClient:
             result = await conn.execute(
                 "DELETE FROM provider_models WHERE provider=$1 AND upstream_model_id=$2",
                 provider, upstream_model_id,
+            )
+        return result.endswith("1")
+
+    @classmethod
+    async def update_provider_model_cost_multiplier(
+        cls,
+        provider: str,
+        upstream_model_id: str,
+        cost_multiplier: float | None,
+    ) -> bool:
+        """只更新单行的倍率列（定时同步刷新已入库行用，不碰 extra_config / model_id / enabled）。
+
+        返回是否真的命中一行。行不存在时静默返回 False——定时同步可能与手删竞态。
+        """
+        if not cls.pool:
+            return False
+        async with cls.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE provider_models
+                   SET cost_multiplier = $3
+                 WHERE provider = $1 AND upstream_model_id = $2
+                """,
+                provider,
+                upstream_model_id,
+                cls._coerce_cost_multiplier(cost_multiplier),
             )
         return result.endswith("1")
 
@@ -8662,25 +9134,63 @@ class PostgresClient:
                 continue
             seen.add(upstream_id)
             payloads.append(payload)
+
+        # Check if there are actual changes before proceeding
+        existing_rows = await cls.list_provider_models(provider, lite=False)
+
+        def normalize_row(row):
+            extra_config = row.get('extra_config', {})
+            if not isinstance(extra_config, dict):
+                extra_config = {}
+            return (
+                row['upstream_model_id'],
+                row['model_id'],
+                tuple(sorted(extra_config.items())),
+                row.get('enabled', True),
+                row.get('cost_multiplier'),
+            )
+
+        existing_normalized = {normalize_row(row) for row in existing_rows}
+        new_normalized = {normalize_row(payload) for payload in payloads}
+
+        if existing_normalized == new_normalized:
+            return len(payloads)  # No changes, exit early
+
         async with cls.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM provider_models WHERE provider=$1", provider)
                 for payload in payloads:
                     await conn.execute(
                         """
-                        INSERT INTO provider_models(provider, upstream_model_id, model_id, extra_config, enabled)
-                        VALUES($1, $2, $3, $4::jsonb, $5)
+                        INSERT INTO provider_models(provider, upstream_model_id, model_id, extra_config, enabled, cost_multiplier)
+                        VALUES($1, $2, $3, $4::jsonb, $5, $6)
                         ON CONFLICT(provider, upstream_model_id) DO UPDATE SET
                             model_id=EXCLUDED.model_id,
                             extra_config=EXCLUDED.extra_config,
-                            enabled=EXCLUDED.enabled
+                            enabled=EXCLUDED.enabled,
+                            cost_multiplier=EXCLUDED.cost_multiplier
                         """,
                         provider,
                         payload["upstream_model_id"],
                         payload["model_id"],
                         cls._dumps(payload["extra_config"]),
                         payload.get("enabled", True),
+                        payload.get("cost_multiplier"),
                     )
+                # Bump models_updated_at timestamp since we made actual changes
+                await conn.execute(
+                    """
+                    UPDATE provider_configs
+                    SET config = jsonb_set(
+                            COALESCE(config, '{}'::jsonb),
+                            '{models_updated_at}',
+                            to_jsonb(EXTRACT(EPOCH FROM now())::double precision),
+                            true
+                        )
+                    WHERE name = $1
+                    """,
+                    provider,
+                )
         return len(payloads)
 
     @classmethod
@@ -8714,6 +9224,42 @@ class PostgresClient:
         cfg = json.loads(row) if isinstance(row, str) else dict(row)
         synced = cfg.get("synced_upstream_ids") or []
         return {s for s in synced if isinstance(s, str) and s}
+
+    @classmethod
+    async def touch_provider_models_synced_at(cls, provider: str) -> None:
+        """记录最近一次从上游成功拉取模型列表的时间戳 (Unix seconds)."""
+        await cls._update_provider_timestamp(provider, "models_synced_at")
+
+    @classmethod
+    async def touch_provider_models_updated_at(cls, provider: str) -> None:
+        """记录最近一次模型行集合确实被修改的时间戳 (Unix seconds)."""
+        await cls._update_provider_timestamp(provider, "models_updated_at")
+
+    @classmethod
+    async def _update_provider_timestamp(cls, provider: str, key: str) -> None:
+        """定向改 provider_configs.config 里的单个时间戳键（Unix 秒）。
+
+        用 jsonb_set 只动这一个键，不整覆盖 config——读-改-写会把并发写进 config 的
+        其他键（rate_limit 之外的账号动作配置等）带回复本，定时同步每轮都会踩。
+        不动外层 updated_at：那是渠道「编辑」时间，模型自动同步不该刷它。
+        key 走白名单，绝不来自外部输入。
+        """
+        if not cls.pool or key not in ("models_synced_at", "models_updated_at"):
+            return
+        async with cls.pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                UPDATE provider_configs
+                SET config = jsonb_set(
+                        COALESCE(config, '{{}}'::jsonb),
+                        '{{{key}}}',
+                        to_jsonb(EXTRACT(EPOCH FROM now())::double precision),
+                        true
+                    )
+                WHERE name = $1
+                """,
+                provider,
+            )
 
     @classmethod
     async def set_provider_synced_upstream_ids(cls, provider: str, ids: set[str]) -> None:
@@ -8985,66 +9531,6 @@ class PostgresClient:
             )
             if result and result != "UPDATE 0":
                 logger.info("[migrate] reparented orphan agents to %s: %s", owner, result)
-
-    @classmethod
-    async def migrate_orphan_scheduled_tasks_owner(cls) -> None:
-        """给 user_id IS NULL 的定时任务补归属，否则用户态列表永远看不到它们。
-
-        ``GET /agent/scheduled-tasks`` 用户态会过滤掉 user_id IS NULL 的行（视为
-        平台/管理员行）。AI 经 capability_call 建任务的链路曾不落 user_id，留下一批
-        用户自己看不见、也管不了的孤儿任务。两步补齐：
-
-        1. 有 agent_id 的：按 agents.user_id 补（任务归属跟着 Agent 归属）；
-        2. 仍为 NULL 的（agent_id 也丢了，如早期 CDP 链路）：挂到
-           _ORPHAN_OWNER_USER_ID，与 migrate_orphan_agents_owner 同一约定。
-
-        归属源头修复在 ToolRegistry.owner_user_id（对话传 caller、CDP 传客户端
-        owner）+ add_job 的 Agent owner 兜底，本迁移只清理历史行。
-        """
-        if not cls.pool:
-            return
-        async with cls.pool.acquire() as conn:
-            # 1) 按 Agent 归属补
-            by_agent = await conn.execute(
-                "UPDATE agent_scheduled_tasks t SET user_id=a.user_id "
-                "FROM agents a WHERE t.agent_id=a.id "
-                "AND t.user_id IS NULL AND a.user_id IS NOT NULL"
-            )
-            if by_agent and by_agent != "UPDATE 0":
-                logger.info("[migrate] scheduled tasks reparented by agent owner: %s", by_agent)
-
-            # 2) 剩余孤儿（无 agent_id 或 Agent 本身也是平台 Agent）挂到配置 owner
-            owner = cls._ORPHAN_OWNER_USER_ID
-            # mc_users 由兼容层建表；表不存在（兼容层关闭或建表尚未执行）即按约定
-            # 「owner 不存在则跳过」，不抛 UndefinedTableError 阻断启动。
-            if await conn.fetchval("SELECT to_regclass('public.mc_users')") is None:
-                remaining = await conn.fetchval(
-                    "SELECT COUNT(*) FROM agent_scheduled_tasks WHERE user_id IS NULL"
-                )
-                if remaining:
-                    logger.warning(
-                        "[migrate] %s orphan scheduled tasks remain; mc_users table absent",
-                        remaining,
-                    )
-                return
-            exists = await conn.fetchval(
-                "SELECT 1 FROM mc_users WHERE id::text=$1 AND is_deleted=FALSE", owner
-            )
-            if not exists:
-                remaining = await conn.fetchval(
-                    "SELECT COUNT(*) FROM agent_scheduled_tasks WHERE user_id IS NULL"
-                )
-                if remaining:
-                    logger.warning(
-                        "[migrate] %s orphan scheduled tasks remain; owner %s not in mc_users",
-                        remaining, owner,
-                    )
-                return
-            rest = await conn.execute(
-                "UPDATE agent_scheduled_tasks SET user_id=$1 WHERE user_id IS NULL", owner
-            )
-            if rest and rest != "UPDATE 0":
-                logger.info("[migrate] orphan scheduled tasks reparented to %s: %s", owner, rest)
 
     @classmethod
     async def list_agents_for_caller(

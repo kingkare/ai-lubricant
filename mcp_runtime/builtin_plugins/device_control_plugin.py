@@ -319,6 +319,25 @@ def _tools() -> list[tuple[str, str, dict]]:
                 "properties": {"include_system": {"type": "boolean", "default": False}},
             },
         ),
+        (
+            "get_foreground_app",
+            "返回当前前台 App 的包名（Android=packageName，iOS=bundleId）及可选 activity。"
+            "用于 Agent 判断「现在在哪个 App」——无特权，无障碍窗口状态即数据源。",
+            {"type": "object", "properties": {}},
+        ),
+        (
+            "open_url",
+            "用默认浏览器/处理器打开一个 URL。默认只接受 http/https（自定义 scheme 是攻击面）；"
+            "传 allow_unsafe_schemes=true 显式放开。与 mobile-mcp 的 mobile_open_url 对齐。",
+            {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "allow_unsafe_schemes": {"type": "boolean", "default": False},
+                },
+                "required": ["url"],
+            },
+        ),
     ]
 
 

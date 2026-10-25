@@ -21,6 +21,8 @@ import asyncio
 import base64
 import json
 import time
+import uuid
+from datetime import datetime
 from typing import Any
 
 from loguru import logger
@@ -33,6 +35,7 @@ class ClickHouseUnavailable(RuntimeError):
 _client = None  # ClickHousePayloadClient，由 main.py 生命周期 connect/close
 _lock = asyncio.Lock()  # 序列化同一纳秒内的并发写，保证 version 单调
 _msg_counter: int = 0  # 进程内 message id 计数器，启动时种子化
+_evt_seq: dict[str, int] = {}  # 进程内 per-conversation 时间线 seq，首次用时懒播种
 _ready: bool = False
 
 
@@ -61,6 +64,72 @@ async def seed_message_id() -> None:
         logger.exception("[conversation_store] seed message id failed")
 
 
+async def _next_event_seq(conversation_id: str) -> int:
+    """分配会话内时间线序号（单实例假设，同 seed_message_id）。
+
+    进程内计数器懒播种：首次遇到某会话时按 ``max(seq)`` 起算，之后自增。多实例
+    部署会撞号，与 message id 计数器同样的前提（本服务单实例）。
+    """
+    cid = str(conversation_id)
+    cur = _evt_seq.get(cid)
+    if cur is None:
+        cur = 0
+        try:
+            rows = await _client.query(
+                "SELECT max(seq) AS m FROM agent_message_events WHERE conversation_id = {cid:String}",
+                {"cid": cid},
+            )
+            if rows and rows[0].get("m") is not None:
+                cur = int(rows[0]["m"])
+        except Exception:  # noqa: BLE001 — 表为空/查询失败都从 0 起，绝不断主流程
+            logger.debug("[conversation_store] seq seed failed conv={}", cid, exc_info=True)
+    cur += 1
+    _evt_seq[cid] = cur
+    return cur
+
+
+async def add_message_event(
+    conversation_id: str,
+    *,
+    message_id: int,
+    item_type: str,
+    item: dict,
+    event_kind: str = "",
+    tool_name: str = "",
+    subagent_id: str = "",
+    turn_number: int = 0,
+    status: str = "",
+) -> None:
+    """追加一行时间线事件帧（best-effort：失败只记日志，绝不抛）。
+
+    与 agent_messages 的投影写并行：agent_messages 仍负责分页游标/envelope/LLM
+    上下文/无帧降级，本表是时间线顺序的唯一权威。读侧按 message_id 分组、seq 排序
+    折叠回消息形状（见 _fold_event_timeline）。
+    """
+    if not is_ready():
+        return
+    try:
+        seq = await _next_event_seq(conversation_id)
+        row = [
+            uuid.uuid4().hex,
+            str(conversation_id),
+            int(message_id),
+            seq,
+            str(item_type or "unknown"),
+            json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+            str(event_kind or item_type or ""),
+            str(tool_name or ""),
+            str(subagent_id or ""),
+            int(turn_number or 0),
+            str(status or ""),
+            _now_ch(),
+            seq,  # version == seq：重投同 seq 收敛不重复
+        ]
+        await _client.insert_message_event_row(row)
+    except Exception:  # noqa: BLE001 — 事件帧写失败绝不能中断对话
+        logger.debug("[conversation_store] add_message_event failed conv={}", conversation_id, exc_info=True)
+
+
 def _next_version() -> int:
     """纳秒时间戳作为 version，天然单调。配合 _lock 保证写序。"""
     return time.time_ns()
@@ -78,6 +147,23 @@ def _extract_cdp_client_id(chat_settings: dict | None) -> str | None:
     return v if v else None
 
 
+def _iso_utc(value: Any) -> Any:
+    """naive datetime（ClickHouse DateTime64，语义为 UTC）→ 带 Z 的 ISO 字符串。
+
+    原样 `isoformat()` 输出 `2026-10-05T00:08:44.479`（无时区标记），前端
+    `new Date(...)` 会按**本地时区**解析，于是列表时间差 8 小时。补 `Z` 显式标注
+    UTC，浏览器据此转成本地时间显示。非 datetime（已是字符串/None）原样返回。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        # ClickHouse 驱动返回 naive UTC；已带 tzinfo 的按原样，naive 的补 Z。
+        if value.tzinfo is None:
+            return value.isoformat() + "Z"
+        return value.isoformat()
+    return value
+
+
 def _conv_row_to_dict(row: dict) -> dict:
     """把 ClickHouse 查询行还原成与原 PostgresClient 一致的 dict 形状。"""
     d = dict(row)
@@ -87,6 +173,10 @@ def _conv_row_to_dict(row: dict) -> dict:
             d["chat_settings"] = json.loads(cs)
         except (json.JSONDecodeError, TypeError):
             pass
+    # 时间戳统一补 Z 标 UTC（前端按本地时区显示）。
+    for f in ("created_at", "updated_at"):
+        if f in d:
+            d[f] = _iso_utc(d[f])
     # ReplacingMergeTree 行不含 version 字段对外；移除避免泄露。
     d.pop("version", None)
     return d
@@ -94,13 +184,16 @@ def _conv_row_to_dict(row: dict) -> dict:
 
 def _msg_row_to_dict(row: dict) -> dict:
     d = dict(row)
-    for f in ("tool_calls", "tool_results", "media", "usage"):
+    for f in ("tool_calls", "tool_results", "media", "usage", "subagents"):
         v = d.get(f)
         if isinstance(v, str) and v:
             try:
                 d[f] = json.loads(v)
             except (json.JSONDecodeError, TypeError):
                 pass
+    for f in ("created_at", "updated_at"):
+        if f in d:
+            d[f] = _iso_utc(d[f])
     _sign_media_urls(d)
     d.pop("version", None)
     return d
@@ -163,7 +256,7 @@ async def create_conversation(
     await _client.insert_conversation_row([
         conv_id, title or "新对话", system_prompt or "", model or "",
         llm_model_id, "active", kind, agent_id, user_id, cdp,
-        cs_json, now, now, ver,
+        cs_json, "", "", now, now, ver,
     ])
     return {
         "id": conv_id,
@@ -187,7 +280,8 @@ async def list_conversations(limit: int = 50, kind: str = "agent") -> list[dict]
     rows = await _client.query(
         f"""
         SELECT id, title, system_prompt, model, llm_model_id, status, kind,
-               agent_id, user_id, cdp_client_id, chat_settings, created_at, updated_at
+               agent_id, user_id, cdp_client_id, chat_settings, run_status, run_status_info,
+               created_at, updated_at
         FROM agent_conversations FINAL
         WHERE status = 'active' AND kind = %(kind)s
         ORDER BY updated_at DESC
@@ -214,7 +308,8 @@ async def list_conversations_for_caller(
     rows = await _client.query(
         f"""
         SELECT id, title, system_prompt, model, llm_model_id, status, kind,
-               agent_id, user_id, cdp_client_id, chat_settings, created_at, updated_at
+               agent_id, user_id, cdp_client_id, chat_settings, run_status, run_status_info,
+               created_at, updated_at
         FROM agent_conversations FINAL
         WHERE status = 'active' AND kind = %(kind)s AND user_id = %(uid)s
         ORDER BY updated_at DESC
@@ -269,7 +364,8 @@ async def list_conversations_for_caller_paged(
     rows = await _client.query(
         f"""
         SELECT id, title, system_prompt, model, llm_model_id, status, kind,
-               agent_id, user_id, cdp_client_id, chat_settings, created_at, updated_at
+               agent_id, user_id, cdp_client_id, chat_settings, run_status, run_status_info,
+               created_at, updated_at
         FROM agent_conversations FINAL
         WHERE {' AND '.join(clauses)}
         ORDER BY updated_at DESC, id DESC
@@ -306,7 +402,8 @@ async def list_conversations_admin(
     rows = await _client.query(
         f"""
         SELECT id, title, system_prompt, model, llm_model_id, status, kind,
-               agent_id, user_id, cdp_client_id, chat_settings, created_at, updated_at
+               agent_id, user_id, cdp_client_id, chat_settings, run_status, run_status_info,
+               created_at, updated_at
         FROM agent_conversations FINAL
         WHERE {where}
         ORDER BY updated_at DESC
@@ -324,15 +421,25 @@ async def list_conversations_admin(
 
 
 def _conv_updated_at_str(conv: dict) -> str:
-    """把 updated_at 归一成可比较的字符串（ClickHouse toString 风格），用作游标。"""
+    """把 updated_at 归一成 ClickHouse ``toString`` 风格（'YYYY-MM-DD HH:MM:SS.mmm'）游标。
+
+    输入可能是原始 datetime（未走 ``_conv_row_to_dict`` 的路径），也可能是
+    ``_iso_utc`` 产出的带 ``Z`` 的 ISO 字符串（列表项已被转换）。两者都归一回
+    ClickHouse ``toString`` 格式——游标 SQL 用 ``toString(updated_at) < %(cur)s``
+    比较，格式必须逐字符对齐，否则分页错乱。
+    """
     v = conv.get("updated_at")
     if v is None:
         return ""
-    # ClickHouse 返回 datetime；转成 'YYYY-MM-DD HH:MM:SS.mmm' 字符串以匹配 toString()。
-    try:
+    if isinstance(v, datetime):
         return v.strftime("%Y-%m-%d %H:%M:%S") + f".{v.microsecond // 1000:03d}"
-    except AttributeError:
-        return str(v)
+    # 已是字符串：'2026-10-05T00:08:44.479Z' → '2026-10-05 00:08:44.479'
+    s = str(v)
+    if "T" in s:
+        s = s.replace("T", " ", 1)
+    if s.endswith("Z"):
+        s = s[:-1]
+    return s
 
 
 async def list_conversations_for_cdp_client(
@@ -363,8 +470,8 @@ async def list_conversations_for_cdp_client(
     where = " AND ".join(clauses)
     rows = await _client.query(
         f"""
-        SELECT id, title, system_prompt, model, llm_model_id, status, kind,
-               agent_id, user_id, cdp_client_id, chat_settings, created_at, updated_at
+        SELECT id, title, model, status, kind, agent_id, user_id,
+               cdp_client_id, chat_settings, run_status, run_status_info, created_at, updated_at
         FROM agent_conversations FINAL
         WHERE {where}
         ORDER BY updated_at DESC
@@ -380,7 +487,8 @@ async def get_conversation(conv_id: str) -> dict | None:
     rows = await _client.query(
         """
         SELECT id, title, system_prompt, model, llm_model_id, status, kind,
-               agent_id, user_id, cdp_client_id, chat_settings, created_at, updated_at
+               agent_id, user_id, cdp_client_id, chat_settings, run_status, run_status_info,
+               created_at, updated_at
         FROM agent_conversations FINAL
         WHERE id = %(id)s
         LIMIT 1
@@ -422,7 +530,8 @@ async def delete_conversation(conv_id: str) -> bool:
             conv.get("model", ""), conv.get("llm_model_id"), "deleted",
             conv.get("kind", "agent"), conv.get("agent_id"), conv.get("user_id"),
             _extract_cdp_client_id(cs) if isinstance(cs, dict) else None,
-            cs_json, conv.get("created_at", now), now, ver,
+            cs_json, conv.get("run_status", ""), conv.get("run_status_info", ""),
+            conv.get("created_at", now), now, ver,
         ])
     return True
 
@@ -430,7 +539,8 @@ async def delete_conversation(conv_id: str) -> bool:
 async def update_conversation(conv_id: str, **fields) -> dict:
     """更新 = 读当前行 + 写一行带新字段、version=now 的副本。"""
     await _require()
-    allowed = {"title", "system_prompt", "model", "status", "llm_model_id", "chat_settings"}
+    allowed = {"title", "system_prompt", "model", "status", "llm_model_id", "chat_settings",
+               "run_status", "run_status_info"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     conv = await get_conversation(conv_id)
     if conv is None:
@@ -438,6 +548,14 @@ async def update_conversation(conv_id: str, **fields) -> dict:
     if not updates:
         return conv
     conv.update(updates)
+    # 同 update_message：agent_conversations 里 title/system_prompt/model/status/kind
+    # 都是非 Nullable String，调用方传 None 会绕过 .get 的默认值直接把 None 带进
+    # insert 行。llm_model_id/agent_id/user_id/cdp_client_id 是 Nullable，保持原样。
+    for _k, _default in (("title", ""), ("system_prompt", ""), ("model", ""),
+                         ("status", "active"), ("kind", "agent"), 
+                         ("run_status", ""), ("run_status_info", "")):
+        if conv.get(_k) is None:
+            conv[_k] = _default
     async with _lock:
         ver = _next_version()
         now = _now_ch()
@@ -449,7 +567,8 @@ async def update_conversation(conv_id: str, **fields) -> dict:
             conv.get("status", "active"), conv.get("kind", "agent"),
             conv.get("agent_id"), conv.get("user_id"),
             _extract_cdp_client_id(cs) if isinstance(cs, dict) else None,
-            cs_json, conv.get("created_at", now), now, ver,
+            cs_json, conv.get("run_status", ""), conv.get("run_status_info", ""),
+            conv.get("created_at", now), now, ver,
         ])
     return conv
 
@@ -467,6 +586,7 @@ async def add_message(
     model: str = "",
     usage: dict | None = None,
     reasoning: str = "",
+    subagents=None,
 ) -> dict:
     await _require()
     global _msg_counter
@@ -479,10 +599,22 @@ async def add_message(
     tr = json.dumps(tool_results, ensure_ascii=False) if tool_results else ""
     md = json.dumps(media, ensure_ascii=False) if media else ""
     us = json.dumps(usage, ensure_ascii=False) if usage else ""
+    sa = json.dumps(subagents, ensure_ascii=False) if subagents else ""
     await _client.insert_message_row([
         msg_id, conversation_id, role, content, tc, tr, turn_number,
-        status, error, md, model, us, reasoning or "", now, ver,
+        status, error, md, model, us, reasoning or "", sa, now, ver,
     ])
+    # user 消息也进时间线：一条 user_input 帧，让事件日志自足（回放整段会话不必再
+    # 拼 agent_messages）。assistant 帧由 ConversationTurnWriter 逐事件追加。
+    if role == "user" and content:
+        await add_message_event(
+            conversation_id,
+            message_id=msg_id,
+            item_type="user_input",
+            item={"type": "user_input", "text": content},
+            event_kind="user_input",
+            turn_number=turn_number,
+        )
     return {
         "id": msg_id,
         "conversation_id": conversation_id,
@@ -497,8 +629,97 @@ async def add_message(
         "model": model,
         "usage": usage or None,
         "reasoning": reasoning or "",
+        "subagents": subagents or None,
         "created_at": now,
     }
+
+
+async def _fold_event_timeline(conversation_id: str, rows: list[dict]) -> list[dict]:
+    """把消息行的 ``content/reasoning/tool_calls/tool_results`` 由事件帧重放覆盖。
+
+    返回的行与 `_msg_row_to_dict` 产出的同形（只覆盖这四个字段），其余 envelope
+    （role/status/error/model/usage/media/subagents）原样保留。
+
+    安全阀：按 ``message_id`` 分组的帧与投影的 tool_call id 序列对不上（长度或 id 不同）
+    → 判定该消息帧不完整（部分写丢失），**保留投影原样**。这保证 CH 写不全时读到的是
+    今天的行为，而不是截断后的正文。无帧消息（老数据 / CH 故障）同样原样返回。
+    """
+    if not rows:
+        return rows
+    try:
+        from agent.turn_writer import fold_frames_to_fields
+        frames_by_msg: dict[int, list[dict]] = {}
+        # 逐条消息拉帧（message_id 在排序键前缀，是范围扫描不是全会话扫描）。一页
+        # 共享一个 limit 会把最新一轮的帧从 seq 尾部**静默截掉**——实测 841 一轮
+        # 4766 帧、页共享 5000 上限截掉尾部，折叠出的正文比投影短，刷新后最后一段
+        # 文本消失。单条上限 20000（热轮远达不到），截断由下方长度闸门兜底退投影。
+        for r in rows:
+            if r.get("role") != "assistant":
+                continue
+            for f in await _client.query_message_events(
+                conversation_id, message_ids=[int(r["id"])], limit=20000
+            ):
+                # 读侧是行形状（item_json = JSON 字符串），折叠吃的是事件 dict：这里
+                # 解析成 {"item": ...} 交给 fold。漏了这步 fold 拿不到任何 item → 每条
+                # 消息的 content/reasoning 被折成空串（text-only 行的完整性闸门形同虚设），
+                # 时间线等于把正文吃了。解析失败按「无帧」处理，退投影。
+                try:
+                    item = json.loads(f.get("item_json") or "null")
+                except Exception:  # noqa: BLE001 — 单帧坏了不该拖垮整页
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                frames_by_msg.setdefault(int(f["message_id"]), []).append({"item": item})
+    except Exception:  # noqa: BLE001 — 折叠只服务显示，失败退回投影（=今天的行为）
+        logger.debug("[conversation_store] fold query failed conv={}", conversation_id, exc_info=True)
+        return rows
+    if not frames_by_msg:
+        return rows
+
+    out: list[dict] = []
+    for row in rows:
+        # 只折叠 assistant 行：时间线交织描述的是「模型这一轮想了什么、说了什么、做了
+        # 什么」。user 行的正文就是它自己的内容，若把只含 user_input 帧的集合折进去
+        # （apply 无 user_input 分支）会把正文清空。
+        if row.get("role") != "assistant":
+            out.append(row)
+            continue
+        frames = frames_by_msg.get(int(row["id"]))
+        if not frames:
+            out.append(row)
+            continue
+        folded = fold_frames_to_fields(frames)
+        proj_calls = row.get("tool_calls") or []
+        fold_calls = folded.get("tool_calls") or []
+        # 完整性闸门（两道）：
+        # ① id 序列必须一致（折叠必须重现投影里的每次工具调用）；
+        # ② 折叠出的 content/reasoning 长度不得短于投影——帧查询有 limit，热轮
+        #    （几千帧）被截断时 tool_call 恰好都在前面、id 闸门发现不了，只有
+        #    正文长度暴露截断。不比对长度就会把「截断后的正文」当成真值写回，
+        #    用户刷新后最后一段文本消失（实测：841 一轮 4766 帧，5000 共享上限
+        #    截掉尾部 → content 2333→489）。
+        if (
+            len(proj_calls) != len(fold_calls)
+            or any(str(a.get("id")) != str(b.get("id")) for a, b in zip(proj_calls, fold_calls))
+            or len(folded.get("content") or "") < len(row.get("content") or "")
+            or len(folded.get("reasoning") or "") < len(row.get("reasoning") or "")
+        ):
+            logger.warning(
+                "[conversation_store] fold/misalignment msg={} proj_calls={} fold_calls={} "
+                "proj_content={} fold_content={} proj_reasoning={} fold_reasoning={}; keeping projection",
+                row.get("id"), len(proj_calls), len(fold_calls),
+                len(row.get("content") or ""), len(folded.get("content") or ""),
+                len(row.get("reasoning") or ""), len(folded.get("reasoning") or ""),
+            )
+            out.append(row)
+            continue
+        merged = dict(row)
+        merged["content"] = folded["content"]
+        merged["reasoning"] = folded["reasoning"]
+        merged["tool_calls"] = folded["tool_calls"] or None
+        merged["tool_results"] = folded["tool_results"] or None
+        out.append(merged)
+    return out
 
 
 async def get_messages_page_by_user_turns(
@@ -506,8 +727,13 @@ async def get_messages_page_by_user_turns(
     *,
     limit: int = 7,
     cursor: int | None = None,
+    timeline: bool = False,
 ) -> dict:
-    """按用户轮次分页消息；cursor 是较新一页最早的 user message id。"""
+    """按用户轮次分页消息；cursor 是较新一页最早的 user message id。
+
+    ``timeline=True`` 时按事件帧折叠（显示端点用），``False`` 保持今天行为（分页游标
+    测试 / LLM 上下文 / retry 种子用）。
+    """
     await _require()
     page_size = max(1, min(int(limit), 50))
     params: dict[str, Any] = {"cid": conversation_id, "limit": page_size + 1}
@@ -538,45 +764,51 @@ async def get_messages_page_by_user_turns(
     rows = await _client.query(
         f"""
         SELECT id, conversation_id, role, content, tool_calls, tool_results,
-               turn_number, status, error, media, model, usage, reasoning, created_at
+               turn_number, status, error, media, model, usage, reasoning, subagents, created_at
         FROM agent_messages FINAL
         WHERE conversation_id = %(cid)s AND id >= %(oldest)s AND status != 'deleted' {upper_clause}
         ORDER BY id ASC
         """,
         message_params,
     )
+    dict_rows = [_msg_row_to_dict(row) for row in rows]
+    if timeline:
+        dict_rows = await _fold_event_timeline(conversation_id, dict_rows)
     return {
-        "messages": [_msg_row_to_dict(row) for row in rows],
+        "messages": dict_rows,
         "page": {"next_cursor": oldest_user_id if has_more else None, "has_more": has_more},
     }
 
 
-async def get_messages(conversation_id: str) -> list[dict]:
+async def get_messages(conversation_id: str, *, timeline: bool = False) -> list[dict]:
     await _require()
     rows = await _client.query(
         """
         SELECT id, conversation_id, role, content, tool_calls, tool_results,
-               turn_number, status, error, media, model, usage, reasoning, created_at
+               turn_number, status, error, media, model, usage, reasoning, subagents, created_at
         FROM agent_messages FINAL
         WHERE conversation_id = %(cid)s AND status != 'deleted'
         ORDER BY id ASC
         """,
         {"cid": conversation_id},
     )
-    return [_msg_row_to_dict(r) for r in rows]
+    dict_rows = [_msg_row_to_dict(r) for r in rows]
+    if timeline:
+        dict_rows = await _fold_event_timeline(conversation_id, dict_rows)
+    return dict_rows
 
 
 async def update_message(message_id: int, **fields) -> None:
     """更新消息 = 读旧行 + 写新 version 副本（带新字段）。"""
     await _require()
-    allowed = {"content", "tool_calls", "tool_results", "status", "error", "turn_number", "media", "model", "usage", "reasoning"}
+    allowed = {"content", "tool_calls", "tool_results", "status", "error", "turn_number", "media", "model", "usage", "reasoning", "subagents"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
     rows = await _client.query(
         """
         SELECT id, conversation_id, role, content, tool_calls, tool_results,
-               turn_number, status, error, media, model, usage, reasoning, created_at
+               turn_number, status, error, media, model, usage, reasoning, subagents, created_at
         FROM agent_messages FINAL
         WHERE id = %(id)s
         LIMIT 1
@@ -587,17 +819,29 @@ async def update_message(message_id: int, **fields) -> None:
         return
     msg = _msg_row_to_dict(rows[0])
     msg.update(updates)
+    # agent_messages 除 error 外全部列都是非 Nullable（建表见 integrations/
+    # clickhouse.py:436）。而调用方表达「清空这个字段」的写法就是传 None——两条重试
+    # 路径都传 model=None/error=None/usage=None。显式传了 None 的键是**存在**的，
+    # 下面 msg.get(k, default) 的默认值根本不参与，None 会一路带进 insert 行，
+    # ClickHouse 直接 DataError: Invalid None value in non-Nullable column。
+    # 这里按列类型归一；error 是 Nullable(String)，None 合法，不动。
+    msg["content"] = msg.get("content") or ""
+    msg["status"] = msg.get("status") or "done"
+    msg["model"] = msg.get("model") or ""
+    if msg.get("turn_number") is None:
+        msg["turn_number"] = 0
     async with _lock:
         ver = _next_version()
     tc = json.dumps(msg.get("tool_calls"), ensure_ascii=False) if msg.get("tool_calls") else ""
     tr = json.dumps(msg.get("tool_results"), ensure_ascii=False) if msg.get("tool_results") else ""
     md = json.dumps(msg.get("media"), ensure_ascii=False) if msg.get("media") else ""
     us = json.dumps(msg.get("usage"), ensure_ascii=False) if msg.get("usage") else ""
+    sa = json.dumps(msg.get("subagents"), ensure_ascii=False) if msg.get("subagents") else ""
     await _client.insert_message_row([
         int(msg["id"]), msg["conversation_id"], msg["role"], msg.get("content", ""),
         tc, tr, msg.get("turn_number", 0), msg.get("status", "done"),
         msg.get("error"), md, msg.get("model", ""), us, msg.get("reasoning", "") or "",
-        msg.get("created_at", _now_ch()), ver,
+        sa, msg.get("created_at", _now_ch()), ver,
     ])
 
 
@@ -633,7 +877,7 @@ async def delete_message(message_id: int) -> bool:
     rows = await _client.query(
         """
         SELECT id, conversation_id, role, content, tool_calls, tool_results,
-               turn_number, status, error, media, model, usage, reasoning, created_at
+               turn_number, status, error, media, model, usage, reasoning, subagents, created_at
         FROM agent_messages FINAL
         WHERE id = %(id)s
         LIMIT 1
@@ -650,7 +894,7 @@ async def delete_message(message_id: int) -> bool:
     await _client.insert_message_row([
         int(msg["id"]), msg["conversation_id"], msg["role"], "",
         "", "", msg.get("turn_number", 0), "deleted",
-        None, "", "", "", "", msg.get("created_at", _now_ch()), ver,
+        None, "", "", "", "", "", msg.get("created_at", _now_ch()), ver,
     ])
     return True
 
@@ -703,5 +947,6 @@ async def touch_conversation(conv_id: str) -> None:
             conv.get("status", "active"), conv.get("kind", "agent"),
             conv.get("agent_id"), conv.get("user_id"),
             _extract_cdp_client_id(cs) if isinstance(cs, dict) else None,
-            cs_json, conv.get("created_at", now), now, ver,
+            cs_json, conv.get("run_status", ""), conv.get("run_status_info", ""),
+            conv.get("created_at", now), now, ver,
         ])

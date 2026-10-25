@@ -21,6 +21,7 @@ from .project_service import IssueTransitionError, project_service
 from .routes_editors import (
     CreateEditorReq,
     CreateSessionReq,
+    UpdateEditorReq,
     _create_editor_session_core,
     _redact_editor,
     _redact_sessions,
@@ -128,7 +129,6 @@ class AssignIssueReq(BaseModel):
     cli_name: str | None = None
     mode: str | None = None
     mode_label: str | None = None
-    mode_capability_snapshot: dict | None = None
     git_identity_id: str | None = None
     assignee_id: str | None = None
     # 创建任务弹框里的可编辑内容和任务类型；服务端仍按 issue 类型校验角色映射。
@@ -137,15 +137,11 @@ class AssignIssueReq(BaseModel):
     sub_type: str | None = None
     task_type: str | None = None
     branch: str | None = None
-    skill_ids: list[str] | None = None
     parent_api_key_id: int | None = None
     usage_limit: dict | None = None
     expires_at: float | None = None
     expected_client_id: str | None = None
     bootstrap_content: str | None = None
-    skill_config: list[dict] | None = None
-    mcp_config: list[dict] | None = None
-    plugin_config: list[dict] | None = None
 
 
 class ConfirmIssueReq(BaseModel):
@@ -157,7 +153,6 @@ class ConfirmIssueReq(BaseModel):
     cli_name: str | None = None
     mode: str | None = None
     mode_label: str | None = None
-    mode_capability_snapshot: dict | None = None
     git_identity_id: str | None = None
     parent_api_key_id: int | None = None
     usage_limit: dict | None = None
@@ -173,6 +168,7 @@ async def list_projects(
     page: int = Query(1, ge=1),
     page_size: int = Query(24, ge=1, le=200),
 ) -> dict:
+    """分页列出当前用户可见的项目，并批量附带每行的编辑器摘要与计数。"""
     result = await project_service.list_projects(
         str(user.id), role=user.role, page=page, page_size=page_size
     )
@@ -197,6 +193,11 @@ async def list_projects(
 async def create_project(
     body: CreateProjectReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """创建项目。
+
+    项目名称必填，缺失返回 400。创建成功后异步发起技术栈识别（fire-and-forget，
+    不阻塞响应），并写一条 project.create 审计记录。
+    """
     try:
         result = await project_service.create_project(
             str(user.id), body.model_dump(exclude_none=True)
@@ -216,6 +217,7 @@ async def create_project(
 
 @router.get("/{project_id}")
 async def get_project(project_id: str, user: User = Depends(get_current_user)) -> dict:
+    """获取单个项目详情；不存在或无权访问返回 404。"""
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在或无权访问")
@@ -254,6 +256,7 @@ async def rescan_project_stack(
 async def update_project(
     project_id: str, body: UpdateProjectReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """更新项目基本信息。需要写权限，否则返回 404。"""
     ok = await project_service.update_project(
         str(user.id), project_id, body.model_dump(exclude_none=True), role=user.role
     )
@@ -271,6 +274,11 @@ async def update_project(
 async def delete_project(
     project_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除项目。
+
+    仅项目所有者可删；非所有者或项目不存在返回 404。级联清理由 project_service
+    负责，本接口只记一条 project.delete 审计。
+    """
     ok = await project_service.delete_project(str(user.id), project_id, role=user.role)
     if not ok:
         raise HTTPException(status_code=404, detail="项目不存在或非所有者")
@@ -283,6 +291,7 @@ async def delete_project(
 
 @router.get("/{project_id}/editors")
 async def list_project_editors(project_id: str, user: User = Depends(get_current_user)) -> list[dict]:
+    """列出项目下的全部编辑器，每个编辑器附带其会话列表（密钥与敏感字段已脱敏）。"""
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在或无权访问")
@@ -296,11 +305,13 @@ async def list_project_editors(project_id: str, user: User = Depends(get_current
 async def create_project_editor_plural(
     project_id: str, body: CreateEditorReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """创建项目编辑器（复数路径），与 POST /{project_id}/editor 同一实现。"""
     return await create_project_editor(project_id, body, request, user)
 
 
 @router.get("/{project_id}/editors/{editor_id}")
 async def get_project_editor_detail(project_id: str, editor_id: str, user: User = Depends(get_current_user)) -> dict:
+    """获取项目下指定编辑器的详情及其会话列表（脱敏）。"""
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     editor = await PostgresClient.get_project_editor_by_id(editor_id, project_id) if project else None
     if not editor:
@@ -311,6 +322,11 @@ async def get_project_editor_detail(project_id: str, editor_id: str, user: User 
 
 @router.post("/{project_id}/editors/{editor_id}/duplicate")
 async def duplicate_project_editor(project_id: str, editor_id: str, request: Request, user: User = Depends(get_current_user)) -> dict:
+    """在项目下复制指定编辑器（含配置，不复制会话）。
+
+    需要项目写权限；源编辑器不存在返回 404，复制冲突（如命名超限）抛
+    ValueError 映射为 409。成功记 project.editor.duplicate 审计。
+    """
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     if project is None or project.get("access_role") not in ("owner", "read_write"):
         raise HTTPException(status_code=404, detail="项目不存在或无写权限")
@@ -326,6 +342,11 @@ async def duplicate_project_editor(project_id: str, editor_id: str, request: Req
 
 @router.delete("/{project_id}/editors/{editor_id}")
 async def delete_project_editor(project_id: str, editor_id: str, request: Request, user: User = Depends(get_current_user)) -> dict:
+    """删除项目下的指定编辑器。
+
+    需要项目写权限；编辑器不存在返回 404。会话与运行时由 close_editor 清理，
+    删除动作记 project.editor.delete 审计。
+    """
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     if project is None or project.get("access_role") not in ("owner", "read_write"):
         raise HTTPException(status_code=404, detail="项目不存在或无写权限")
@@ -360,6 +381,7 @@ async def create_project_editor_session_plural(
 
 @router.get("/{project_id}/editor")
 async def get_project_editor(project_id: str, user: User = Depends(get_current_user)) -> dict:
+    """获取项目的（单例）编辑器配置；未配置时 editor 为 null。"""
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在或无权访问")
@@ -377,6 +399,12 @@ async def create_project_editor(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """为项目创建编辑器并（若指定 prompt_id）尽力写入提示词文件。
+
+    需要项目写权限；body.project_id 与路径不一致返回 400，参数非法抛
+    ValueError 映射为 400。提示词文件写入失败不阻断创建（保存配置时仍会重试
+    并上报）。创建动作记 project.editor.create 审计。
+    """
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     if project is None or project.get("access_role") not in ("owner", "read_write"):
         raise HTTPException(status_code=404, detail="项目不存在或无写权限")
@@ -413,6 +441,7 @@ async def create_project_editor(
 
 @router.get("/{project_id}/editor/sessions")
 async def list_project_editor_sessions(project_id: str, user: User = Depends(get_current_user)) -> list[dict]:
+    """列出项目编辑器的全部会话（脱敏），未配置编辑器时返回空列表。"""
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在或无权访问")
@@ -432,6 +461,13 @@ async def update_project_editor(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """更新项目编辑器配置并把提示词写回工作目录。
+
+    需要项目写权限；项目未配置编辑器返回 404，编辑器当前不可修改返回 409。
+    prompt_id 变更时同步改写工作目录的 CLAUDE.md/AGENTS.md，结果以
+    config_resync 上报（写文件失败如实列入 failed，不阻断更新）。
+    更新动作记 project.editor.update 审计。
+    """
     project = await project_service.get_project(str(user.id), project_id, role=user.role)
     if project is None or project.get("access_role") not in ("owner", "read_write"):
         raise HTTPException(status_code=404, detail="项目不存在或无写权限")
@@ -531,6 +567,7 @@ async def get_tree_blob(
     ref: str = Query("", description="分支/引用"),
     user: User = Depends(get_current_user),
 ) -> dict:
+    """读取仓库中单个文件的内容（按 ref/分支解析）；不存在或无权访问返回 404。"""
     blob = await project_service.get_blob(
         str(user.id), project_id, role=user.role, path=path, ref=ref
     )
@@ -547,6 +584,7 @@ async def get_tree(
     path: str = Query("", description="路径"),
     user: User = Depends(get_current_user),
 ) -> list[dict]:
+    """列出仓库目录树；recursive 为真时递归展开，path 限定子目录。"""
     entries = await project_service.get_tree(
         str(user.id), project_id, role=user.role, ref=ref, path=path, recursive=recursive
     )
@@ -573,6 +611,7 @@ async def list_submodules(
 # ---- Collaborators --------------------------------------------------------
 @router.get("/{project_id}/collaborators")
 async def list_collaborators(project_id: str, user: User = Depends(get_current_user)) -> list[dict]:
+    """列出项目的协作者及其角色。"""
     rows = await project_service.list_collaborators(str(user.id), project_id, role=user.role)
     if rows is None:
         raise HTTPException(status_code=404, detail="项目不存在或无权访问")
@@ -583,6 +622,11 @@ async def list_collaborators(project_id: str, user: User = Depends(get_current_u
 async def add_collaborator(
     project_id: str, body: AddCollaboratorReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """为项目添加协作者。
+
+    仅项目所有者可加；用户 ID 非法抛 ValueError 映射为 400，非所有者返回 404。
+    role 缺省为只读；成功记 project.add_collaborator 审计。
+    """
     try:
         collab = await project_service.add_collaborator(
             str(user.id), project_id, body.user_id, body.role or "read_only", role=user.role
@@ -603,6 +647,7 @@ async def add_collaborator(
 async def remove_collaborator(
     project_id: str, target_user_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """移除项目协作者。仅所有者可删；协作者不存在或非所有者返回 404。"""
     ok = await project_service.remove_collaborator(
         str(user.id), project_id, target_user_id, role=user.role
     )
@@ -619,6 +664,7 @@ async def remove_collaborator(
 # ---- Associations ---------------------------------------------------------
 @router.get("/{project_id}/associations")
 async def list_associations(project_id: str, user: User = Depends(get_current_user)) -> list[dict]:
+    """列出项目关联的其他项目（关联/引用关系）。"""
     rows = await project_service.list_associations(str(user.id), project_id, role=user.role)
     if rows is None:
         raise HTTPException(status_code=404, detail="项目不存在或无权访问")
@@ -629,6 +675,7 @@ async def list_associations(project_id: str, user: User = Depends(get_current_us
 async def add_association(
     project_id: str, body: AddAssociationReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """新建与另一项目的关联。仅所有者可加；参数非法返回 400，非所有者返回 404。"""
     try:
         assoc = await project_service.add_association(
             str(user.id),
@@ -659,6 +706,7 @@ async def add_association(
 async def remove_association(
     project_id: str, target_project_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除与目标项目的关联。仅所有者可删；关联不存在或非所有者返回 404。"""
     ok = await project_service.remove_association(
         str(user.id), project_id, target_project_id, role=user.role
     )
@@ -682,6 +730,11 @@ async def list_issues(
     priority: int | None = Query(None),
     assigned_to_me: bool = Query(False),
 ) -> list[dict]:
+    """列出项目下的 Issue（需求/缺陷），可按类型、状态、优先级筛选。
+
+    assigned_to_me 为真时只返回指派给当前用户的条目；筛选参数不合法抛
+    ValueError 映射为 400。项目不存在或无权访问返回 404。
+    """
     try:
         rows = await project_service.list_issues(
             str(user.id), project_id, role=user.role,
@@ -703,6 +756,7 @@ async def list_issues(
 async def create_issue(
     project_id: str, body: CreateIssueReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """在项目下创建 Issue（需求或缺陷）。缺标题或分配者返回 400，无写权限返回 404。"""
     try:
         issue = await project_service.create_issue(
             str(user.id), project_id, body.model_dump(exclude_none=True), role=user.role
@@ -727,6 +781,8 @@ async def create_issue(
 async def update_issue(
     project_id: str, issue_id: str, body: UpdateIssueReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """部分更新 Issue，含状态流转。非法流转抛 IssueTransitionError 映射为 400，
+    Issue 不存在或无写权限返回 404。"""
     try:
         ok = await project_service.update_issue(
             str(user.id), project_id, issue_id, body.model_dump(exclude_none=True), role=user.role
@@ -751,6 +807,11 @@ async def assign_issue(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """分配 Issue 为执行任务：选择节点/模型等参数并派生会话，推动状态流转。
+
+    状态不允许当前操作抛 IssueTransitionError 映射为 409；节点缺失/无权/被占用
+    抛 ValueError 映射为 409；Issue 不存在或无写权限返回 404。
+    """
     try:
         result = await project_service.assign_issue(
             str(user.id), project_id, issue_id,
@@ -815,6 +876,11 @@ async def confirm_issue(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """确认 Issue：按 approve 批准或驳回，可随 start_task 直接起任务。
+
+    状态不允许当前操作抛 IssueTransitionError 映射为 409；节点缺失/无权/被占用
+    抛 ValueError 映射为 409；Issue 不存在或无写权限返回 404。
+    """
     try:
         result = await project_service.confirm_issue(
             str(user.id), project_id, issue_id,
@@ -846,6 +912,7 @@ async def confirm_issue(
 async def list_comments(
     project_id: str, issue_id: str, user: User = Depends(get_current_user)
 ) -> list[dict]:
+    """列出指定 Issue 下的评论（按创建时间排序）。"""
     rows = await project_service.list_comments(str(user.id), project_id, issue_id, role=user.role)
     if rows is None:
         raise HTTPException(status_code=404, detail="项目/Issue 不存在或无权访问")
@@ -856,6 +923,7 @@ async def list_comments(
 async def add_comment(
     project_id: str, issue_id: str, body: AddCommentReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """为 Issue 添加评论。评论内容为空返回 400，项目/Issue 不存在或无写权限返回 404。"""
     try:
         comment = await project_service.add_comment(
             str(user.id), project_id, issue_id, body.model_dump(exclude_none=True), role=user.role

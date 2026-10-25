@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Ai Lubricant 平台分层架构图：业务层 / 能力层 / 数据层 / 技术层，右侧贯穿安全治理与可观测。">
+<title>Ai Lubricant · 分层架构图</title>
+<style>
+:root{
+  --font-sans:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  --font-mono:"JetBrains Mono","Cascadia Code",Consolas,monospace;
+  --bg:#f6f7f9;--bg-card:#fff;--border:#e2e5ea;--border-strong:#cfd5de;
+  --text:#1f2530;--text-muted:#68707d;
+  --accent:#2f6fed;--accent-soft:#e9f0fd;--accent-2:#7a5cf5;
+  --code-bg:#f1f3f7;--code-border:#e2e5ea;
+  --biz:#5b8def;--cap:#7a5cf5;--dat:#1f9d6b;--tec:#64748b;
+  --biz-bg:#eef3fe;--cap-bg:#f1eeff;--dat-bg:#eaf8f1;--tec-bg:#eef1f5;
+  --table-alt:#fafbfc;
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 6px 24px rgba(16,24,40,.06);
+}
+html[data-theme="dark"]{
+  --bg:#0e1218;--bg-card:#161c26;--border:#28303f;--border-strong:#3a4457;
+  --text:#d7dce4;--text-muted:#8b94a4;
+  --accent:#5c8bf5;--accent-soft:#1a2540;--accent-2:#9b82ff;
+  --code-bg:#11161f;--code-border:#28303f;
+  --biz:#6f9bff;--cap:#9b82ff;--dat:#3fc98a;--tec:#94a3b8;
+  --biz-bg:#141d33;--cap-bg:#1a1733;--dat-bg:#12291f;--tec-bg:#1a2029;
+  --table-alt:#1b222e;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 28px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font-sans);font-size:15px;line-height:1.7}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.86em;background:var(--code-bg);border:1px solid var(--code-border);border-radius:4px;padding:1px 5px}
+.wrap{display:flex;min-height:100vh;max-width:1440px;margin:0 auto}
+
+.sidebar{width:200px;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto;background:#1b2130;color:#c3cad6;padding:22px 0 40px}
+html[data-theme="dark"] .sidebar{background:#0b0f16;border-right:1px solid var(--border)}
+.brand{display:flex;align-items:center;gap:11px;padding:0 20px 18px;font-size:15px;font-weight:700;color:#fff}
+.brand .dot{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;font-weight:800;font-size:14px}
+.sidebar nav a{display:flex;align-items:center;gap:9px;padding:7px 20px;color:#aeb6c4;font-size:13.5px;border-left:3px solid transparent}
+.sidebar nav a:hover{background:#242b3c;color:#fff;text-decoration:none}
+.sidebar nav a.active{background:#242b3c;color:#fff;border-left-color:var(--accent)}
+.main{flex:1;min-width:0}
+.topbar{position:sticky;top:0;z-index:30;display:flex;justify-content:flex-end;gap:10px;padding:10px 26px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(9px);border-bottom:1px solid var(--border)}
+.topbar button{border:1px solid var(--border);background:var(--bg-card);color:var(--text);padding:6px 13px;border-radius:8px;font-size:13px;cursor:pointer;font-family:var(--font-sans)}
+.topbar button:hover{border-color:var(--accent);color:var(--accent)}
+.content{max-width:1180px;margin:0 auto;padding:34px 40px 120px}
+
+h1{font-size:29px;margin:6px 0 4px;letter-spacing:-.5px}
+.page-sub{color:var(--text-muted);margin:0 0 30px;font-size:14px}
+h2{font-size:21px;margin:44px 0 6px;padding-bottom:9px;border-bottom:1px solid var(--border)}
+h2+p.lead{margin-top:10px}
+.lead{color:var(--text-muted);font-size:14px}
+
+/* ===== 分层架构图 ===== */
+.arch{background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:22px;box-shadow:var(--shadow);overflow-x:auto}
+.arch-grid{display:grid;grid-template-columns:minmax(0,1fr) 168px;gap:14px;align-items:stretch}
+.stack{display:flex;flex-direction:column;gap:10px}
+.layer{border:1.5px solid;border-radius:13px;padding:13px 16px 15px;display:flex;gap:14px;align-items:flex-start}
+.layer.biz{border-color:var(--biz);background:var(--biz-bg)}
+.layer.cap{border-color:var(--cap);background:var(--cap-bg)}
+.layer.dat{border-color:var(--dat);background:var(--dat-bg)}
+.layer.tec{border-color:var(--tec);background:var(--tec-bg)}
+.layer-name{flex:0 0 88px;text-align:center;font-weight:800;font-size:15px;padding-top:2px;letter-spacing:.5px;line-height:1.4}
+.layer.biz .layer-name{color:var(--biz)}
+.layer.cap .layer-name{color:var(--cap)}
+.layer.dat .layer-name{color:var(--dat)}
+.layer.tec .layer-name{color:var(--tec)}
+.layer-name small{display:block;font-size:10.5px;font-weight:600;color:var(--text-muted);letter-spacing:0;margin-top:2px;font-family:var(--font-mono)}
+.cells{flex:1;display:flex;flex-wrap:wrap;gap:8px}
+.cell{background:var(--bg-card);border:1px solid var(--border);border-radius:9px;padding:8px 11px;flex:1 1 auto;min-width:124px}
+.cell .cn{display:block;font-size:13.3px;font-weight:700;margin-bottom:2px}
+.cell .cd{font-size:11.6px;color:var(--text-muted);line-height:1.5;font-family:var(--font-mono)}
+.cell.wide{flex:1 1 220px}
+.down{display:flex;justify-content:center;color:var(--text-muted);font-size:13px;line-height:1;margin:-2px 0}
+
+/* 右侧贯穿 */
+.pillar{border:1.5px solid var(--accent-2);border-radius:13px;background:color-mix(in srgb,var(--accent-soft) 55%,var(--bg-card));padding:13px 12px;display:flex;flex-direction:column}
+.pillar .pn{font-size:14px;font-weight:800;color:var(--accent-2);text-align:center;margin-bottom:2px}
+.pillar .ps{font-size:10.5px;color:var(--text-muted);text-align:center;margin-bottom:11px;font-family:var(--font-mono)}
+.pillar .pl{display:flex;flex-direction:column;gap:7px;flex:1}
+.pill{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:6px 9px;font-size:12.2px;font-weight:600;text-align:center}
+.pill small{display:block;font-size:10.5px;font-weight:400;color:var(--text-muted);font-family:var(--font-mono);margin-top:1px}
+
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin:14px 0 0;font-size:12px;color:var(--text-muted)}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-1px;border:1px solid var(--border-strong)}
+.legend .b1{background:var(--biz-bg);border-color:var(--biz)}
+.legend .b2{background:var(--cap-bg);border-color:var(--cap)}
+.legend .b3{background:var(--dat-bg);border-color:var(--dat)}
+.legend .b4{background:var(--tec-bg);border-color:var(--tec)}
+.legend .b5{background:var(--accent-soft);border-color:var(--accent-2)}
+
+.table-wrap{overflow-x:auto;margin:14px 0;border:1px solid var(--border);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:13.6px}
+th,td{border-bottom:1px solid var(--border);padding:9px 13px;text-align:left;vertical-align:top}
+th{background:var(--accent-soft);font-weight:600;white-space:nowrap}
+tbody tr:nth-child(even){background:var(--table-alt)}
+tbody tr:last-child td{border-bottom:none}
+.note{border-radius:10px;padding:12px 16px;margin:16px 0 0;border:1px solid var(--border);background:var(--bg-card);font-size:13.5px;color:var(--text-muted)}
+.note b{color:var(--text)}
+footer{margin-top:48px;padding-top:22px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}
+@media (max-width:980px){.arch-grid{grid-template-columns:1fr}.pillar{order:5}}
+@media (max-width:920px){.sidebar{display:none}.content{padding:24px 18px 90px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<aside class="sidebar">
+  <div class="brand"><span class="dot">A</span> Ai Lubricant</div>
+  <nav style="margin-top:8px">
+    <a href="#arch">分层架构</a>
+    <a href="#ports">端口</a>
+    <a href="#repos">仓库</a>
+  </nav>
+</aside>
+
+<main class="main">
+<div class="topbar">
+  <button id="theme-toggle" type="button">☾ 深色</button>
+  <button id="print-page" type="button">⎙ 打印</button>
+</div>
+
+<article class="content">
+
+<h1>Ai Lubricant 分层架构图</h1>
+<p class="page-sub">业务层 → 能力层 → 数据层 → 技术层，自上而下逐层支撑；安全治理与可观测贯穿全层。依据 <code>README.md</code>、<code>main.py</code>、<code>docker-compose.yml</code>。</p>
+
+<!-- ===================== 分层架构 ===================== -->
+<h2 id="arch">分层架构</h2>
+
+<div class="arch">
+  <div class="arch-grid">
+    <div class="stack">
+
+      <!-- 业务层 -->
+      <div class="layer biz">
+        <div class="layer-name">业务层<small>用户可见</small></div>
+        <div class="cells">
+          <div class="cell"><span class="cn">模型中转</span><span class="cd">OpenAI / Anthropic 兼容接口</span></div>
+          <div class="cell"><span class="cn">Agent 任务</span><span class="cd">对话 · 定时 · 子任务</span></div>
+          <div class="cell"><span class="cn">编辑器接入</span><span class="cd">Claude Code / Codex / OpenCode / Cursor / Gemini CLI</span></div>
+          <div class="cell"><span class="cn">代码 Review</span><span class="cd">PR 自动审查</span></div>
+          <div class="cell"><span class="cn">测试平台</span><span class="cd">需求 → 用例 → 报告</span></div>
+          <div class="cell"><span class="cn">远程节点</span><span class="cd">终端 · 主机 · 文件 · 出口</span></div>
+          <div class="cell"><span class="cn">内网穿透</span><span class="cd">frp / cloudflared / nps</span></div>
+          <div class="cell"><span class="cn">浏览器控制</span><span class="cd">真实 Chrome + CDP</span></div>
+          <div class="cell"><span class="cn">手机控制</span><span class="cd">Android · iPhone</span></div>
+          <div class="cell"><span class="cn">移动端 App</span><span class="cd">iOS / Android</span></div>
+          <div class="cell"><span class="cn">邮箱</span><span class="cd">只读 MCP</span></div>
+          <div class="cell wide"><span class="cn">生态与市场</span><span class="cd">MCP · 技能 · 插件 · 渠道模板 · 提示词 · GitHub 榜单资源中心</span></div>
+        </div>
+      </div>
+
+      <div class="down">▼ 调用</div>
+
+      <!-- 能力层 -->
+      <div class="layer cap">
+        <div class="layer-name">能力层<small>平台能力</small></div>
+        <div class="cells">
+          <div class="cell"><span class="cn">统一模型网关</span><span class="cd">渠道适配 · 协议转换 · 智能选路 · 九种冻结 · 双层限流 · 用量归一</span></div>
+          <div class="cell"><span class="cn">Agent 运行时</span><span class="cd">工作流 · 调度 · 记忆 · SOP · 资源授权</span></div>
+          <div class="cell"><span class="cn">测试执行引擎</span><span class="cd">确定性 · 步骤分发 · 断言 · 变量</span></div>
+          <div class="cell"><span class="cn">MCP 运行时</span><span class="cd">SSE 网关 · 内置插件 · 实例绑定</span></div>
+          <div class="cell"><span class="cn">通道服务</span><span class="cd">节点控制面 · 设备驱动 · CDP 桥 · 隧道运行时</span></div>
+          <div class="cell"><span class="cn">认证与凭据</span><span class="cd">密码镜像 · TOTP · Cookie 收割 · 步骤认证</span></div>
+          <div class="cell"><span class="cn">通知</span><span class="cd">钉钉 / 飞书 / 企微 / webhook / 推送</span></div>
+          <div class="cell"><span class="cn">资源与分发</span><span class="cd">附件存储 · 资源镜像 · Git 分发</span></div>
+        </div>
+      </div>
+
+      <div class="down">▼ 读写</div>
+
+      <!-- 数据层 -->
+      <div class="layer dat">
+        <div class="layer-name">数据层<small>存储</small></div>
+        <div class="cells">
+          <div class="cell"><span class="cn">PostgreSQL 16</span><span class="cd">主数据 · 表前缀 mc_ · 测试域 mc_test_*</span></div>
+          <div class="cell"><span class="cn">Redis 7</span><span class="cd">缓存 · 限流计数 · 锁 · 租约</span></div>
+          <div class="cell"><span class="cn">ClickHouse 24</span><span class="cd">可选 · payload 双写</span></div>
+          <div class="cell"><span class="cn">文件目录</span><span class="cd">记忆 · 工作区 · 附件 · 镜像 · 日志</span></div>
+        </div>
+      </div>
+
+      <div class="down">▼ 运行于</div>
+
+      <!-- 技术层 -->
+      <div class="layer tec">
+        <div class="layer-name">技术层<small>技术栈</small></div>
+        <div class="cells">
+          <div class="cell"><span class="cn">Python 3.11 · FastAPI</span><span class="cd">asyncio · uvicorn · CORS / GZip</span></div>
+          <div class="cell"><span class="cn">Tortoise ORM</span><span class="cd">asyncpg · UUID 主键</span></div>
+          <div class="cell"><span class="cn">协议</span><span class="cd">OpenAI · Anthropic · MCP · CDP · SSE</span></div>
+          <div class="cell"><span class="cn">通道</span><span class="cd">MV3 扩展 · go-ios · Android APK · h2c</span></div>
+          <div class="cell"><span class="cn">调度与日志</span><span class="cd">APScheduler · cron · loguru</span></div>
+          <div class="cell"><span class="cn">部署</span><span class="cd">Docker Compose · bind mount · 创空间单容器</span></div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 右侧贯穿 -->
+    <div class="pillar">
+      <div class="pn">安全治理</div>
+      <div class="ps">贯穿全层</div>
+      <div class="pl">
+        <div class="pill">API Key 生命周期<small>真正失效 · 子Key归并</small></div>
+        <div class="pill">凭据哈希存储</div>
+        <div class="pill">MCP 保护<small>绑实例 · 审批 · 吊销</small></div>
+        <div class="pill">节点 TOTP 封存 + 审批</div>
+        <div class="pill">审计日志</div>
+        <div class="pill">请求级观测</div>
+        <div class="pill">限流与配额</div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="legend">
+    <span><i class="b1"></i>业务层</span>
+    <span><i class="b2"></i>能力层</span>
+    <span><i class="b3"></i>数据层</span>
+    <span><i class="b4"></i>技术层</span>
+    <span><i class="b5"></i>安全治理（贯穿）</span>
+  </div>
+</div>
+
+<div class="note"><b>部署形态</b>能力层跑在三个进程里：主服务 <code>main.py</code>（:8001→宿主 :3006）、节点控制面 <code>node_server</code>（:8003）、隧道运行时 <code>tunnel_server</code>（仅内网）；同一镜像靠启动命令区分，主服务等另两者健康后才启动。Agent 能力随主服务进程运行，无独立 Agent 进程。</div>
+
+<!-- ===================== 端口 ===================== -->
+<h2 id="ports">端口</h2>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:150px">端口</th><th>归属进程</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>3006</code></td><td>主服务</td><td>Web 入口（容器内 <code>:8001</code>）：门户 <code>/console</code>、管理端 <code>/manager</code>、兼容接口、MCP</td></tr>
+<tr><td><code>8003</code></td><td>节点控制面</td><td>节点连入 + 内部调用，不当网页访问</td></tr>
+<tr><td><code>58160/udp</code></td><td>主服务</td><td>局域网发现广播应答</td></tr>
+<tr><td><code>15432 / 6479</code></td><td>PostgreSQL / Redis</td><td>宿主机调试映射，仅本机</td></tr>
+<tr><td><code>8123 / 9000</code></td><td>ClickHouse</td><td>可选，<code>--profile clickhouse</code></td></tr>
+<tr><td>不对外</td><td>隧道运行时</td><td>仅 Compose 内网可达</td></tr>
+</tbody></table></div>
+
+<!-- ===================== 仓库 ===================== -->
+<h2 id="repos">仓库边界</h2>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:230px">目录</th><th>作用</th><th style="width:110px">来源</th></tr></thead>
+<tbody>
+<tr><td><code>server/</code> <code>agent/</code> <code>providers/</code> <code>limits/</code> 等</td><td>主数据服务、模型聚合、Agent、限流计费、管理 API</td><td>本仓 BSL 1.1</td></tr>
+<tr><td><code>node_server/</code></td><td>独立节点控制面</td><td>独立仓库</td></tr>
+<tr><td><code>nodes/</code></td><td>节点客户端与运行时</td><td>独立仓库</td></tr>
+<tr><td><code>user-frontend/</code></td><td>用户门户前端</td><td>独立仓库</td></tr>
+<tr><td><code>mobile/</code></td><td>移动端工程</td><td>独立仓库</td></tr>
+<tr><td><code>device-control/</code></td><td>设备控制 MCP 与移动设备协议</td><td>独立仓库</td></tr>
+</tbody></table></div>
+
+<footer>
+  测试平台分层架构与流程图见 <a href="./ai-testing-platform/architecture-diagram.html">AI 测试平台 架构图</a>。
+</footer>
+
+</article>
+</main>
+</div>
+
+<script>
+(function(){
+  var root=document.documentElement;
+  var t=document.getElementById('theme-toggle');
+  var saved=null;try{saved=localStorage.getItem('platform-arch-theme')}catch(e){}
+  if(saved){root.setAttribute('data-theme',saved);}
+  else if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches){root.setAttribute('data-theme','dark');}
+  function sync(){t.textContent=root.getAttribute('data-theme')==='dark'?'☀ 浅色':'☾ 深色';}
+  sync();
+  t.addEventListener('click',function(){
+    var next=root.getAttribute('data-theme')==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('platform-arch-theme',next);}catch(e){}
+    sync();
+  });
+  document.getElementById('print-page').addEventListener('click',function(){window.print()});
+  var links=[].slice.call(document.querySelectorAll('.sidebar nav a'));
+  var targets=links.map(function(a){return document.querySelector(a.getAttribute('href'))}).filter(Boolean);
+  function onScroll(){
+    var y=window.scrollY+140,cur=null;
+    targets.forEach(function(el){if(el.offsetTop<=y)cur=el;});
+    links.forEach(function(a){a.classList.toggle('active',cur&&a.getAttribute('href')=='#'+cur.id);});
+  }
+  window.addEventListener('scroll',onScroll,{passive:true});
+  onScroll();
+})();
+</script>
+</body>
+</html>

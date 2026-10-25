@@ -145,8 +145,10 @@ def _install_common(monkeypatch, states: dict):
     monkeypatch.setattr(admin, "_del_account_auth_state", del_state)
     monkeypatch.setattr(admin, "_log_operation", log_op)
     monkeypatch.setattr(admin, "_merge_saved_account_for_auth", lambda acc, _cfg: dict(acc))
+    monkeypatch.setattr(admin, "_read_proxies", lambda: [])
     monkeypatch.setattr(admin, "_resolve_account_proxy", lambda *_a, **_k: None)
     monkeypatch.setattr(admin, "_resolve_account_url_prefix", lambda *_a, **_k: None)
+    monkeypatch.setattr(admin, "_resolve_account_proxy_config_id", lambda *_a, **_k: "")
     monkeypatch.setattr(admin, "_provider_extra", lambda *_a, **_k: {})
 
 
@@ -181,7 +183,8 @@ def _device_provider(rec: _Recorder, *, accepts_context: bool = True):
 
 
 def test_device_code_mode_skips_callback_probe(monkeypatch):
-    """声明 mode=device_code 就直接走设备码，不再先撞一次 callback 的 501。"""
+    """声明 mode=device_code 直接走设备码，不撞 callback 的 501；
+    统一模型下对外包装成「异步步骤」（mode='steps' + step.poll）。"""
     states: dict = {}
     rec = _Recorder()
     _install_common(monkeypatch, states)
@@ -196,10 +199,12 @@ def test_device_code_mode_skips_callback_probe(monkeypatch):
         request, "Bearer t"))
 
     assert rec.calls == ["begin_device_flow"]      # callback 钩子一次都没调
-    assert result["mode"] == "device_code"
-    assert result["poll_status"] is True
-    assert "redirect_uri" not in result           # device_code 不回传回调地址
+    # 对外统一成步骤形态：设备码被包装成一个异步步骤
+    assert result["mode"] == "steps"
+    assert result["step"]["poll"]["interval"] == 3
+    assert result["step"]["auth_url"] == "https://up.example/auth"
     stored = states[result["state"]]
+    # 内部状态机仍是 device_code（扫描器不动）
     assert stored["task_type"] == "device_code"
     assert stored["poll_params"] == {"t": "1"}
     assert stored["auth_context"]["origin"] == "https://panel.example.com"
@@ -236,7 +241,8 @@ def test_legacy_single_arg_device_hook_still_called(monkeypatch):
     result = asyncio.run(admin.start_provider_account_auth("demo", {"account": {}}, request, "Bearer t"))
 
     assert rec.calls == ["begin_device_flow"]
-    assert result["mode"] == "device_code"
+    assert result["mode"] == "steps"
+    assert result["step"]["poll"]["interval"] == 3
 
 
 def test_callback_mode_skips_device_flow_and_returns_redirect_uri(monkeypatch):
@@ -269,7 +275,8 @@ def test_callback_mode_skips_device_flow_and_returns_redirect_uri(monkeypatch):
     assert rec.calls == ["build_account_auth_start"]   # 不碰设备码
     expected = "https://panel.example.com/admin/providers/demo/accounts/auth/callback"
     assert result["redirect_uri"] == expected
-    assert expected in result["auth_url"]              # 渠道拿到的就是框架拼的那份
+    assert result["mode"] == "steps"                   # 回调式也被包成步骤
+    assert expected in result["step"]["auth_url"]      # 渠道拿到的就是框架拼的那份
     assert rec.contexts[0]["callback_url"] == expected
 
 
@@ -285,7 +292,7 @@ def test_missing_mode_keeps_legacy_501_probe(monkeypatch):
     result = asyncio.run(admin.start_provider_account_auth("demo", {"account": {}}, request, "Bearer t"))
 
     assert rec.calls == ["build_account_auth_start", "begin_device_flow"]
-    assert result["mode"] == "device_code"
+    assert result["mode"] == "steps"
 
 
 def test_non_501_callback_error_propagates(monkeypatch):
@@ -389,8 +396,8 @@ def test_replay_authorized_completes_account(monkeypatch):
 
     assert result["ok"] is True
     assert result["status"] == "completed"
-    assert result["username"] == "neo"
-    assert persisted and persisted[0][1]["username"] == "neo"
+    assert result["account"]["user_name"] == "neo"
+    assert persisted == []           # 不自动落库：前端回填表单后用户手动保存
 
 
 def test_replay_first_stage_returns_pending(monkeypatch):
@@ -618,7 +625,8 @@ def test_replay_legacy_hook_without_url_param_still_works(monkeypatch):
     result = asyncio.run(admin.replay_provider_account_auth(
         "demo", {"callback_url": "http://x/oauth/callback?code=c"}, "Bearer t"))
     assert result["status"] == "completed"
-    assert persisted and persisted[0][1]["username"] == "neo"
+    assert result["account"]["user_name"] == "neo"
+    assert persisted == []           # 不自动落库
 
 
 def test_loopback_no_pending_sessions_returns_neutral_page(monkeypatch):
@@ -733,8 +741,9 @@ def _stub_finalize_deps(monkeypatch) -> list:
     return persisted
 
 
-def test_loopback_authorized_finalizes_account(monkeypatch):
-    """第二阶段：渠道换到凭证 → authorized → 直接落库 + completed。"""
+def test_loopback_authorized_marks_completed_without_persisting(monkeypatch):
+    """第二阶段：渠道换到凭证 → authorized → 标记 completed + 存 account_data，
+    **不自动落库**（前端回填表单后用户手动保存）。"""
     states: dict = {}
 
     class Provider:
@@ -763,10 +772,20 @@ def test_loopback_authorized_finalizes_account(monkeypatch):
     assert resp.status_code == 200
     body = resp.body.decode()
     assert "授权成功" in body
-    assert persisted and persisted[0][1]["username"] == "neo"
+    assert persisted == []                       # 不自动落库
     assert states["s1"]["status"] == "completed"
     assert states["s1"]["completed"] is True
-    assert states["s1"]["account"]["username"] == "neo"
+    assert states["s1"]["account_data"]["user_name"] == "neo"
+    # 回归（用户报「autoclaw 认证成功但没回填新增账号输入框」）：spec 只给 user_name，
+    # 统一模型下 account_data 不再经 _finalize_authorized_auth 归一，必须在这里补出
+    # username —— 前端按 acc.username 判空，缺了就把整块回填跳掉。
+    assert states["s1"]["account_data"]["username"] == "neo"
+    # 响应回传的 account 同样要带 username
+    assert admin._normalize_auth_account_data({"user_name": "neo", "password": "p"})["username"] == "neo"
+    assert admin._normalize_auth_account_data({"user_name": "neo"})["username"] == "neo"
+    # 已有 username 不被覆盖；一个都没有时**不编造**（不写 f"{provider}-user" 假名）
+    assert admin._normalize_auth_account_data({"username": "kept"})["username"] == "kept"
+    assert "username" not in admin._normalize_auth_account_data({"whatever": 1})
 
 
 def test_finalize_authorized_auth_is_idempotent(monkeypatch):
@@ -784,8 +803,9 @@ def test_finalize_authorized_auth_is_idempotent(monkeypatch):
     assert persisted == []          # 幂等：不重复落库
 
 
-def test_scanner_authorized_finalizes_without_status_poll(monkeypatch):
-    """扫描器拿到 authorized 就在原地完成落库——不再依赖前端继续查 /auth/status。"""
+def test_scanner_authorized_marks_completed_without_persisting(monkeypatch):
+    """扫描器拿到 authorized → 标记 completed + 存 account_data，**不自动落库**：
+    account_data 回传前端回填表单，用户核对确认后手动保存。"""
 
     class Provider:
         async def poll_device_flow(self, poll_params, auth_context=None):
@@ -812,8 +832,8 @@ def test_scanner_authorized_finalizes_without_status_poll(monkeypatch):
 
     assert record["status"] == "completed"
     assert record["completed"] is True
-    assert record["account"]["username"] == "neo"
-    assert persisted and persisted[0][1]["username"] == "neo"
+    assert record["account_data"]["user_name"] == "neo"
+    assert persisted == []          # 不自动落库：等前端确认保存
 
 
 # ==================== 回调落地页（成功页倒计时 / 返回首页 / 注入防护）====================

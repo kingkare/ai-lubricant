@@ -1,43 +1,56 @@
 """服务端（数据服务/控制面/Tunnel Runtime）发行版本目录。
 
-与节点/移动端/设备控制三条线同构但有一处本质差异：**服务端没有二进制资产要
-托管**。节点程序要传 tar.gz 进独立发行仓库、移动端要传 APK，服务端的一版就是
-一个 git tag——部署机 ``git clone --branch <tag>`` 即得全套代码（前端 dist 已
-随库发布，见 ``script/publish_github.sh`` 第 0.5 步）。
+与节点/移动端/设备控制三条线**完全同构**：publish 打 tag 时把版本信息写成
+``server-releases/version.json`` 提交进市场仓；本模块定时从市场仓拉取并缓存到
+PostgreSQL，让升级卡片不必每次都打 GitHub。
 
-因此本模块不渲染 version.json 到市场仓库、不碰 GitHub Releases，只做两件事：
+``version.json`` 形状（写入侧 publish_github.sh 产出）::
 
-1. **登记**：管理员在市场管理「服务端」线新建版本时选定 git tag + 写备注，
-   条目落 ``marketplace_items``（module=``server-versions``），与其余三条线共用
-   同一张表与同一套 CRUD/校验/发布机制。
-2. **快照**：本进程内存 + ``app_config.server_release_snapshot`` 缓存"当前已
-   登记的最新版本"，供管理端升级卡片读取。**登记即门槛**——publish 只是把 tag
-   推上 GitHub 当源料，登记了用户才看得见，升级再要一次显式确认。
+    {
+      "schema": "ai-lubricant.server-release/v1",
+      "version": "v260912",
+      "version_notes": "...",
+      "release_tag": "v260912",
+      "download_url": "https://github.com/wuxin-gh/ai-lubricant/releases/download/v260912/ai-lubricant-v260912.tar.gz",
+      "digest": "sha256:...",
+      "size_bytes": 25165824,
+      "updated_at": "..."
+    }
 
-与另三条线的关键区别：消费侧（升级卡片）读的是**本模块的内存快照**而非
-GitHub raw，所以登记后无需等 CDN 传播；``apply_release`` 由 publisher 在同进程
-调用（与 node/mobile 同款），多实例经 ``runtime_sync`` 广播后从 DB 重载。
+**发布即推送**：打了 tag 就等于发布（用户侧下次轮询就能看到），中间没有"登记"
+这道人工闸门——与节点/移动端同款。要"发了但不推给用户"时用 draft 语义（不写
+version.json）。
+
+升级包放在**主仓自己的 Release**（不另建发行仓）：包是主仓产物，放主仓语义最顺。
 """
 from __future__ import annotations
 
 import asyncio
 import copy
 import datetime as _dt
+import json
 import os
 from typing import Any
 
+import aiohttp
 from loguru import logger
 
 from db import PostgresClient
+from user_platform.marketplace import config as mp_config
 
 SNAPSHOT_KEY = "server_release_snapshot"
+MAX_FILE_BYTES = 64 * 1024
+FETCH_TIMEOUT_SECONDS = 20
+DEFAULT_SYNC_SECONDS = 600
 
 _lock = asyncio.Lock()
 _snapshot: dict[str, Any] = {
     "version": "",
     "version_notes": "",
     "release_tag": "",
-    "repo_url": "",
+    "download_url": "",
+    "digest": "",
+    "size_bytes": 0,
     "updated_at": "",
     "stale": True,
 }
@@ -58,19 +71,14 @@ async def load_snapshot() -> None:
 
 
 async def get_latest_release() -> dict[str, Any]:
-    """返回当前已登记的版本快照（或空骨架）。永远不抛。"""
+    """返回当前缓存的最新版本（或空骨架）。永远不抛。"""
     return copy.deepcopy(_snapshot)
 
 
 async def apply_release(release: dict[str, Any], *, publish: bool = True) -> dict[str, Any]:
-    """立即应用市场写侧刚登记的版本，避免等待定时同步。
+    """立即应用写侧刚生成的版本信息（publish 脚本同进程场景）。
 
-    与另三条线同款语义：登记完成后已拿到权威 payload，直接写 PG + 内存，多实例经
-    runtime_sync 广播后从 DB 重载。本模块不做 GitHub 校验（无资产可校验）——tag
-    的合法性由登记时的 GitHub 标签列表接口保证（见 ``server_upgrade.list_release_tags``）。
-
-    **空 payload 表示「当前无已登记版本」**（最新那条被改回 draft 或删除）：此时
-    写空骨架而不是保留旧值——否则升级卡片会一直推荐一个已被撤回的版本。
+    空 payload（version 为空）= 清空快照，撤回最新版后升级卡片不再推荐它。
     """
     global _snapshot
     version = str(release.get("version") or "").strip()
@@ -79,7 +87,9 @@ async def apply_release(release: dict[str, Any], *, publish: bool = True) -> dic
         "version": version,
         "version_notes": str(release.get("version_notes") or ""),
         "release_tag": str(release.get("release_tag") or version),
-        "repo_url": str(release.get("repo_url") or ""),
+        "download_url": str(release.get("download_url") or ""),
+        "digest": str(release.get("digest") or ""),
+        "size_bytes": int(release.get("size_bytes") or 0),
         "updated_at": release.get("updated_at") or now,
         "stale": False,
         "fetched_at": now,
@@ -95,8 +105,10 @@ async def apply_release(release: dict[str, Any], *, publish: bool = True) -> dic
     return copy.deepcopy(_snapshot)
 
 
-async def reload_from_db() -> None:
-    await load_snapshot()
+def _raw_url() -> str:
+    from user_platform.marketplace import urls
+
+    return urls.consumer_raw_url("server-releases/version.json")
 
 
 def _clean_version(value: Any) -> str:
@@ -109,8 +121,7 @@ def server_upgrade_status(
 ) -> dict[str, Any]:
     """计算服务端当前/最新/是否可升级。
 
-    版本号是日期串（``vYYMMDD``），字典序即时间序，字符串比较即可；``stale``
-    表示快照未能刷新（本模块无远端拉取，恒 False，保留字段与另三条线同形）。
+    版本号是日期串（``vYYMMDD``），字典序即时间序，字符串比较即可。
     """
     current = _clean_version(current_version)
     latest_version = _clean_version(latest.get("version") or "")
@@ -121,34 +132,149 @@ def server_upgrade_status(
         "latest": latest_version,
         "release_tag": str(latest.get("release_tag") or ""),
         "version_notes": str(latest.get("version_notes") or ""),
-        "repo_url": str(latest.get("repo_url") or ""),
+        "download_url": str(latest.get("download_url") or ""),
+        "digest": str(latest.get("digest") or ""),
+        "size_bytes": int(latest.get("size_bytes") or 0),
         "needs_upgrade": needs,
         "updated_at": str(latest.get("updated_at") or ""),
     }
 
 
 def current_version() -> str:
-    """本进程运行版本。
+    """本进程运行版本：读仓库根 ``VERSION`` 文件，没有则回落 ``dev``。
 
-    裸跑（releases+current 布局）：由 systemd 从 shared/alb.env 注入 ``APP_VERSION``
-    （updater 翻 current 指针后写入）。镜像部署：构建期 ``--build-arg APP_VERSION``
-    烧进 ``ENV``。两者都缺失时回落 ``dev``，与 ``routes_server._version()`` 同口径。
+    ``VERSION`` 由 publish 打升级包时写入（内容 = git tag，如 ``v260912``），
+    只存在于发布产物里、不在 master 工作区。所以：
+      - 部署机解压升级包 → 有该文件 → 显示真实版本
+      - 开发机（master）→ 无该文件 → 显示 ``dev``（诚实：确实不是发布版）
+
+    曾经用环境变量 ``APP_VERSION``，问题是「别人告诉进程的」——谁忘了传就撒谎
+    （生产曾显示 dev），且多容器形态下要靠外部注入对齐。文件随代码走，不会撒谎。
     """
-    return (os.getenv("APP_VERSION") or "dev").strip() or "dev"
+    from project_paths import version_file
+
+    try:
+        text = version_file().read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except Exception:  # noqa: BLE001 - 文件缺失/不可读都回落 dev，不影响启动
+        pass
+    return "dev"
+
+
+async def _render_from_store() -> dict[str, Any]:
+    """writable 部署：store 是真相源，从 store 渲染 version.json。
+
+    与 node 线同款：登记条目落在 ``marketplace_items``，本部署直接从 store 渲染，
+    不读仓库 raw（避免 raw 传播延迟把刚登记的数据冲掉）。
+    """
+    import marketplace_store as store
+    from user_platform.marketplace.render import render_server_release
+
+    if not await store.is_populated():
+        raise RuntimeError("store 未填充（bootstrap 前）")
+    manifests = await store.list_manifests("server-versions", include_hidden=True)
+    payload, errors = render_server_release(manifests)
+    if errors:
+        raise RuntimeError("version.json 渲染失败: " + "; ".join(errors))
+    return payload
+
+
+async def _fetch_from_repo() -> dict[str, Any]:
+    """只读部署：从市场仓 raw 拉 version.json（publish 打 tag 时写入的那份）。"""
+    from providers.proxy_manager import get_proxy_manager
+
+    resp = await get_proxy_manager().request(
+        url=_raw_url(),
+        method="GET",
+        headers={"User-Agent": "ai-lubricant-server-release"},
+        timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS),
+        proxy_config_id=mp_config.settings.proxy_id or None,
+    )
+    if resp.status != 200:
+        raise RuntimeError(f"version.json returned HTTP {resp.status}")
+    raw = await resp.read()
+    if len(raw) > MAX_FILE_BYTES:
+        raise RuntimeError(f"version.json exceeds {MAX_FILE_BYTES} bytes")
+    return json.loads(raw.decode("utf-8"))
+
+
+async def refresh(*, publish: bool = True) -> dict[str, Any]:
+    """刷新版本快照：writable 部署从 store 渲染，只读部署从市场仓 raw 拉。
+
+    与 node 线完全同构。
+    """
+    global _snapshot
+    settings = mp_config.consumer_settings
+    if not settings.enabled or "server-versions" not in settings.modules:
+        return {"ok": False, "error": "服务端版本源未启用", **await get_latest_release()}
+    async with _lock:
+        try:
+            data = (
+                await _render_from_store()
+                if mp_config.settings.writable
+                else await _fetch_from_repo()
+            )
+            previous_version = str(_snapshot.get("version") or "")
+            next_version = str(data.get("version") or "")
+            now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            next_snapshot = {
+                "version": next_version,
+                "version_notes": str(data.get("version_notes") or ""),
+                "release_tag": str(data.get("release_tag") or next_version),
+                "download_url": str(data.get("download_url") or ""),
+                "digest": str(data.get("digest") or ""),
+                "size_bytes": int(data.get("size_bytes") or 0),
+                "updated_at": data.get("updated_at") or now,
+                "stale": False,
+                "fetched_at": now,
+            }
+            # 先更新内存：即使 PG 写失败（本地无 DB），消费侧仍能拿到本次数据
+            _snapshot = copy.deepcopy(next_snapshot)
+            try:
+                await PostgresClient.set_config(SNAPSHOT_KEY, next_snapshot)
+            except Exception as exc:
+                logger.debug("[server-release] set_config failed (in-memory updated): {}", exc)
+            if publish:
+                import runtime_sync
+
+                await runtime_sync.publish(runtime_sync.EVENT_SERVER_RELEASE, "__all__")
+            if next_version and previous_version and next_version != previous_version:
+                from user_platform.notify_core import emit_notification_background
+
+                emit_notification_background(
+                    "server.new_version",
+                    params={
+                        "version": next_version,
+                        "previous_version": previous_version,
+                        "version_notes": str(data.get("version_notes") or ""),
+                    },
+                    owner_type="platform",
+                    severity="info",
+                    source="server_release_catalog",
+                    message=f"服务端版本已从 {previous_version} 更新为 {next_version}",
+                    dedupe_key=f"server.new_version:{next_version}",
+                    dedupe_window_seconds=86400,
+                )
+            logger.info("[server-release] synced version={}", next_version or "(empty)")
+            return {"ok": True, **copy.deepcopy(_snapshot)}
+        except Exception as exc:
+            _snapshot["stale"] = True
+            logger.warning("[server-release] refresh failed; keeping last snapshot: {}", exc)
+            return {"ok": False, "error": str(exc), **copy.deepcopy(_snapshot)}
+
+
+async def reload_from_db() -> None:
+    await load_snapshot()
 
 
 async def sync_loop() -> None:
-    """占位循环：本模块无远端拉取，仅周期性从 DB 重载以收敛多实例。
-
-    与另三条线保持同形的启动方式（main.py 统一 create_task），但间隔更长——登记
-    动作已由 publisher 同进程 apply，这里的重载只是多实例兜底。
-    """
-    interval = max(60, int(os.getenv("SERVER_RELEASE_SYNC_INTERVAL", "600")))
+    interval = max(60, int(os.getenv("SERVER_RELEASE_SYNC_INTERVAL", str(DEFAULT_SYNC_SECONDS))))
     while True:
         try:
-            await reload_from_db()
+            await refresh()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("[server-release] reload cycle failed: {}", exc)
+            logger.warning("[server-release] sync cycle failed: {}", exc)
         await asyncio.sleep(interval)

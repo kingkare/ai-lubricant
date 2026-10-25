@@ -117,6 +117,43 @@ def test_intercepted_by_output_rule_returns_rule_name(monkeypatch):
     assert main._intercepted_by_output_rule("前缀 [Tool use interrupted] 后缀") == "literal"
 
 
+def test_attempt_failure_status_distinguishes_interception_from_empty_response():
+    from providers.base import (
+        EmptyNonStreamResponseError,
+        IncompleteStreamError,
+        is_output_intercepted_error,
+    )
+
+    # 拦截命中（流式/非流式）→ output_intercepted，不再和真空响应混为一谈
+    stream_hit = IncompleteStreamError("output intercepted by rule: 白鹿拦截", "output_intercepted")
+    nonstream_hit = EmptyNonStreamResponseError(
+        "output intercepted by rule: 白鹿拦截", code="output_intercepted"
+    )
+    assert is_output_intercepted_error(stream_hit)
+    assert is_output_intercepted_error(nonstream_hit)
+    assert main._attempt_failure_status(stream_hit) == "output_intercepted"
+    assert main._attempt_failure_status(nonstream_hit) == "output_intercepted"
+
+    # 真空响应仍是 empty_non_stream（默认 code 不变，向后兼容）
+    genuine_empty = EmptyNonStreamResponseError("upstream returned stop response with empty output")
+    assert genuine_empty.code == "upstream_empty_non_stream_response"
+    assert not is_output_intercepted_error(genuine_empty)
+    assert main._attempt_failure_status(genuine_empty) == "empty_non_stream"
+
+    # 其它失败仍是 error
+    assert main._attempt_failure_status(ValueError("boom")) == "error"
+
+
+def test_intercepted_non_stream_error_keeps_retryable_semantics():
+    """拦截命中的非流式异常仍是 EmptyNonStreamResponseError 子类型——
+    重试分类（retryable_incomplete_response）与「不冻账号」口径都不变。"""
+    from providers.base import EmptyNonStreamResponseError
+
+    err = EmptyNonStreamResponseError("output intercepted by rule: 白鹿拦截", code="output_intercepted")
+    assert isinstance(err, EmptyNonStreamResponseError)
+    assert err.code == "output_intercepted"
+
+
 def test_admin_clean_output_interception_rules_drops_invalid_entries():
     cleaned = admin._clean_output_interception_rules({
         "enabled": True,

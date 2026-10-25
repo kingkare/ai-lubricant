@@ -14,7 +14,6 @@ import asyncio
 import json
 import logging
 import shutil
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -237,16 +236,19 @@ class MCPManager:
         server_configs: list[dict[str, Any]] | None = None,
         service_tokens: dict[str, str] | None = None,
         cdp_session_id: str = "",
+        cdp_client_ids: tuple[str, ...] = (),
     ):
         self.configs = [MCPServerConfig.from_dict(c) for c in (server_configs or [])]
         self.tools: dict[str, MCPTool] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         # service_name -> token（服务开启鉴权时，SSE/RPC 用它带 ?token= / Bearer）。
         self._service_tokens: dict[str, str] = dict(service_tokens or {})
-        # One logical holder per Agent runtime. It survives multiple MCP tool calls
-        # so scan -> execute -> wait owns the same CDP tab until this manager closes.
-        self.lease_id = f"agent:{uuid.uuid4().hex[:16]}"
+        # 本 Agent 运行时的 CDP 默认标签页：同一次运行里的多次 MCP 调用都落在
+        # 这个 session 上（scan → execute → wait 操作同一个 tab）。
         self.cdp_session_id = str(cdp_session_id or "")
+        # 本次运行被授权操作的 CDP 客户端集合（服务端边界）：cdp-bridge 插件据此
+        # 只允许模型在域内选择浏览器，跨域拒绝。空 = 未限定（由插件按身份推导）。
+        self.cdp_client_ids = tuple(str(c) for c in (cdp_client_ids or ()) if str(c))
 
     async def test_config(self, config: MCPServerConfig) -> dict[str, Any]:
         """Validate that the MCP service config is usable enough to attempt launch/connect."""
@@ -384,16 +386,19 @@ class MCPManager:
     async def _sse_call(self, service_name: str, tool_name: str, arguments: dict[str, Any]) -> list[dict]:
         """经进程内网关执行 tools/call，返回 result.content 列表。"""
         token = self._service_tokens.get(service_name, "")
-        from mcp_runtime.plugin_loader import current_cdp_holder, current_cdp_session_id
-        holder_token = current_cdp_holder.set(self.lease_id)
+        from mcp_runtime.plugin_loader import (
+            current_cdp_client_ids,
+            current_cdp_session_id,
+        )
         session_token = current_cdp_session_id.set(self.cdp_session_id)
+        client_token = current_cdp_client_ids.set(self.cdp_client_ids)
         try:
             payload = await self._gateway_rpc(
                 service_name, "tools/call", {"name": tool_name, "arguments": arguments}, token
             )
         finally:
             current_cdp_session_id.reset(session_token)
-            current_cdp_holder.reset(holder_token)
+            current_cdp_client_ids.reset(client_token)
         content = payload.get("content")
         if isinstance(content, list):
             return content
@@ -407,15 +412,7 @@ class MCPManager:
         return tools if isinstance(tools, list) else []
 
     async def close(self) -> None:
-        """Stop any subprocesses launched by the manager and release CDP leases."""
-        # Release any CDP tab leases this Agent runtime acquired under its holder.
-        # In-process driver lives in mcp_builtin.cdp_bridge.server; missing driver
-        # or import failure must never block agent teardown.
-        try:
-            from mcp_builtin.cdp_bridge.server import release_holder
-            release_holder(self.lease_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[mcp] release_holder %s failed: %s", self.lease_id, exc)
+        """Stop any subprocesses launched by the manager."""
         for proc in list(self._processes.values()):
             if proc.returncode is None:
                 proc.terminate()

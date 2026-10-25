@@ -83,6 +83,42 @@ def get_postgres_pool_limits() -> dict[str, int]:
     return {"min_size": min_size, "max_size": max_size}
 
 
+def get_compat_pool_limits() -> dict[str, int]:
+    """兼容层（Tortoise ``mc_*``）连接池大小，独立于主网关池。
+
+    历史坑：兼容层 DSN 原样转发 ``POSTGRES_POOL_*``，于是「调大主池」这一个动作会
+    让主服务同时对同一库开两套同上限的池，总占用静默翻倍。兼容层只承载管理端/
+    console 的低频 ``mc_*`` 读写，给它一套自己的旋钮：``min_size`` 默认压到 1（不像
+    主池那样预连一堆空闲连接），``max_size`` 缺省仍跟随主池上限（保持旧行为，
+    不配就等价于改前），要收紧时显式设 ``COMPAT_POOL_MAX_SIZE`` 即可。
+
+    非法值一律收敛到安全区间，绝不因配置故障让兼容层池起不来或超限：``min_size``
+    允许 0（纯按需连接），``max_size`` 至少 1，``min_size`` 不超过 ``max_size``。
+    """
+    main = get_postgres_pool_limits()
+    min_size = max(0, _optional_int("COMPAT_POOL_MIN_SIZE", 1))
+    max_size = _optional_int("COMPAT_POOL_MAX_SIZE", main["max_size"])
+    if max_size < 1:
+        max_size = 1
+    if min_size > max_size:
+        min_size = max_size
+    return {"min_size": min_size, "max_size": max_size}
+
+
+def get_postgres_idle_lifetime() -> float:
+    """空闲连接回收秒数（``max_inactive_connection_lifetime``）。
+
+    asyncpg 只回收**超出 min_size** 的空闲连接：突发涨上去的连接用完即在此时长后被
+    关掉，把池缩回 min_size 地板。默认 300s；设 0 关闭回收。
+    """
+    return float(max(0, _optional_int("POSTGRES_POOL_MAX_IDLE_SECONDS", 300)))
+
+
+def get_postgres_app_name(default: str = "") -> str:
+    """连接在 ``pg_stat_activity.application_name`` 里的标识，便于按进程归因排障。"""
+    return _optional_text(("PG_APP_NAME",), default)
+
+
 def get_redis_config() -> dict[str, Any]:
     return {
         "prefix_key": _required_text(("REDIS_PREFIX_KEY",), "redis.prefix_key"),

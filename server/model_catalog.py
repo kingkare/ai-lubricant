@@ -173,6 +173,7 @@ def _expand_scheme_fallback_groups(
                 "backup_group": next_backup,
                 "response_model": group.get("response_model", ""),
                 "metadata_model": group.get("metadata_model", ""),
+                "metadata_mode": group.get("metadata_mode", ""),
                 "metadata": dict(group.get("metadata") or {}),
                 "schemes": [],
                 "active_scheme": "",
@@ -213,6 +214,79 @@ def _effective_max_tokens(record: Mapping[str, Any], default: Mapping[str, Any])
         return 0
 
 
+# 自定义模型「模型元数据」取值模式：
+#   min   = 按成员逐字段取最小值（默认，历史行为）
+#   max   = 按成员逐字段取最大值
+#   avg   = 按成员逐字段取平均值（四舍五入）
+#   model = 采用指定真实模型（metadata_model）的元数据原值，不做聚合
+# 空串/未知值由 normalize_group_metadata_mode 归一化到 min（未指定 metadata_model）
+# 或 model（已指定 metadata_model），保持旧数据语义不变。
+GROUP_METADATA_MODES = ("min", "max", "avg", "model")
+
+# 参与聚合的数值字段：只有 token 窗口类字段有 min/max/avg 的意义，其余字段
+# （模态、capabilities、布尔能力）一律取「成员基准记录」的值。
+_AGGREGATED_TOKEN_FIELDS = ("max_tokens", "max_context_tokens")
+
+
+def normalize_group_metadata_mode(mode: Any, metadata_model: Any = "") -> str:
+    """归一化取值模式。空/未知时按是否有 metadata_model 回落到 model / min。"""
+    normalized = str(mode or "").strip().lower()
+    if normalized in GROUP_METADATA_MODES:
+        return normalized
+    return "model" if str(metadata_model or "").strip() else "min"
+
+
+def _aggregate_token_value(values: list[int], mode: str) -> int:
+    if mode == "max":
+        return max(values)
+    if mode == "avg":
+        return int(round(sum(values) / len(values)))
+    return min(values)
+
+
+def compute_group_metadata(
+    members: Any,
+    metadata_model: Any,
+    metadata_mode: Any,
+    metadata: Mapping[str, Mapping[str, Any]],
+    default: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """计算自定义模型对外暴露的元数据。
+
+    - model 模式且 metadata_model 命中：直接用该真实模型记录原值（不聚合）。
+    - 其余模式：基准记录 = 成员中 max_tokens 最小者（确定性、与历史一致），其非 token
+      字段原样保留；max_tokens / max_context_tokens 按模式对全部成员聚合。
+    无任何可用成员元数据时返回 None。
+    """
+    default = default or {}
+    members = [m for m in (members or ()) if isinstance(m, str) and m]
+    mode = normalize_group_metadata_mode(metadata_mode, metadata_model)
+    selected = metadata.get(str(metadata_model or "").strip()) if metadata_model else None
+    if mode == "model" and selected is not None:
+        return {key: value for key, value in selected.items() if key != "model_id"}
+    # model 模式但未命中/未指定模型：回落到 min 聚合，避免用无意义的 'model' 标签走聚合。
+    if mode == "model":
+        mode = "min"
+
+    candidates = [metadata[model_id] for model_id in members if model_id in metadata]
+    if not candidates:
+        return None
+    base = min(candidates, key=lambda item: _effective_max_tokens(item, default))
+    result = {key: value for key, value in base.items() if key != "model_id"}
+    for field in _AGGREGATED_TOKEN_FIELDS:
+        values: list[int] = []
+        for record in candidates:
+            try:
+                value = int(record.get(field) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                values.append(value)
+        if values:
+            result[field] = _aggregate_token_value(values, mode)
+    return result
+
+
 def _group_metadata(
     group_index: Mapping[str, Mapping[str, Any]],
     metadata: Mapping[str, Mapping[str, Any]],
@@ -220,20 +294,15 @@ def _group_metadata(
 ) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for display_id, group in group_index.items():
-        metadata_model = str(group.get("metadata_model") or "").strip()
-        selected = metadata.get(metadata_model) if metadata_model else None
-        if selected is None:
-            candidates = [
-                metadata[model_id]
-                for model_id in group.get("models", ())
-                if isinstance(model_id, str) and model_id in metadata
-            ]
-            if candidates:
-                selected = min(candidates, key=lambda item: _effective_max_tokens(item, default))
-        if selected is not None:
-            result[display_id] = {
-                key: value for key, value in selected.items() if key != "model_id"
-            }
+        computed = compute_group_metadata(
+            group.get("models"),
+            group.get("metadata_model"),
+            group.get("metadata_mode"),
+            metadata,
+            default,
+        )
+        if computed is not None:
+            result[display_id] = computed
     return result
 
 

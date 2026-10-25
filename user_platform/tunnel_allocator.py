@@ -83,6 +83,8 @@ async def allocate(scheme: TunnelScheme) -> dict:
         # ``server_addr`` is where the client connects to frps/nps; ``domain``
         # is an optional public-facing name for users. It affects only the
         # advertised address, never the generated client config.
+        # (chmlfrp never reaches here: it is panel-managed and gets its public
+        # address from the panel-issued frpc ini at dispatch time.)
         public_host = (config.get("domain") or "").strip() or server_addr
         rng = _port_range(config)
         if rng is None:

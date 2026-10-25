@@ -120,6 +120,7 @@ def _raise(exc: ValueError) -> None:
 async def get_project_webhook(
     project_id: str, user: User = Depends(get_current_user)
 ) -> dict | None:
+    """查项目 Webhook 配置。未配置时返回 None。"""
     row = await webhook_service.get_webhook(str(user.id), project_id, role=user.role)
     if row is None:
         return None
@@ -133,6 +134,7 @@ async def list_project_review_nodes(
     editor_provider: str = "",
     user: User = Depends(get_current_user),
 ) -> dict:
+    """列项目可选的 Review 执行节点（按框架与编辑器筛选）。项目不存在或无权访问 404。"""
     project, _access = await webhook_service._resolve(
         str(user.id), project_id, user.role
     )
@@ -237,6 +239,12 @@ async def enable_project_webhook(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """启用项目 Webhook（含 Review 框架/节点/编辑器/模型/限额等完整配置）。
+
+    在 Git 平台注册仓库 webhook（持久化 hook_id 与密钥，密钥永不回传明文）。
+    Review 必填项缺失、编辑器/节点不可用、上游调用失败等分别 422/502。
+    成功后记审计。
+    """
     try:
         result = await webhook_service.enable_webhook(
             str(user.id), project_id,
@@ -277,6 +285,11 @@ async def update_project_webhook(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """更新项目 Webhook 配置（可选重置密钥、切换事件、Review 各项参数）。
+
+    仅更新传入字段。Webhook 未配置 404，参数校验失败 422，Git 平台调用失败 502。
+    成功后记审计。
+    """
     try:
         result = await webhook_service.update_webhook(
             str(user.id), project_id,
@@ -339,6 +352,7 @@ async def delete_project_webhook(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """关闭并删除项目 Webhook（Git 平台侧与本地记录一并清掉），记审计。"""
     try:
         deleted = await webhook_service.disable_webhook(
             str(user.id), project_id, role=user.role

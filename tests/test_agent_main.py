@@ -43,7 +43,7 @@ async def test_run_task_delegates_into_agent_runner_loop(monkeypatch):
     tools.get_schema.return_value = [{"type": "function", "function": {"name": "lookup"}}]
     seen = {}
 
-    async def fake_loop(client, system_prompt, user_input, handler, tools_schema, max_turns, verbose, on_event=None):
+    async def fake_loop(client, system_prompt, user_input, handler, tools_schema, max_turns, verbose, on_event=None, **_kwargs):
         seen.update(
             client=client,
             system_prompt=system_prompt,
@@ -207,7 +207,7 @@ async def test_run_task_falls_back_to_agent_system_prompt(monkeypatch):
     tools.get_schema.return_value = []
     seen = {}
 
-    async def fake_loop(client, system_prompt, user_input, handler, tools_schema, max_turns, verbose, on_event=None):
+    async def fake_loop(client, system_prompt, user_input, handler, tools_schema, max_turns, verbose, on_event=None, **_kwargs):
         seen["system_prompt"] = system_prompt
         yield {"result": "CURRENT_TASK_DONE", "data": "ok"}
 
@@ -229,7 +229,7 @@ async def test_run_task_explicit_system_prompt_wins(monkeypatch):
     tools.get_schema.return_value = []
     seen = {}
 
-    async def fake_loop(client, system_prompt, user_input, handler, tools_schema, max_turns, verbose, on_event=None):
+    async def fake_loop(client, system_prompt, user_input, handler, tools_schema, max_turns, verbose, on_event=None, **_kwargs):
         seen["system_prompt"] = system_prompt
         yield {"result": "CURRENT_TASK_DONE", "data": "ok"}
 
@@ -252,7 +252,7 @@ async def test_run_task_uses_caller_supplied_llm(monkeypatch):
     scheduled_llm = Mock()
     seen = {}
 
-    async def fake_loop(client, system_prompt, user_input, handler, tools_schema, max_turns, verbose, on_event=None):
+    async def fake_loop(client, system_prompt, user_input, handler, tools_schema, max_turns, verbose, on_event=None, **_kwargs):
         seen["client"] = client
         yield {"result": "CURRENT_TASK_DONE", "data": "ok"}
 
@@ -331,7 +331,8 @@ async def test_spawn_subagent_async_forks_main_when_no_subagent_key(monkeypatch)
 # their parameter detail, and only then the general constitution. Nothing here
 # tests wording; it tests the ordering and de-duplication that regressed before.
 
-def _resources_agent(monkeypatch, scene=None, capability_index=None, sop_bodies=None):
+def _resources_agent(monkeypatch, scene=None, capability_index=None, sop_bodies=None,
+                     seeded_bodies=None):
     """A GenericAgent whose _ensure_resources runs without DB or real files."""
     from agent import agent_main as am
 
@@ -344,6 +345,11 @@ def _resources_agent(monkeypatch, scene=None, capability_index=None, sop_bodies=
     monkeypatch.setattr(GenericAgent, "_ensure_tools", fake_ensure_tools)
     bodies = sop_bodies or {}
     monkeypatch.setattr(GenericAgent, "_read_sop_body", lambda self, ref: bodies.get(ref, ""))
+    seeded = seeded_bodies or {}
+    monkeypatch.setattr(
+        GenericAgent, "_read_seeded_sop",
+        AsyncMock(side_effect=lambda name: seeded.get(name, "")),
+    )
     monkeypatch.setattr(am, "logger", Mock())
 
     import agent.file_memory as fm
@@ -374,7 +380,7 @@ _MARKET_BODY = {"memory/sop/mcp/marketplace-status_sop.md": "# marketplace SOP\n
 @pytest.mark.asyncio
 async def test_scene_tools_precede_constitution(monkeypatch):
     """Scene services + their detail come before [Role], not 100 lines after it."""
-    scene = SimpleNamespace(services=("marketplace-status",))
+    scene = SimpleNamespace(capabilities=("marketplace-status",))
     agent = _resources_agent(monkeypatch, scene=scene, capability_index=_MARKET_INDEX, sop_bodies=_MARKET_BODY)
 
     _tools, prefix = await agent._ensure_resources()
@@ -388,7 +394,7 @@ async def test_scene_tools_precede_constitution(monkeypatch):
 @pytest.mark.asyncio
 async def test_scene_service_not_listed_twice(monkeypatch):
     """A service whose full body is inlined is dropped from the general index."""
-    scene = SimpleNamespace(services=("marketplace-status",))
+    scene = SimpleNamespace(capabilities=("marketplace-status",))
     agent = _resources_agent(monkeypatch, scene=scene, capability_index=_MARKET_INDEX, sop_bodies=_MARKET_BODY)
 
     _tools, prefix = await agent._ensure_resources()
@@ -403,13 +409,13 @@ async def test_scene_service_not_listed_twice(monkeypatch):
 @pytest.mark.asyncio
 async def test_capability_heading_name_is_stable(monkeypatch):
     """The constitution / capability_call errors / SOPs all cite this exact name."""
-    scene = SimpleNamespace(services=("marketplace-status",))
+    scene = SimpleNamespace(capabilities=("marketplace-status",))
     agent = _resources_agent(monkeypatch, scene=scene, capability_index=_MARKET_INDEX, sop_bodies=_MARKET_BODY)
 
     _tools, prefix = await agent._ensure_resources()
 
     assert "[Available Capabilities]" in prefix
-    assert "- scheduler: create|list|cancel|run_now" in prefix
+    assert "- workflow: list|get|run|runs|run_status|cancel|create|update|delete" in prefix
 
 
 @pytest.mark.asyncio
@@ -430,7 +436,7 @@ async def test_no_scene_keeps_constitution_first(monkeypatch):
 @pytest.mark.asyncio
 async def test_missing_scene_sop_falls_back_to_pointer(monkeypatch):
     """No readable SOP body → the service stays in the index with its pointer."""
-    scene = SimpleNamespace(services=("marketplace-status",))
+    scene = SimpleNamespace(capabilities=("marketplace-status",))
     agent = _resources_agent(monkeypatch, scene=scene, capability_index=_MARKET_INDEX, sop_bodies={})
 
     _tools, prefix = await agent._ensure_resources()
@@ -453,3 +459,188 @@ def test_method_description_is_cut_at_a_word_boundary():
     # Short descriptions pass through untouched.
     assert _short_desc("Scan the tab.") == "Scan the tab."
     assert _short_desc(None) == ""
+
+
+# ── spawn_subagent: role/category → model routing + persona injection ──────
+
+def test_spawn_subagent_schema_has_role_category_enums_and_no_model_ids():
+    """schema 暴露 role/category enum；模型清单绝不进上下文（核心收益）。"""
+    import json as _json
+
+    from agent.tools import _SPAWN_SUBAGENT_SCHEMA
+
+    schema_text = _json.dumps(_SPAWN_SUBAGENT_SCHEMA)
+    props = _SPAWN_SUBAGENT_SCHEMA["function"]["parameters"]["properties"]
+    assert props["role"]["enum"] == ["explore", "verify", "build", "general"]
+    assert props["category"]["enum"] == ["quick", "deep", "ultrabrain"]
+    assert _SPAWN_SUBAGENT_SCHEMA["function"]["parameters"]["required"] == ["task"]
+    # 描述里不能出现任何具体模型 id（模型 id 只存 DB 的映射表里）。
+    for leaked in ("gpt-", "claude-", "gemini-", "deepseek-", "qwen"):
+        assert leaked not in schema_text, leaked
+
+
+def test_normalize_subagent_model_map_shapes():
+    """normalize：白名单外键/空值剔除；str（asyncpg 文本）/dict/脏输入都收敛。"""
+    from agent.agent_main import _normalize_subagent_model_map
+
+    assert _normalize_subagent_model_map(
+        {"roles": {"explore": "m1", "bogus": "x", "verify": "  "}, "categories": {"deep": "m2", "junk": "y"}}
+    ) == {"roles": {"explore": "m1"}, "categories": {"deep": "m2"}}
+    assert _normalize_subagent_model_map('{"roles":{"verify":"m3"}}') == {
+        "roles": {"verify": "m3"}, "categories": {},
+    }
+    for bad in (None, "not-json", 42, {"roles": ["explore"], "categories": 42}):
+        assert _normalize_subagent_model_map(bad) == {"roles": {}, "categories": {}}
+
+
+def _spawn_agent(monkeypatch, config, parent_llm):
+    """Shared fixture body: a parent agent whose child run_task is a stub."""
+    tools = Mock()
+    tools.get_schema.return_value = []
+    agent = GenericAgent(config, llm=parent_llm, tools=tools, agent_id=42)
+
+    async def fake_run_task(self, prompt, system_prompt=""):
+        return [{"data": prompt, "system_prompt": system_prompt}]
+    monkeypatch.setattr(GenericAgent, "run_task", fake_run_task)
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_resolves_role_model(monkeypatch):
+    """map.roles[role] 配了模型 → 子桥用该模型（同主 key fork）。"""
+    config = AgentConfig(
+        main_api_key_id=3, main_model="main-model",
+        subagent_model_map={"roles": {"verify": "strong-model"}, "categories": {}},
+    )
+    parent_llm = Mock()
+    forked = SimpleNamespace(name="verify-child")
+    parent_llm.fork.return_value = forked
+    agent = _spawn_agent(monkeypatch, config, parent_llm)
+
+    handle = await agent.spawn_subagent_async("check this", role="verify")
+    parent_llm.fork.assert_called_once_with(model="strong-model")
+    assert handle.role == "verify"
+    await handle.asyncio_task
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_category_beats_role(monkeypatch):
+    """难度档优先于岗位（resolution: category > role）。"""
+    config = AgentConfig(
+        main_api_key_id=3,
+        subagent_model_map={"roles": {"verify": "strong-model"}, "categories": {"quick": "fast-model"}},
+    )
+    parent_llm = Mock()
+    parent_llm.fork.return_value = SimpleNamespace(name="child")
+    agent = _spawn_agent(monkeypatch, config, parent_llm)
+
+    await agent.spawn_subagent_async("t", role="verify", category="quick")
+    parent_llm.fork.assert_called_once_with(model="fast-model")
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_explicit_model_beats_map(monkeypatch):
+    """显式 model 参数优先于查表（逃生口）。"""
+    config = AgentConfig(
+        main_api_key_id=3,
+        subagent_model_map={"roles": {"verify": "strong-model"}, "categories": {}},
+    )
+    parent_llm = Mock()
+    parent_llm.fork.return_value = SimpleNamespace(name="child")
+    agent = _spawn_agent(monkeypatch, config, parent_llm)
+
+    await agent.spawn_subagent_async("t", model="my-own-model", role="verify")
+    parent_llm.fork.assert_called_once_with(model="my-own-model")
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_empty_map_falls_back(monkeypatch):
+    """map 空/未命中 → 逐层回落，与改动前解析链逐字一致（回归保护）。"""
+    parent_llm = Mock()
+    parent_llm.fork.return_value = SimpleNamespace(name="child")
+    agent = _spawn_agent(monkeypatch, AgentConfig(main_api_key_id=3, main_model="m"), parent_llm)
+
+    await agent.spawn_subagent_async("t", role="verify", category="quick")
+    parent_llm.fork.assert_called_once_with()  # 跟随主桥，无模型覆盖
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_role_not_in_map_falls_back(monkeypatch):
+    """map 里有其它 role 但没配当前 role → 回落（None → 跟随主）。"""
+    config = AgentConfig(
+        main_api_key_id=3,
+        subagent_model_map={"roles": {"explore": "cheap"}, "categories": {}},
+    )
+    parent_llm = Mock()
+    parent_llm.fork.return_value = SimpleNamespace(name="child")
+    agent = _spawn_agent(monkeypatch, config, parent_llm)
+
+    await agent.spawn_subagent_async("t", role="verify")
+    parent_llm.fork.assert_called_once_with()  # verify 未配 → 跟随主
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_injects_role_persona(monkeypatch):
+    """role → 子 agent 人格注入（父人设 + role persona 拼接）。"""
+    config = AgentConfig(main_api_key_id=3, main_model="m")
+    parent_llm = Mock()
+    parent_llm.fork.return_value = SimpleNamespace(name="child")
+    agent = _spawn_agent(monkeypatch, config, parent_llm)
+    agent._agent_system_prompt = "You are the team lead."
+
+    handle = await agent.spawn_subagent_async("t", role="verify")
+    outputs = await handle.asyncio_task
+    sp = outputs[0]["system_prompt"]
+    assert "You are the team lead." in sp
+    assert "independent reviewer" in sp  # _ROLE_PERSONAS["verify"] 关键词
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_no_role_keeps_legacy_prompt(monkeypatch):
+    """未指定 role → 不传 system_prompt（旧行为：子 agent 空人设）。"""
+    config = AgentConfig(main_api_key_id=3, main_model="m")
+    parent_llm = Mock()
+    parent_llm.fork.return_value = SimpleNamespace(name="child")
+    agent = _spawn_agent(monkeypatch, config, parent_llm)
+    agent._agent_system_prompt = "You are the team lead."
+
+    handle = await agent.spawn_subagent_async("t")
+    outputs = await handle.asyncio_task
+    assert outputs[0]["system_prompt"] == ""
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_role_persona_without_parent_prompt(monkeypatch):
+    """父无人设时，子 agent 仍拿到 role 人格。"""
+    config = AgentConfig(main_api_key_id=3, main_model="m")
+    parent_llm = Mock()
+    parent_llm.fork.return_value = SimpleNamespace(name="child")
+    agent = _spawn_agent(monkeypatch, config, parent_llm)
+    agent._agent_system_prompt = ""
+
+    handle = await agent.spawn_subagent_async("t", role="explore")
+    outputs = await handle.asyncio_task
+    assert "explorer" in outputs[0]["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_async_dedicated_key_uses_resolved_model(monkeypatch):
+    """绑了子专用 key：key 固定走独立桥，模型仍取查表结果（key 与模型正交）。"""
+    config = AgentConfig(
+        main_api_key_id=3, main_model="main-model", subagent_api_key_id=7,
+        subagent_model_map={"roles": {"build": "build-model"}, "categories": {}},
+    )
+    parent_llm = Mock()
+    agent = _spawn_agent(monkeypatch, config, parent_llm)
+
+    captured = {}
+
+    async def fake_resolve_bridge(self, api_key_id, model, *, role):
+        captured["args"] = (api_key_id, model, role)
+        return SimpleNamespace(name="dedicated", model=model)
+    monkeypatch.setattr(GenericAgent, "_resolve_gateway_bridge", fake_resolve_bridge)
+
+    handle = await agent.spawn_subagent_async("t", role="build")
+    assert captured["args"] == (7, "build-model", "subagent")
+    parent_llm.fork.assert_not_called()  # 不走主桥 fork
+    await handle.asyncio_task

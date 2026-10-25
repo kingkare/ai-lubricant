@@ -6,6 +6,9 @@ from providers.custom import CustomProvider
 class EdgeOneAIProvider(CustomProvider):
     PROVIDER_NAME = "edgeone-ai"
     SUPPORTS_MULTI_MESSAGES = True
+    # 上游地址由账号的二级域名 name 现拼（见 base_url property），渠道级 base_url
+    # 本来就该留空；同 Cloudflare，不豁免会让该渠道改一次 400 一次。
+    REQUIRES_BASE_URL = False
 
     @classmethod
     def account_schema(cls) -> dict:

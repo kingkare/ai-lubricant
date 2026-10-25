@@ -153,6 +153,9 @@ class MailAccountTypeHandler(ObjectTypeHandler):
         result["_secrets"] = states
         result["user_ids"] = _normalize_id_list(result.get("user_ids"))
         result["mailbox_type"] = str(result.get("mailbox_type") or "TempMail")
+        # 出站代理绑定：空串归一成 None（未绑），非空必须是字符串 id。
+        proxy_id = result.get("proxy_id")
+        result["proxy_id"] = str(proxy_id).strip() or None
         return result
 
 
@@ -180,10 +183,11 @@ class CdpClientTypeHandler(ObjectTypeHandler):
         # immediate create/rotate response by SharedConfigAdapter.
         result.pop("token_hash", None)
         result["client_id"] = str(result.get("instance_key") or result.get("id") or "")
-        # 兼容旧数据：单 user_id → user_ids 列表；补齐缺省 agent_ids。
+        # 兼容旧数据：单 user_id → user_ids 列表。
         result["user_ids"] = _normalize_id_list(result.get("user_ids"), fallback=result.get("user_id"))
-        result["agent_ids"] = _normalize_id_list(result.get("agent_ids"))
         result.pop("user_id", None)
+        # agent 授权已单轨化到 agent 侧 grants；旧行里残留的 agent_ids 不再对外暴露。
+        result.pop("agent_ids", None)
         return result
 
 
@@ -215,15 +219,20 @@ class SharedConfigAdapter:
         return handler
 
     async def _validate_users_agents(self, ctx: ResourceContext, prepared: dict) -> None:
-        """校验 cdp_client / mail_account 的可操作用户与可操作 agent 列表。
+        """校验 cdp_client / mail_account 的可操作用户列表。
 
         方向已翻转：不再要求用户预先获得服务授权——由本实例的 user_ids 反过来
         决定该服务的授权用户集（保存后由 recompute_service_users_from_resources 回写）。
-        这里只校验 user_ids/agent_ids 引用的对象存在且已启用。
+        这里只校验 user_ids 引用的对象存在且已启用。
+
+        agent 授权已单轨化到 agent 侧 grants（mcp_grants 的 cdp_client_id 行），
+        cdp_client 资源行不再携带 agent_ids——传入也直接丢弃，防止旧前端写回。
         """
         config_type = self._storage(ctx)["configType"]
         if config_type not in ("cdp_client", "mail_account"):
             return
+        if config_type == "cdp_client":
+            prepared.pop("agent_ids", None)
         if "user_ids" in prepared:
             user_ids = _normalize_id_list(prepared["user_ids"])
             for user_id in user_ids:
@@ -231,14 +240,6 @@ class SharedConfigAdapter:
                 if not user or not user.get("enabled"):
                     raise ConfigurationError(f"可操作用户不存在或未启用: {user_id}")
             prepared["user_ids"] = user_ids
-        if config_type == "cdp_client" and "agent_ids" in prepared:
-            agent_ids = _normalize_id_list(prepared["agent_ids"])
-            if agent_ids:
-                found = set(await mcp_plugin_store.list_agent_ids(agent_ids))
-                missing = [aid for aid in agent_ids if aid not in found]
-                if missing:
-                    raise ConfigurationError(f"可操作 agent 不存在或未启用: {missing}")
-            prepared["agent_ids"] = agent_ids
 
     async def list(self, ctx: ResourceContext, query: dict) -> list[dict]:
         storage = self._storage(ctx)

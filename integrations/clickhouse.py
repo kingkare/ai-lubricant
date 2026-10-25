@@ -88,6 +88,58 @@ ORDER BY (task_id, seq)
 TTL toDateTime(created_at) + INTERVAL 365 DAY
 """
 
+# Agent 对话的时间线本体（每帧一行，seq 有序），形态对齐 task_messages。交错顺序由
+# seq 承载，不再靠 agent_messages.tool_calls 的 content_offset / reasoning_offset 事后
+# 切片还原。只有数据服务进程写这张表（agent/conversation_store），故 DDL 单一事实源。
+AGENT_MESSAGE_EVENTS_COLUMNS = [
+    "id",
+    "conversation_id",
+    "message_id",
+    "seq",
+    "item_type",
+    "item_json",
+    "event_kind",
+    "tool_name",
+    "subagent_id",
+    "turn_number",
+    "status",
+    "created_at",
+    "version",
+]
+
+AGENT_MESSAGE_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS agent_message_events
+(
+    id String,
+    conversation_id String,
+    message_id UInt64,
+    seq UInt64,
+    item_type LowCardinality(String),
+    item_json String CODEC(ZSTD(9)),
+    event_kind LowCardinality(String),
+    tool_name String,
+    subagent_id String,
+    turn_number Int32 DEFAULT 0,
+    status LowCardinality(String),
+    created_at DateTime64(3),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (conversation_id, message_id, seq)
+TTL toDateTime(created_at) + INTERVAL {ttl_days} DAY
+"""
+
+# agent_conversations 的插入列名（顺序即 insert 行的顺序）。**单一事实源**：
+# conversation_store 的 4 处 insert_conversation_row 行数据、DDL 建表列、SELECT
+# 列表都必须与它对齐。加列时改这一处 + 4 处行数据 + DDL，insert_conversation_row
+# 会按长度自检，不一致时立刻抛错（见该函数）。
+_CONVERSATION_COLUMNS = (
+    "id", "title", "system_prompt", "model", "llm_model_id",
+    "status", "kind", "agent_id", "user_id", "cdp_client_id",
+    "chat_settings", "run_status", "run_status_info",
+    "created_at", "updated_at", "version",
+)
+
 
 @dataclass(frozen=True)
 class ClickHousePayloadEvent:
@@ -424,6 +476,8 @@ class ClickHousePayloadClient:
             user_id Nullable(String),
             cdp_client_id Nullable(String),
             chat_settings String,
+            run_status String DEFAULT '',
+            run_status_info String DEFAULT '',
             created_at DateTime64(3),
             updated_at DateTime64(3),
             version UInt64
@@ -448,6 +502,7 @@ class ClickHousePayloadClient:
             model String DEFAULT '',
             usage String DEFAULT '',
             reasoning String DEFAULT '',
+            subagents String DEFAULT '',
             created_at DateTime64(3),
             version UInt64
         )
@@ -461,20 +516,37 @@ class ClickHousePayloadClient:
         await self._call(self._client.command, "ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS model String DEFAULT ''")
         await self._call(self._client.command, "ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS usage String DEFAULT ''")
         await self._call(self._client.command, "ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS reasoning String DEFAULT ''")
+        # subagents：本条 assistant 消息派生的子 agent 列表（名字/任务/小结/各自 token），
+        # JSON 数组字符串。落库后刷新历史才能恢复子 agent 卡片与各自的用量。
+        await self._call(self._client.command, "ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS subagents String DEFAULT ''")
+        # 会话运行状态一等公民字段：
+        #   run_status      状态枚举（sending/thinking/...，见 agent/conversation_state.py）
+        #   run_status_info 状态附言（重试第几次 / 工具名 / 错误文案）
+        # 由 ConversationState.update 写穿，供三端底栏刷新后恢复显示。
+        await self._call(self._client.command, "ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS run_status String DEFAULT ''")
+        await self._call(self._client.command, "ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS run_status_info String DEFAULT ''")
+        # 旧 run_state（含糊 JSON 字符串）已废弃，DROP 掉。
+        await self._call(self._client.command, "ALTER TABLE agent_conversations DROP COLUMN IF EXISTS run_state")
 
     async def insert_conversation_row(self, row: list) -> None:
-        """单行追加 agent_conversations（列顺序见 column_names）。"""
+        """单行追加 agent_conversations（列顺序见 _CONVERSATION_COLUMNS）。"""
         if self._client is None:
             raise RuntimeError("ClickHouse client is not connected")
+        # 防呆：行数据与列名必须等长。历史 bug 是加列时只改了 insert 行、忘了同步
+        # column_names，clickhouse_connect 在深处抛 "Insert data column count does
+        # not match column names"，报错点离真正的手误很远。这里本地先判，错误直指
+        # 本函数与列数。
+        if len(row) != len(_CONVERSATION_COLUMNS):
+            raise ValueError(
+                f"agent_conversations insert row has {len(row)} values but "
+                f"_CONVERSATION_COLUMNS has {len(_CONVERSATION_COLUMNS)}; "
+                f"did you add a column without updating both?"
+            )
         await self._call(
             self._client.insert,
             "agent_conversations",
             [row],
-            column_names=[
-                "id", "title", "system_prompt", "model", "llm_model_id",
-                "status", "kind", "agent_id", "user_id", "cdp_client_id",
-                "chat_settings", "created_at", "updated_at", "version",
-            ],
+            column_names=list(_CONVERSATION_COLUMNS),
         )
 
     async def insert_message_row(self, row: list) -> None:
@@ -488,9 +560,84 @@ class ClickHousePayloadClient:
             column_names=[
                 "id", "conversation_id", "role", "content", "tool_calls",
                 "tool_results", "turn_number", "status", "error", "media",
-                "model", "usage", "reasoning", "created_at", "version",
+                "model", "usage", "reasoning", "subagents", "created_at", "version",
             ],
         )
+
+    # ── Agent 会话事件日志 ─────────────────────────────────────────────
+    # agent_message_events 存 agent 对话的时间线本体（每帧一行，seq 有序），形态对齐
+    # task_messages（见下方任务块）：思考/正文/工具调用/结果/子 agent 各自成帧，
+    # 交错顺序由 seq 承载——不再靠 agent_messages.tool_calls 里的 content_offset /
+    # reasoning_offset 事后切片还原。agent_messages 继续写（投影）：分页游标、
+    # envelope（role/status/error/model/usage/media）、LLM 上下文重建与无帧消息的
+    # 降级渲染都以它为准；时间线顺序唯一权威是本表。
+    # 只有数据服务进程写这张表（agent/conversation_store）；DDL 单一事实源在本模块，
+    # tests/test_agent_message_events_schema.py 比对。
+
+    async def ensure_agent_message_events_schema(self, *, ttl_days: int = 365) -> None:
+        """建 agent_message_events（幂等）。"""
+        if self._client is None:
+            raise RuntimeError("ClickHouse client is not connected")
+        ttl_days = max(1, int(ttl_days))
+        await self._call(self._client.command, AGENT_MESSAGE_EVENTS_DDL.format(ttl_days=ttl_days))
+
+    async def insert_message_event_row(self, row: list) -> None:
+        """单行追加 agent_message_events（列顺序见 AGENT_MESSAGE_EVENTS_COLUMNS）。"""
+        if self._client is None:
+            raise RuntimeError("ClickHouse client is not connected")
+        if len(row) != len(AGENT_MESSAGE_EVENTS_COLUMNS):
+            raise ValueError(
+                f"agent_message_events insert row has {len(row)} values but "
+                f"AGENT_MESSAGE_EVENTS_COLUMNS has {len(AGENT_MESSAGE_EVENTS_COLUMNS)}; "
+                f"did you add a column without updating both?"
+            )
+        await self._call(
+            self._client.insert,
+            "agent_message_events",
+            [row],
+            column_names=list(AGENT_MESSAGE_EVENTS_COLUMNS),
+        )
+
+    async def insert_message_event_rows(self, rows: list[list]) -> None:
+        """多行批量追加 agent_message_events（回填一页 PG 行落成一两个 part，
+        单行插会把 part 数撑爆——理由同 insert_task_message_rows）。"""
+        if not rows:
+            return
+        if self._client is None:
+            raise RuntimeError("ClickHouse client is not connected")
+        await self._call(
+            self._client.insert,
+            "agent_message_events",
+            rows,
+            column_names=list(AGENT_MESSAGE_EVENTS_COLUMNS),
+        )
+
+    async def query_message_events(
+        self, conversation_id: str, *, message_ids: list[int] | None = None, limit: int = 5000
+    ) -> list[dict]:
+        """按会话（可选按 message_id 收窄）取时间线帧，seq 有序、最旧在前。
+
+        ``message_id`` 在排序键里，按页收窄时是前缀范围扫描而不是全会话扫描。
+        FINAL 收敛同 (conversation_id, message_id, seq) 的重复插入（ReplacingMergeTree
+        按 version 取最新；version=seq，重投同 seq 收敛不重复）。
+        """
+        if self._client is None:
+            raise RuntimeError("ClickHouse client is not connected")
+        limit = max(1, min(int(limit), 20000))
+        params: dict[str, Any] = {"cid": str(conversation_id), "limit": limit}
+        ids_clause = ""
+        if message_ids:
+            params["ids"] = [int(m) for m in message_ids]
+            ids_clause = "AND message_id IN {ids:Array(UInt64)} "
+        rows = await self.query(
+            "SELECT id, conversation_id, message_id, seq, item_type, item_json, "
+            "event_kind, tool_name, subagent_id, turn_number, status, created_at, version "
+            "FROM agent_message_events FINAL "
+            f"WHERE conversation_id = {{cid:String}} {ids_clause}"
+            "ORDER BY message_id ASC, seq ASC LIMIT {limit:UInt32}",
+            params,
+        )
+        return list(rows)
 
     # ── 任务对话内容存储 ─────────────────────────────────────────────
     # task_messages 存任务详情页的对话内容（user_input + agent 帧），append-only：

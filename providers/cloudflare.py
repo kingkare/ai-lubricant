@@ -11,6 +11,11 @@ from providers.custom import CustomProvider
 class CloudflareProvider(CustomProvider):
     PROVIDER_NAME = "cloudflare"
     SUPPORTS_MULTI_MESSAGES = True
+    # Workers AI 的地址由账号的 account_id 现拼（见 base_url property），渠道级 base_url
+    # 本来就该留空。不豁免会继承 CustomProvider 的 True：建/改渠道一律 400
+    # 「渠道地址（base_url）不能为空」，而前端对内置类型又不开放协议 Tab，用户连填的
+    # 地方都没有——编辑弹框保存必失败。
+    REQUIRES_BASE_URL = False
 
     @classmethod
     def account_schema(cls) -> dict:

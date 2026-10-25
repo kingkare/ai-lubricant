@@ -20,7 +20,10 @@ class _Provider:
         self.limits = SimpleNamespace()
 
     async def reserve_limits_with_decision(self, model_id, messages, context=None):
-        return await LimitManager.acquire_account(context["account_client"], model_id, messages)
+        return await LimitManager.acquire_account(
+            context["account_client"], model_id, messages,
+            is_test=bool((context or {}).get("is_test")),
+        )
 
     async def reserve_limits(self, model_id, messages, context=None):
         result = await self.reserve_limits_with_decision(model_id, messages, context)
@@ -364,13 +367,14 @@ class _LedgerRedis:
 
     async def eval(self, script, keys=None, args=None):
         keys = keys or []
-        # 用脚本首命令粗略分派到对应实现。
-        head = script.strip()
-        if head.startswith("local freeze_ttl"):
+        # 用脚本里的唯一子串分派（三个脚本首行都是注释/相同结构，不能靠 startswith）：
+        # reserve 独有 ZREMRANGEBYSCORE；rollback 独有 local removed；reconcile 写 committed。
+        head = script
+        if "ZREMRANGEBYSCORE" in head:
             return self._reserve(keys, args)
-        if head.startswith("local removed"):
+        if "local removed" in head:
             return self._rollback(keys, args)
-        if head.startswith("local rid"):
+        if "'committed'" in head:
             return self._reconcile(keys, args)
         return None
 
@@ -669,3 +673,172 @@ def test_tpm_lua_writes_freeze_before_return(monkeypatch):
     assert "redis.call('SET', KEYS[4], 'tpm', 'EX', model_ttl)" in captured["script"]
     assert result["account_used"] == 100
     assert result["model_used"] == 200
+
+
+# ==================== 测试/探测同样占并发（is_test / is_probe）====================
+
+def test_test_probe_reserve_flag_skips_freeze_and_index(monkeypatch):
+    """skip_freeze_checks=True：ARGV[32]=1 下传；三个冻结键 TTL 检查与可恢复索引
+    登记都必须被该标志门控（测试要能打到冻结账号，且不污染活跃预占索引）。"""
+    captured = {}
+
+    class FakeRedis:
+        prefix_key = "test"
+
+        async def eval(self, script, keys=None, args=None):
+            captured["script"] = script
+            captured["args"] = args
+            return [1, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+    monkeypatch.setattr(RedisLimitBackend, "redis", staticmethod(lambda: FakeRedis()))
+    result = asyncio.run(RedisLimitBackend.reserve_account_limits(
+        "account:p1:u1", "lease-tp",
+        freeze_key="limit:cooldown:p1:u1",
+        model_freeze_key="limit:model-tpm-freeze:m1",
+        account_model_freeze_key="limit:cooldown:p1:u1:model:m1",
+        concurrent_limit=2, rpm_limit=5,
+        skip_freeze_checks=True,
+    ))
+
+    assert captured["args"][31] == 1
+    script = captured["script"]
+    # 门控必须先于冻结检查出现。
+    assert script.index("ARGV[32]") < script.index("TTL', KEYS[4]")
+    # 索引登记（SADD）也在门控之内。
+    assert script.index("ARGV[32]") < script.index("SADD', KEYS[12]")
+    assert result["allowed"] is True
+
+    # 默认（正常请求）不带门控标志 → ARGV[32]=0。
+    result2 = asyncio.run(RedisLimitBackend.reserve_account_limits(
+        "account:p1:u1", "lease-n",
+        freeze_key="limit:cooldown:p1:u1",
+        model_freeze_key="limit:model-tpm-freeze:m1",
+        account_model_freeze_key="limit:cooldown:p1:u1:model:m1",
+        concurrent_limit=2, rpm_limit=5,
+    ))
+    assert captured["args"][31] == 0
+    assert result2["allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_test_probe_occupies_and_releases_concurrency(monkeypatch):
+    """测试请求同样占每账号并发槽：满位时第二个测试被拒（不再照发不误），
+    测试结束释放槽位；且测试不写 RPM/TPM ledger。"""
+    occupied: set[str] = set()
+    reserve_calls: list[dict] = []
+
+    async def _reserve(cls, account_key, lease_id, *, concurrent_limit=0, rpm_limit=0, rpd_limit=0, **kwargs):
+        now = time.time()
+        reserve_calls.append({
+            "concurrent_limit": concurrent_limit,
+            "rpm_limit": rpm_limit,
+            "skip_freeze_checks": kwargs.get("skip_freeze_checks"),
+            "token_amount": kwargs.get("token_amount", 0),
+        })
+        if concurrent_limit > 0:
+            if len(occupied) >= concurrent_limit:
+                return {
+                    "allowed": False, "reason": "concurrent", "ttl": 0, "retry_after": 1,
+                    "concurrent_used": len(occupied), "lease_expires_at": 0,
+                    "window_ids": RedisLimitBackend._reservation_window_ids(now),
+                }
+            occupied.add(lease_id)
+        return {
+            "allowed": True, "reason": "", "ttl": 0,
+            "lease_expires_at": now + 900,
+            "window_ids": RedisLimitBackend._reservation_window_ids(now),
+        }
+
+    async def _release(cls, account_key, lease_id):
+        occupied.discard(lease_id)
+        return True
+
+    monkeypatch.setattr(RedisLimitBackend, "reserve_account_limits", classmethod(_reserve))
+    monkeypatch.setattr(RedisLimitBackend, "release_account_reservation", classmethod(_release))
+    monkeypatch.setattr(LimitManager, "_start_lease_renewal", classmethod(lambda cls, lease: None))
+
+    from rate_limiter import ModelClientPool
+    account = AccountClient(_Provider(), rpm_limit=7, concurrent_limit=1)
+    candidate = {"provider_name": "p1", "account_client": account, "routed_model": "m1", "route_info": {}}
+
+    first, first_decision = await ModelClientPool._try_reserve(candidate, [], is_test=True)
+    assert first is not None
+    assert first_decision is not None and first_decision.allowed
+    assert account._in_flight == 1
+    assert len(occupied) == 1
+    # 测试口径：并发照占，但 RPM/token 不预占、冻结键不检查。
+    assert reserve_calls[0]["concurrent_limit"] == 1
+    assert reserve_calls[0]["rpm_limit"] == 0
+    assert reserve_calls[0]["token_amount"] == 0
+    assert reserve_calls[0]["skip_freeze_checks"] is True
+
+    second, second_decision = await ModelClientPool._try_reserve(candidate, [], is_test=True)
+    assert second is None
+    assert second_decision.reason == "concurrent_limit"
+    assert account._in_flight == 1
+
+    await account.release()
+    assert account._in_flight == 0
+    assert occupied == set()
+    assert LimitManager._active_leases == {}
+
+
+@pytest.mark.asyncio
+async def test_probe_reservation_keeps_normal_quota_ledger_disabled_for_tests(monkeypatch):
+    """探测（is_probe）经 _try_reserve 走同一测试口径：只占并发。"""
+    occupied: set[str] = set()
+    seen: dict = {}
+
+    async def _reserve(cls, account_key, lease_id, *, concurrent_limit=0, **kwargs):
+        seen["skip_freeze_checks"] = kwargs.get("skip_freeze_checks")
+        seen["rpm_limit"] = kwargs.get("rpm_limit")
+        occupied.add(lease_id)
+        return {
+            "allowed": True, "reason": "", "ttl": 0,
+            "lease_expires_at": time.time() + 900,
+            "window_ids": RedisLimitBackend._reservation_window_ids(time.time()),
+        }
+
+    async def _release(cls, account_key, lease_id):
+        occupied.discard(lease_id)
+        return True
+
+    monkeypatch.setattr(RedisLimitBackend, "reserve_account_limits", classmethod(_reserve))
+    monkeypatch.setattr(RedisLimitBackend, "release_account_reservation", classmethod(_release))
+    monkeypatch.setattr(LimitManager, "_start_lease_renewal", classmethod(lambda cls, lease: None))
+
+    from rate_limiter import ModelClientPool
+    account = AccountClient(_Provider(), rpm_limit=3, concurrent_limit=2)
+    candidate = {"provider_name": "p1", "account_client": account, "routed_model": "m1", "route_info": {}}
+    reserved, _ = await ModelClientPool._try_reserve(candidate, [], is_probe=True)
+    assert reserved is not None
+    assert seen["skip_freeze_checks"] is True
+    assert seen["rpm_limit"] == 0
+    await account.release()
+    assert occupied == set()
+
+
+@pytest.mark.asyncio
+async def test_test_probe_lease_skips_ledger_settlement(monkeypatch):
+    """测试/探测 lease 成功/失败都不碰 ledger：reconcile 绝不把真实 usage 写进 TPM
+    （否则测试消耗配额甚至触线冻结），rollback 无账可退。"""
+    calls: list[str] = []
+
+    async def _no_backend_call(*args, **kwargs):
+        calls.append("called")
+        return None
+
+    monkeypatch.setattr(RedisLimitBackend, "reconcile_account_reservation", _no_backend_call)
+    monkeypatch.setattr(RedisLimitBackend, "rollback_account_reservation", _no_backend_call)
+    monkeypatch.setattr(RedisLimitBackend, "finalize_reservation", _no_backend_call)
+
+    subject = LimitSubject(provider="p1", account="u1", model="m1")
+    lease = LimitLease(subject, "lease-tp-1", test_probe=True)
+    assert await LimitManager.reconcile_account_reservation(lease, 9999) is None
+    assert lease.settled is True
+
+    lease2 = LimitLease(subject, "lease-tp-2", test_probe=True)
+    assert await LimitManager.rollback_account_reservation(lease2) is None
+    assert lease2.rolled_back is True
+
+    assert calls == []

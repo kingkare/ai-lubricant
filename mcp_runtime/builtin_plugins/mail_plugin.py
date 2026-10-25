@@ -216,6 +216,26 @@ async def _resolve_instance_key(token: str) -> str | None:
     return str(rid) if rid is not None else None
 
 
+def _mail_session(ctx: PluginContext, config: dict):
+    """出站会话：账户绑了代理池条目（proxy_id）就经共享 ProxyManager 路由
+    （network/url_prefix/direct/node/browser 五模式，配置热更新即时生效）；
+    未绑回落 ctx.http_session() 直连——保持无代理时的原行为与测试桩兼容。
+
+    mail 上游登录有 JWT 会话态，按账户 id 隔离出站实例（与有登录态渠道同口径），
+    避免多账户共用一条出网连接被上游当同源。
+    """
+    proxy_id = str(config.get("proxy_id") or "").strip()
+    if not proxy_id:
+        return ctx.http_session()
+    import aiohttp
+    from providers.proxy_manager import get_proxy_manager
+    return get_proxy_manager().session(
+        account_id=f"mail:{config.get('id') or ''}",
+        proxy_config_id=proxy_id,
+        default_timeout=aiohttp.ClientTimeout(total=120),
+    )
+
+
 async def _query_messages(
     args: dict, ctx: PluginContext, *, require_address: bool, instance_key: str | None = None,
     allowed_account_ids: set[int] | None = None,
@@ -265,7 +285,7 @@ async def _query_messages(
         config.get("base_url") or "", config.get("secret_key") or "",
     )
     try:
-        async with ctx.http_session() as session:
+        async with _mail_session(ctx, config) as session:
             messages = await client.list_mail(
                 session, limit=limit, offset=offset,
                 address=source_address or None, keyword=keyword,

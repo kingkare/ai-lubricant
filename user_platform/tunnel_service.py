@@ -34,7 +34,7 @@ from .masking import mask_secret
 from .models_tunnel import TunnelBinding, TunnelScheme, TunnelRuntime
 from .tunnel_allocator import AllocationError, allocate, release
 
-KINDS = ("frpc", "cloudflared", "npc")
+KINDS = ("frpc", "cloudflared", "npc", "chmlfrp")
 
 # Reserved ``node_id`` meaning "the main service's own machine" rather than a
 # control-plane node. Kept as a sentinel value so the column stays NOT NULL and
@@ -47,7 +47,7 @@ _LIVE_TASK_STATUSES = ("pending", "processing")
 
 # Config keys holding a secret: masked in responses, preserved when the client
 # echoes the masked form back on update.
-_SECRET_KEYS = ("token", "api_token", "credentials")
+_SECRET_KEYS = ("token", "api_token", "credentials", "refresh_token", "access_token")
 
 # A single DNS label: 1-63 chars, alphanumeric + hyphen, no leading/trailing
 # hyphen. A domain is one or more labels joined by dots (max 253 total).
@@ -56,6 +56,23 @@ _DNS_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 # frpc client `user` (scheme config) and frpc proxy names (binding override):
 # plain TOML-safe identifiers, no quotes/whitespace/control characters.
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
+
+# ChmlFrp tunnel names: the panel is stricter than frpc's TOML names — it
+# accepts ONLY letters, digits and underscore (实测报「隧道名不符合规范，仅允许
+# 字母、数字和下划线」). Validate here so the user gets the error before the
+# panel call, and so the default/generated name conforms too.
+_CHMLFRP_TUNNEL_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+
+def _validate_chmlfrp_tunnel_name(value: str) -> str:
+    """Strip + validate a ChmlFrp tunnel name against the panel's rule."""
+    name = (value or "").strip()
+    if not _CHMLFRP_TUNNEL_NAME.match(name):
+        raise TunnelServiceError(
+            "invalid_argument",
+            "隧道名仅允许字母、数字和下划线(ChmlFrp 面板限制),最多 64 字符",
+        )
+    return name
 
 
 class TunnelServiceError(Exception):
@@ -121,41 +138,28 @@ def _validate_scheme_config(kind: str, config: dict[str, Any]) -> None:
     if kind not in KINDS:
         raise TunnelServiceError("invalid_argument", f"unsupported kind {kind!r}")
     config = config or {}
+    if kind == "chmlfrp":
+        # ChmlFrp is a *panel-managed* service: the user fills only the panel
+        # URL + token pair. There is NO server_addr/server_port/token to enter —
+        # the frps relay address is unknown until the platform creates a tunnel
+        # through the panel at binding time (see tunnel_panel_service.create_tunnel)
+        # and pulls the generated frpc ini. Validation here therefore only checks
+        # the panel credentials + defaulting the panel URL.
+        if not str(config.get("access_token") or "").strip():
+            raise TunnelServiceError("invalid_argument",
+                                     "chmlfrp requires access_token (面板 JWT)")
+        if not str(config.get("panel_url") or "").strip():
+            from .tunnel_panel_spec import panel_spec_for
+            config["panel_url"] = panel_spec_for("chmlfrp")["panel_url_default"]
+        # Drop any legacy frps fields so an edited row cannot carry stale values
+        # into the (panel-driven) render path.
+        for stale in ("server_addr", "server_port"):
+            config.pop(stale, None)
+        return
     if kind in ("frpc", "npc"):
         if not (config.get("server_addr") or "").strip():
             raise TunnelServiceError("invalid_argument", "server_addr is required")
-        # port_range is now optional: a scheme without one does no port-range
-        # restriction — each binding must then carry its own remote_port. A
-        # half/zero value like [0, 0] is treated as "unset" and dropped so the
-        # old front-end's empty-submission form self-heals; a real two-int
-        # range is validated in place.
-        rng = config.get("port_range")
-        if rng and any(rng):
-            if not isinstance(rng, list) or len(rng) != 2 or not all(isinstance(x, int) for x in rng):
-                raise TunnelServiceError("invalid_argument", "port_range must be [lo:int, hi:int]")
-            lo, hi = int(rng[0]), int(rng[1])
-            if lo <= 0 or hi < lo:
-                raise TunnelServiceError("invalid_argument", f"invalid port_range [{lo}, {hi}]")
-        elif "port_range" in config:
-            del config["port_range"]
-        # domain is optional for frpc/npc — a public-facing name for display.
-        if str(config.get("domain") or "").strip():
-            config["domain"] = _normalize_domain(str(config["domain"]))
-        # frpc only: an optional client `user` (TOML top-level). It also prefixes
-        # proxy names as `user.name`. npc's [common] has no user field, so the
-        # override is validated/kept only for frpc.
-        if kind == "frpc":
-            user = str(config.get("user") or "").strip()
-            if user:
-                if not _SAFE_NAME.match(user):
-                    raise TunnelServiceError(
-                        "invalid_argument",
-                        "user may only contain letters, digits, '.', '_' or '-'",
-                    )
-                config["user"] = user
-            elif "user" in config:
-                # empty string → drop the key so it is not echoed back.
-                del config["user"]
+        _validate_frp_family(config, kind)
     elif kind == "cloudflared":
         mode = (config.get("mode") or "quick").strip()
         if mode not in ("quick", "managed"):
@@ -172,6 +176,42 @@ def _validate_scheme_config(kind: str, config: dict[str, Any]) -> None:
             if not str(config.get("domain") or "").strip():
                 raise TunnelServiceError("invalid_argument", "cloudflared managed requires domain")
             config["domain"] = _normalize_domain(str(config["domain"]))
+
+
+def _validate_frp_family(config: dict[str, Any], kind: str) -> None:
+    """Shared validation for the frp-family kinds (frpc / npc / chmlfrp).
+
+    ``config`` is mutated in place (normalized domain, cleaned ``user``, dropped
+    empty ``port_range``). ``server_addr``/``token`` presence is the caller's
+    responsibility (chmlfrp swaps ``server_addr`` for the panel token).
+    """
+    rng = config.get("port_range")
+    if rng and any(rng):
+        if not isinstance(rng, list) or len(rng) != 2 or not all(isinstance(x, int) for x in rng):
+            raise TunnelServiceError("invalid_argument", "port_range must be [lo:int, hi:int]")
+        lo, hi = int(rng[0]), int(rng[1])
+        if lo <= 0 or hi < lo:
+            raise TunnelServiceError("invalid_argument", f"invalid port_range [{lo}, {hi}]")
+    elif "port_range" in config:
+        del config["port_range"]
+    # domain is optional — a public-facing name for display.
+    if str(config.get("domain") or "").strip():
+        config["domain"] = _normalize_domain(str(config["domain"]))
+    # frpc (and chmlfrp, whose panel profile has no user) keep an optional client
+    # ``user``. npc's [common] has no user field, so the override is validated/kept
+    # only for frpc.
+    if kind in ("frpc", "chmlfrp"):
+        user = str(config.get("user") or "").strip()
+        if user:
+            if not _SAFE_NAME.match(user):
+                raise TunnelServiceError(
+                    "invalid_argument",
+                    "user may only contain letters, digits, '.', '_' or '-'",
+                )
+            config["user"] = user
+        elif "user" in config:
+            # empty string → drop the key so it is not echoed back.
+            del config["user"]
 
 
 def _is_masked(value: str | None) -> bool:
@@ -296,6 +336,7 @@ def _binding_dict(row: TunnelBinding) -> dict:
         "description": row.description,
         "proxy_name": row.proxy_name,
         "remote_port": row.remote_port,
+        "panel_node": row.panel_node,
         "hostname": row.hostname,
         "public_addr": row.public_addr,
         "allocated_value": row.allocated_value,
@@ -315,6 +356,17 @@ def _binding_dict(row: TunnelBinding) -> dict:
 async def list_schemes(user_id: str) -> list[dict]:
     rows = await TunnelScheme.filter(user_id=uuid.UUID(user_id)).order_by("-created_at")
     return [_scheme_dict(r) for r in rows]
+
+
+async def get_scheme(user_id: str, scheme_id: str) -> dict:
+    """One scheme by id (panel endpoints use the **raw** config so the panel
+    client can read the cleartext token — not the masked public projection)."""
+    row = await TunnelScheme.get_or_none(id=uuid.UUID(scheme_id), user_id=uuid.UUID(user_id))
+    if row is None:
+        raise TunnelServiceError("not_found", "scheme not found")
+    d = _scheme_dict(row)
+    d["config"] = dict(row.config or {})
+    return d
 
 
 async def create_scheme(
@@ -416,14 +468,14 @@ async def _resolve_project_node(project_id: str) -> str:
 
     A project has no node of its own — its previewable services run inside the
     node its running task holds, so that node is the only meaningful tunnel
-    target for a project-attached binding. Prefers the exclusive
-    :class:`TaskNodeBinding` record (one node ↔ one task) and falls back to the
-    task row's own ``node_id``.
+    target for a project-attached binding. The task row's own ``node_id`` is the
+    single source of truth (the retired exclusive ``TaskNodeBinding`` occupation
+    table is gone; the node server enforces capacity now).
 
     Raises :class:`TunnelServiceError` when the project has no live task, since
     there is then no node to expose.
     """
-    from .models_task import ProjectTask, Task, TaskNodeBinding
+    from .models_task import ProjectTask, Task
 
     task_ids = [
         row.task_id
@@ -436,8 +488,7 @@ async def _resolve_project_node(project_id: str) -> str:
             .only("id", "node_id")
         )
         for task in live:
-            lease = await TaskNodeBinding.get_or_none(task_id=task.id)
-            node_id = (lease.node_id if lease else None) or (task.node_id or "")
+            node_id = task.node_id or ""
             if node_id.strip():
                 return node_id.strip()
     raise TunnelServiceError(
@@ -458,6 +509,7 @@ async def create_binding(
     description: str | None = None,
     proxy_name: str | None = None,
     remote_port: int | None = None,
+    panel_node: str | None = None,
 ) -> dict:
     """Create a binding and return pending; the runtime service starts the client.
 
@@ -504,10 +556,32 @@ async def create_binding(
         proxy_name = None
         remote_port = None
 
-    # frpc/npc overrides: validate + dedupe before touching the allocator.
+    # chmlfrp: the platform creates the tunnel through the panel at dispatch
+    # time (see tunnel_panel_service.create_tunnel) and the panel assigns the
+    # remote port + public address. So there is NO port-range allocation here;
+    # we only validate the tunnel name (proxy_name) and the chosen relay node.
     clean_proxy_name: str | None = None
     clean_remote_port: int | None = None
-    if scheme.kind in ("frpc", "npc"):
+    clean_panel_node: str | None = None
+    if scheme.kind == "chmlfrp":
+        clean_panel_node = (panel_node or "").strip()
+        if not clean_panel_node:
+            raise TunnelServiceError(
+                "invalid_argument", "请选择 ChmlFrp 服务节点(创建隧道的中继节点)"
+            )
+        if proxy_name:
+            # chmlfrp 的隧道名规则比 frpc 严格:只允许字母/数字/下划线。在后端
+            # 先校验,错误在保存时就抛,而不是等面板调用失败。
+            clean_proxy_name = _validate_chmlfrp_tunnel_name(proxy_name)
+            if await _proxy_name_in_use(scheme.id, clean_proxy_name):
+                raise TunnelServiceError(
+                    "in_use", f"隧道名 {clean_proxy_name!r} 已被本服务的其它代理使用"
+                )
+        if remote_port:
+            clean_remote_port = int(remote_port)
+            if not 1 <= clean_remote_port <= 65535:
+                raise TunnelServiceError("invalid_argument", "remote_port must be 1-65535")
+    elif scheme.kind in ("frpc", "npc"):
         if proxy_name and scheme.kind == "frpc":
             clean_proxy_name = _validate_proxy_name(proxy_name)
             if await _proxy_name_in_use(scheme.id, clean_proxy_name):
@@ -529,7 +603,12 @@ async def create_binding(
                 "该方案未配置端口段,创建代理时必须填写远端端口",
             )
 
-    if clean_remote_port:
+    if scheme.kind == "chmlfrp":
+        # No address yet — the panel assigns it at dispatch; the list shows
+        # "地址生成中…" until the runtime creates the tunnel and back-fills.
+        public_addr = None
+        allocated_value = None
+    elif clean_remote_port:
         # User-chosen port: deterministic address, no pool allocation.
         public_addr = public_addr_override or f"{_public_host(scheme)}:{clean_remote_port}"
         allocated_value = None
@@ -560,6 +639,7 @@ async def create_binding(
         description=(description or "").strip() or None,
         proxy_name=clean_proxy_name,
         remote_port=clean_remote_port,
+        panel_node=clean_panel_node,
         hostname=hostname,
         public_addr=public_addr,
         allocated_value=allocated_value,
@@ -596,6 +676,7 @@ async def update_binding(
     description: str | None = None,
     proxy_name: str | None = None,
     remote_port: int | None = None,
+    panel_node: str | None = None,
 ) -> dict:
     """Edit a binding's mutable fields; runtime reconciles asynchronously.
 
@@ -656,12 +737,62 @@ async def update_binding(
             await _drop_binding_dns(row, scheme)
 
     old_node = row.node_id
+    old_local_port = row.local_port
 
     row.node_id = resolved_node
     row.local_host = local_host or "127.0.0.1"
     row.local_port = int(local_port)
     row.description = (description or "").strip() or None
     row.hostname = new_hostname
+
+    if scheme.kind == "chmlfrp":
+        # ChmlFrp: the panel tunnel is defined by (relay node, tunnel name,
+        # local port, remote port). Changing any of them means the existing
+        # panel tunnel no longer matches, so the runtime must re-create it —
+        # drop the cached ini (provider_ref) and let the reconciler provision a
+        # fresh tunnel with the new parameters.
+        new_panel_node = (panel_node or "").strip()
+        if not new_panel_node:
+            raise TunnelServiceError(
+                "invalid_argument", "请选择 ChmlFrp 服务节点(创建隧道的中继节点)"
+            )
+        new_name = row.proxy_name
+        if proxy_name:
+            clean_name = _validate_chmlfrp_tunnel_name(proxy_name)
+            if clean_name != (row.proxy_name or "") and await _proxy_name_in_use(
+                scheme.id, clean_name, exclude_binding_id=row.id
+            ):
+                raise TunnelServiceError(
+                    "in_use", f"隧道名 {clean_name!r} 已被本服务的其它代理使用"
+                )
+            new_name = clean_name
+        new_remote_port = int(remote_port) if remote_port else None
+        changed = (
+            new_panel_node != (row.panel_node or "")
+            or new_name != (row.proxy_name or "")
+            or new_remote_port != row.remote_port
+            or int(local_port) != old_local_port
+        )
+        row.panel_node = new_panel_node
+        row.proxy_name = new_name
+        row.remote_port = new_remote_port
+        if changed:
+            await _drop_chmlfrp_tunnel(row, scheme)
+        row.desired_state = "running"
+        row.client_status = "pending"
+        row.error = None
+        await row.save(update_fields=[
+            "node_id", "local_host", "local_port", "hostname", "public_addr",
+            "description", "proxy_name", "remote_port", "panel_node",
+            "desired_state", "client_status", "error", "updated_at",
+        ])
+        await _fence_group_runtime(row, scheme, node_id=resolved_node)
+        if old_node != resolved_node:
+            await _fence_group_runtime(row, scheme, node_id=old_node)
+        from .tunnel_notify import notify_tunnel_changed
+
+        await notify_tunnel_changed(runtime_id=str(row.id), target_id=resolved_node)
+        return _binding_dict(row)
 
     # frpc/npc proxy overrides. Empty remote_port = keep current; an explicit
     # change re-checks uniqueness and recomputes the public address.
@@ -745,6 +876,30 @@ async def _drop_binding_dns(row: TunnelBinding, scheme: TunnelScheme) -> None:
     # Clear the id so the runtime re-creates a record for the new hostname.
     row.provider_ref = {k: v for k, v in (row.provider_ref or {}).items() if k != "dns_record_id"}
     await row.save(update_fields=["provider_ref", "updated_at"])
+
+
+async def _drop_chmlfrp_tunnel(row: TunnelBinding, scheme: TunnelScheme) -> None:
+    """Force the chmlfrp runtime to re-provision its panel tunnel.
+
+    The panel-issued frpc ini is cached on the *runtime* (``provider_ref``), and
+    the reconciler reuses it as long as it is present. When a binding's
+    tunnel-defining fields change (relay node / tunnel name / ports), the cached
+    ini no longer matches, so clear it here — the next reconcile re-creates the
+    panel tunnel with the new parameters. Idempotent and best-effort.
+    """
+    from .tunnel_runtime_manager import runtime_key
+
+    try:
+        key = runtime_key(scheme, row.node_id, str(row.id))
+        runtime = await TunnelRuntime.get_or_none(runtime_key=key)
+        if runtime is not None:
+            runtime.provider_ref = {
+                k: v for k, v in (runtime.provider_ref or {}).items()
+                if k not in ("frpc_ini", "tunnel_name", "panel_node")
+            }
+            await runtime.save(update_fields=["provider_ref", "updated_at"])
+    except Exception as exc:  # noqa: BLE001 — cache drop must not block the edit
+        logger.warning("[tunnel] chmlfrp cache drop failed for {}: {}", row.id, exc)
 
 
 async def _fence_group_runtime(

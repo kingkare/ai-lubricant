@@ -72,6 +72,7 @@ def merge(monkeypatch):
 
 
 def _ios_resource(resource_id: int, device_id: str, node_id: str, **ios_extra) -> dict:
+    # udid 可用 ios_extra 覆盖（多设备用例），默认 UDID-1。
     ios = {"udid": "UDID-1", "node_id": node_id, "wda_state": "missing"}
     ios.update(ios_extra)
     return {"id": resource_id, "device_id": device_id, "ios": ios, "platform": "ios"}
@@ -83,7 +84,7 @@ def test_merges_wda_progress_into_ios_block(merge):
     inv = {
         "node-a": {
             "devices": [
-                {"device_id": "dev_X", "wda_state": "preparing", "wda_progress": 42, "wda_stage": "downloading"}
+                {"udid": "UDID-1", "device_id": "dev_X", "wda_state": "preparing", "wda_progress": 42, "wda_stage": "downloading"}
             ]
         }
     }
@@ -97,7 +98,7 @@ def test_merges_wda_progress_into_ios_block(merge):
 
 def test_merges_terminal_state(merge):
     resources = [_ios_resource(36, "dev_X", "node-a")]
-    inv = {"node-a": {"devices": [{"device_id": "dev_X", "wda_state": "ready", "profile_expires_at": "2026-10-01T00:00:00Z"}]}}
+    inv = {"node-a": {"devices": [{"udid": "UDID-1", "device_id": "dev_X", "wda_state": "ready", "profile_expires_at": "2026-10-01T00:00:00Z"}]}}
     merge(resources, inv)
 
     assert resources[0]["ios"]["wda_state"] == "ready"
@@ -117,7 +118,7 @@ def test_node_unreachable_keeps_existing_state(merge):
 def test_empty_values_do_not_overwrite(merge):
     """节点清单里字段为空（刚重连还没填全）时不覆盖已有值。"""
     resources = [_ios_resource(36, "dev_X", "node-a", wda_state="ready", wda_progress=100)]
-    inv = {"node-a": {"devices": [{"device_id": "dev_X", "wda_state": "", "wda_progress": 0, "wda_stage": ""}]}}
+    inv = {"node-a": {"devices": [{"udid": "UDID-1", "device_id": "dev_X", "wda_state": "", "wda_progress": 0, "wda_stage": ""}]}}
     merge(resources, inv)
 
     # 空字符串不覆盖；wda_progress=0 是有效值（新 job 开始），保留 0。
@@ -128,14 +129,14 @@ def test_empty_values_do_not_overwrite(merge):
 def test_no_n_plus_one_per_node(merge):
     """同一节点的多台设备只取一次 inventory。"""
     resources = [
-        _ios_resource(1, "dev_A", "node-a"),
-        _ios_resource(2, "dev_B", "node-a"),
-        _ios_resource(3, "dev_C", "node-a"),
+        _ios_resource(1, "dev_A", "node-a", udid="UDID-A"),
+        _ios_resource(2, "dev_B", "node-a", udid="UDID-B"),
+        _ios_resource(3, "dev_C", "node-a", udid="UDID-C"),
     ]
     inv = {"node-a": {"devices": [
-        {"device_id": "dev_A", "wda_state": "ready"},
-        {"device_id": "dev_B", "wda_state": "preparing", "wda_progress": 10},
-        {"device_id": "dev_C", "wda_state": "missing"},
+        {"udid": "UDID-A", "device_id": "dev_A", "wda_state": "ready"},
+        {"udid": "UDID-B", "device_id": "dev_B", "wda_state": "preparing", "wda_progress": 10},
+        {"udid": "UDID-C", "device_id": "dev_C", "wda_state": "missing"},
     ]}}
     client = merge(resources, inv)
 
@@ -151,10 +152,23 @@ def test_non_ios_resources_untouched(merge):
     assert client.calls == [], "没有 iOS 设备时不该请求任何节点"
 
 
-def test_device_id_mismatch_is_skipped(merge):
-    """inventory 里的 device_id 对不上任何资源时不误改。"""
+def test_udid_mismatch_is_skipped(merge):
+    """inventory 里的 udid 对不上任何资源时不误改。"""
     resources = [_ios_resource(36, "dev_X", "node-a", wda_state="missing")]
-    inv = {"node-a": {"devices": [{"device_id": "dev_OTHER", "wda_state": "ready"}]}}
+    inv = {"node-a": {"devices": [{"udid": "UDID-OTHER", "device_id": "dev_OTHER", "wda_state": "ready"}]}}
     merge(resources, inv)
 
     assert resources[0]["ios"]["wda_state"] == "missing"
+
+
+def test_matches_by_udid_when_device_id_changed(merge):
+    """核心回归：节点侧 device_id 变了（认领丢失后重认领），按 udid 仍匹配。
+
+    旧实现按 device_id 匹配，此时漏 → 设备恒显示离线（用户报的「插着却离线」）。
+    """
+    resources = [_ios_resource(36, "dev_OLD", "node-a", wda_state="missing")]
+    inv = {"node-a": {"devices": [{"udid": "UDID-1", "device_id": "dev_NEW", "wda_state": "ready", "present": True}]}}
+    merge(resources, inv)
+
+    assert resources[0]["ios"]["wda_state"] == "ready", "device_id 变了也要按 udid 匹配上"
+    assert resources[0]["ios"]["present"] is True

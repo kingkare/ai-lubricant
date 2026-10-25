@@ -26,6 +26,7 @@ models_router = APIRouter(prefix="/api/v1/users/models", tags=["user-platform-us
 
 @models_router.get("")
 async def list_user_models(team_id: str = Depends(get_current_team_id)) -> dict:
+    """列出当前团队的模型配置。"""
     return await team_models_service.list_models(team_id)
 
 
@@ -40,6 +41,7 @@ async def list_available_user_models(team_id: str = Depends(get_current_team_id)
 async def create_user_model(
     request: Request, team_id: str = Depends(get_current_team_id)
 ) -> dict:
+    """新建团队模型配置。"""
     body = await request.json()
     return await team_models_service.create_model(team_id, body)
 
@@ -48,6 +50,7 @@ async def create_user_model(
 async def health_check_user_model(
     request: Request, _team_id: str = Depends(get_current_team_id)
 ) -> dict:
+    """对请求体里的临时模型配置做连通性检查（不落库）。"""
     body = await request.json()
     return await team_models_service.health_check_adhoc(body)
 
@@ -56,6 +59,7 @@ async def health_check_user_model(
 async def update_user_model(
     model_id: str, request: Request, team_id: str = Depends(get_current_team_id)
 ) -> dict:
+    """更新指定模型配置。模型不存在或无权访问时返回 404。"""
     body = await request.json()
     result = await team_models_service.update_model(team_id, model_id, body)
     if result is None:
@@ -67,6 +71,7 @@ async def update_user_model(
 async def delete_user_model(
     model_id: str, team_id: str = Depends(get_current_team_id)
 ) -> dict:
+    """删除指定模型配置。模型不存在或无权访问时返回 404。"""
     ok = await team_models_service.delete_model(team_id, model_id)
     if not ok:
         raise HTTPException(status_code=404, detail="模型不存在或无权访问")
@@ -77,6 +82,7 @@ async def delete_user_model(
 async def health_check_stored_user_model(
     model_id: str, team_id: str = Depends(get_current_team_id)
 ) -> dict:
+    """对已保存的模型配置做连通性检查。模型不存在或无权访问时返回 404。"""
     result = await team_models_service.health_check_stored(team_id, model_id)
     if result is None:
         raise HTTPException(status_code=404, detail="模型不存在或无权访问")

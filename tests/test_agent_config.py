@@ -15,17 +15,16 @@ def _assert_default_config(cfg: AgentConfig) -> None:
     assert cfg.model == ""
     assert cfg.subagent_api_key == ""
     assert cfg.subagent_model == ""
-    assert cfg.max_turns == 80
+    assert cfg.max_turns == 200
     assert cfg.max_concurrent_tasks == 5
     assert cfg.memory_enabled is True
     assert cfg.skill_auto_learn is True
     assert cfg.browser_enabled is False
     assert cfg.subagent_enabled is True
-    assert cfg.scheduler_enabled is False
     assert cfg.cdp_bridge_mode == "stdio"
     assert cfg.cdp_bridge_token == ""
     assert cfg.workspace_root == "agent/workspace"
-    assert cfg.allowed_roots == ["agent/workspace", "agent/temp"]
+    assert cfg.allowed_roots == ["agent/workspace"]
     assert cfg.denied_patterns == [
         r"^/etc/",
         r"^/var/",
@@ -41,7 +40,7 @@ def test_agent_config_defaults() -> None:
     cfg = AgentConfig()
 
     assert cfg.enabled is False
-    assert cfg.max_turns == 80
+    assert cfg.max_turns == 200
     assert cfg.model == ""
     assert cfg.subagent_model == ""
     assert cfg.cdp_bridge_mode == "stdio"
@@ -56,7 +55,7 @@ def test_from_dict_sets_known_fields_and_leaves_others_default() -> None:
     assert cfg.enabled is True
     assert cfg.api_key == "k1"
     assert cfg.model == "m1"
-    assert cfg.max_turns == 80
+    assert cfg.max_turns == 200
     assert cfg.model == "m1"
     assert cfg.subagent_model == ""
     assert cfg.cdp_bridge_mode == "stdio"
@@ -74,7 +73,7 @@ def test_from_dict_ignores_unknown_keys_without_raising() -> None:
     assert cfg.enabled is False
     assert cfg.api_key == ""
     assert cfg.subagent_model == ""
-    assert cfg.max_turns == 80
+    assert cfg.max_turns == 200
     assert cfg.memory_enabled is True
     assert cfg.browser_enabled is False
     assert cfg.cdp_bridge_mode == "stdio"
@@ -87,6 +86,15 @@ def test_from_dict_empty_none_and_string_return_default_config() -> None:
     assert AgentConfig.from_dict("notadict") == AgentConfig()
 
 
+def test_from_dict_drops_removed_scheduler_enabled() -> None:
+    """历史主配置里残留的 agent.scheduler_enabled 按未知字段忽略，不报错不保留。"""
+    cfg = AgentConfig.from_dict({"scheduler_enabled": True, "model": "m"})
+
+    assert not hasattr(cfg, "scheduler_enabled")
+    assert cfg.model == "m"
+    assert "scheduler_enabled" not in cfg.to_dict()
+
+
 def test_round_trip_from_to_dict_reproduces_non_default_config() -> None:
     cfg = AgentConfig(
         enabled=True,
@@ -94,13 +102,13 @@ def test_round_trip_from_to_dict_reproduces_non_default_config() -> None:
         model="m",
         subagent_api_key="sk",
         subagent_model="sm",
+        subagent_model_map={"roles": {"verify": "strong"}, "categories": {"quick": "fast"}},
         max_turns=123,
         max_concurrent_tasks=7,
         memory_enabled=False,
         skill_auto_learn=False,
         browser_enabled=True,
         subagent_enabled=False,
-        scheduler_enabled=True,
         cdp_bridge_mode="http",
         cdp_bridge_token="token",
         workspace_root="custom/workspace",
@@ -111,6 +119,13 @@ def test_round_trip_from_to_dict_reproduces_non_default_config() -> None:
     reloaded = AgentConfig.from_dict(cfg.to_dict())
 
     assert reloaded == cfg
+
+
+def test_subagent_model_map_defaults_to_empty_dict() -> None:
+    """新字段默认空 dict；to_dict 必须带上它（否则 round-trip 丢字段）。"""
+    cfg = AgentConfig()
+    assert cfg.subagent_model_map == {}
+    assert cfg.to_dict()["subagent_model_map"] == {}
 
 
 def test_allowed_roots_and_denied_patterns_are_non_empty_independent_lists() -> None:

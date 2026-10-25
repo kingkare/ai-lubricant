@@ -1,13 +1,21 @@
 """Guardian / Daemon modes for Agent.
 
-Implements two GenericAgent-inspired long-running modes:
+Implements three GenericAgent-inspired long-running modes:
 
 1. Goal Mode:
    - User gives an objective + time budget.
    - Agent is repeatedly woken with alternating create/inspect/improve prompts.
    - Budget exhaustion triggers wrap-up.
 
-2. Autonomous Mode:
+2. Ralph Mode:
+   - User gives an objective + round cap.
+   - Each round runs as a FRESH bounded agent loop carrying only the objective
+     and the previous round's structured report; the round's final text is
+     parsed+validated as a strict report (continue/complete/blocked).
+   - State lives in agent_goal_states with mode='ralph', mirroring goal mode.
+   - complete/blocked/max-rounds triggers wrap-up.
+
+3. Autonomous Mode:
    - Agent can run background TODO-driven work when enabled.
    - This module stores state; actual idle detection/triggering is handled by scheduler/API layer.
 """
@@ -170,6 +178,147 @@ class Guardian:
             await conn.execute(
                 "UPDATE agent_goal_states SET status=$2, updated_at=now() "
                 "WHERE agent_id=$1 AND mode='goal' AND status IN ('running','wrapping_up')",
+                self.agent_id,
+                status,
+            )
+
+    # ── Ralph mode ────────────────────────────────────────────────────────────
+    # Mirrors goal mode's shape exactly: one row in agent_goal_states with
+    # mode='ralph', max_turns holds the round cap, state jsonb holds the previous
+    # round's validated report (the handoff). The API/chat driver loop owns the
+    # rounds; this class owns the state machine.
+
+    async def start_ralph_mode(
+        self,
+        objective: str,
+        max_rounds: int,
+    ) -> dict[str, Any]:
+        """Start a ralph-mode run for this agent."""
+        if not PostgresClient.pool:
+            raise RuntimeError("Database not available")
+        max_rounds = max(1, int(max_rounds))
+        async with PostgresClient.pool.acquire() as conn:
+            # Stop existing running ralph modes for this agent
+            await conn.execute(
+                "UPDATE agent_goal_states SET status='stopped', updated_at=now() "
+                "WHERE agent_id=$1 AND mode='ralph' AND status='running'",
+                self.agent_id,
+            )
+            row = await conn.fetchrow(
+                """
+                INSERT INTO agent_goal_states(
+                    agent_id, mode, objective, budget_seconds, start_time,
+                    turns_used, max_turns, status, state
+                ) VALUES($1, 'ralph', $2, 0, now(), 0, $3, 'running', '{}'::jsonb)
+                RETURNING *
+                """,
+                self.agent_id, objective, max_rounds,
+            )
+        return _state_row_to_dict(row)
+
+    async def stop_ralph_mode(self) -> bool:
+        """Stop active ralph mode for this agent."""
+        if not PostgresClient.pool:
+            return False
+        async with PostgresClient.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE agent_goal_states SET status='stopped', updated_at=now() "
+                "WHERE agent_id=$1 AND mode='ralph' AND status='running'",
+                self.agent_id,
+            )
+        return result.endswith("1")
+
+    async def get_ralph_state(self) -> dict[str, Any] | None:
+        """Latest ralph-mode state row (running or terminal)."""
+        if not PostgresClient.pool:
+            return None
+        async with PostgresClient.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM agent_goal_states WHERE agent_id=$1 AND mode='ralph' "
+                "ORDER BY created_at DESC LIMIT 1",
+                self.agent_id,
+            )
+        return _state_row_to_dict(row) if row else None
+
+    async def next_ralph_round(self) -> dict[str, Any] | None:
+        """Advance ralph state and return the round descriptor, or None when done.
+
+        Returns ``{"round": int, "max_rounds": int, "objective": str, "prompt": str}``
+        for the next round, or ``None`` if the round cap was hit (the driver loop
+        then ends with the max_rounds outcome). The handoff is read from
+        ``state.handoff`` (the previous round's validated report) — :func:`record_ralph_report`
+        is what writes it.
+        """
+        if not PostgresClient.pool:
+            return None
+        from agent.ralph import build_round_prompt
+        async with PostgresClient.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM agent_goal_states WHERE agent_id=$1 AND mode='ralph' AND status='running' "
+                "ORDER BY created_at DESC LIMIT 1",
+                self.agent_id,
+            )
+            if not row:
+                return None
+            state = dict(row)
+            rounds_done = int(state.get("turns_used") or 0)
+            max_rounds = int(state.get("max_turns") or 16)
+            objective = state.get("objective") or ""
+            if rounds_done >= max_rounds:
+                # Round cap hit — switch to wrapping_up so the driver loop sees
+                # no more running row and ends with the max_rounds outcome.
+                await conn.execute(
+                    "UPDATE agent_goal_states SET status='wrapping_up', updated_at=now() WHERE id=$1",
+                    state["id"],
+                )
+                return None
+            stored_state = state.get("state")
+            if isinstance(stored_state, str):
+                try:
+                    import json as _json
+                    stored_state = _json.loads(stored_state) if stored_state else {}
+                except (ValueError, TypeError):
+                    stored_state = {}
+            if not isinstance(stored_state, dict):
+                stored_state = {}
+            handoff = stored_state.get("handoff")
+            prompt = build_round_prompt(objective, handoff, rounds_done + 1, max_rounds)
+            return {
+                "round": rounds_done + 1,
+                "max_rounds": max_rounds,
+                "objective": objective,
+                "prompt": prompt,
+            }
+
+    async def record_ralph_report(self, report: dict[str, Any]) -> None:
+        """Store one round's validated report as the next round's handoff.
+
+        Bumps ``turns_used`` so the round cap is enforced. The status stays
+        ``running`` — terminal status is set by :func:`mark_ralph_done`.
+        """
+        if not PostgresClient.pool:
+            return
+        import json as _json
+        async with PostgresClient.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE agent_goal_states "
+                "SET state = jsonb_build_object('handoff', $2::jsonb), "
+                "turns_used = turns_used + 1, updated_at = now() "
+                "WHERE agent_id=$1 AND mode='ralph' AND status='running'",
+                self.agent_id,
+                _json.dumps(report, ensure_ascii=False),
+            )
+
+    async def mark_ralph_done(self, *, outcome: str = "done") -> None:
+        """Mark ralph mode terminal. outcome ∈ {complete, blocked, max_rounds,
+        round_failed, done}."""
+        if not PostgresClient.pool:
+            return
+        status = f"done_{outcome}" if outcome != "done" else "done"
+        async with PostgresClient.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE agent_goal_states SET status=$2, updated_at=now() "
+                "WHERE agent_id=$1 AND mode='ralph' AND status IN ('running','wrapping_up')",
                 self.agent_id,
                 status,
             )

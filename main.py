@@ -28,6 +28,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers
+from starlette.middleware.gzip import GZipMiddleware as _GZipMiddleware, GZipResponder as _GZipResponder
 from loguru import logger
 import config
 import model_catalog
@@ -36,7 +38,13 @@ from channel import chat_protocols_from_legacy, _LEGACY_CHAT_KEYS
 from admin import router as admin_router, loopback_router as admin_loopback_router
 from providers import CustomProvider, EdgeOneAIProvider
 from providers.cloudflare import CloudflareProvider
-from providers.base import IncompleteStreamError, EmptyNonStreamResponseError, normalize_upstream_error_message
+from providers.base import (
+    IncompleteStreamError,
+    EmptyNonStreamResponseError,
+    is_output_intercepted_error,
+    normalize_upstream_error_message,
+    ChannelError,
+)
 from proxy_utils import runtime_accounts, to_manager_config
 from providers.proxy_manager import (
     get_proxy_manager,
@@ -49,12 +57,15 @@ from rate_limiter import (
     NoAvailableAccountError,
     begin_routing_timing,
     end_routing_timing,
+    begin_routing_request_ctx,
+    end_routing_request_ctx,
 )
 from limits.manager import LimitManager, begin_routing_redis_scope, end_routing_redis_scope, routing_redis_state
 from message_utils import anthropic_to_openai_messages, openai_to_anthropic_response, convert_stream_to_anthropic, responses_to_openai_messages, openai_to_responses_response, iter_sse_payloads
 from rd import JdbcClient
 from db import PostgresClient
 from request_log_writer import request_log_writer
+import compaction_detect
 
 
 # 文件日志目录。默认仓库内 logs/；releases+current 布局下经 LOG_DIR 指到跨版本
@@ -82,8 +93,7 @@ def _configure_file_logging() -> None:
     )
 from usage_utils import normalize_usage, usage_value, estimate_usage, fill_usage_with_estimate, set_tokenizer_rules_getter, estimate_request_part_tokens, estimate_request_part_tokens as _estimate_request_part_tokens, estimate_input_tokens, estimate_input_token_parts, request_input_parts, estimate_request_tokens
 from shared_init import init_shared_services
-from agent.config import AgentConfig
-from agent.runner import AgentTaskRunner
+from agent.runner import AgentTaskRunner, scheduler_wanted
 import attempt_builder
 import retry_policy
 from request_reservations import ApiKeyReservation, CandidateReservation
@@ -246,6 +256,22 @@ async def lifespan(_app: FastAPI):
     except Exception:
         logger.exception("[attachment] signing key bootstrap failed; signed URLs will fall back to login-state")
 
+    # 浏览器插件密码管理器的列加密密钥：缺失即生成随机值并写回 .env（或回退从
+    # AGENT_ATTACHMENT_SIGNING_KEY 派生）。缺密钥会让已存密码无法解密，不静默降级。
+    try:
+        import browser_password_crypto
+        browser_password_crypto.ensure_password_key()
+    except Exception:
+        logger.exception("[browser-password] encryption key bootstrap failed; saved passwords will be unavailable")
+
+    # Apple ID 密码列加密密钥（自动重登用）：同款路径。缺密钥只是退回「token 过期
+    # 需人工重登」，已存的密码密文解不开时调用方按需重登，不静默降级。
+    try:
+        from user_platform.apple_signing import password_crypto
+        password_crypto.ensure_apple_password_key()
+    except Exception:
+        logger.exception("[apple-signing] password key bootstrap failed; auto-relogin will be unavailable")
+
     await init_shared_services()
     try:
         from db import PostgresClient
@@ -304,6 +330,10 @@ async def lifespan(_app: FastAPI):
             )
             await _conv_client.connect()
             await _conv_client.ensure_conversation_schema(ttl_days=365)
+            # Agent 对话时间线事件表（每帧一行，seq 有序）。与 agent_messages 同库、
+            # 借用同一客户端；agent_messages 继续作为投影（分页游标/envelope/LLM 上下文
+            # /无帧降级），本表是时间线顺序的唯一权威。见 agent/conversation_store。
+            await _conv_client.ensure_agent_message_events_schema(ttl_days=365)
             conversation_store.attach_client(_conv_client)
             await conversation_store.seed_message_id()
             logger.info("[conversation_store] ClickHouse ready, schema ensured")
@@ -347,7 +377,6 @@ async def lifespan(_app: FastAPI):
     try:
         from db import PostgresClient
         await PostgresClient.migrate_orphan_agents_owner()
-        await PostgresClient.migrate_orphan_scheduled_tasks_owner()
     except Exception:
         logger.exception("[startup] orphan owner reparent migration failed; main service continues")
 
@@ -358,6 +387,23 @@ async def lifespan(_app: FastAPI):
         await notify_core.start()
     except Exception:
         logger.exception("[notify] outbox worker start failed; outbound notifications unavailable")
+
+    # 环境会话后台同步 worker：固定间隔把每个环境的会话副本（元信息 + 活跃会话内容）
+    # 对账到节点。间隔 = settings.env_session_sync_interval（0 = 关闭）；失败只 log。
+    try:
+        from user_platform import session_sync_worker
+        await session_sync_worker.start()
+    except Exception:
+        logger.exception("[env-sync] session sync worker start failed; env session copies stay manual")
+
+    # 环境「代码目录」准备恢复：进程重启会丢掉在途的 clone task，这里把 provisioning
+    # 的环境重跑一遍（节点 clone 幂等，目录已在就秒回）。同时也是存量 worktree/fresh
+    # 环境的首次验证入口（迁移把它们标成 provisioning）。
+    try:
+        from user_platform import environment_service
+        await environment_service.recover_pending_provisions()
+    except Exception:
+        logger.exception("[env] provision recovery failed; stuck-provisioning environments stay failed")
 
     # Agent MCP principal 启动对账：保证每个 Agent 绑定 usage_type='agent' 的 principal，
     # 含历史 Agent 改绑到正确类型。在 mcp_users 表就绪后执行；失败只 log 不阻断启动。
@@ -429,6 +475,14 @@ async def lifespan(_app: FastAPI):
         ios_auto_renew.sync_loop(), name="ios-wda-auto-renew"
     )
 
+    # iOS 设备自动扫描对账：每 30s 一轮，把「节点清单」与「服务端资源行」收敛到一致
+    # （节点明确报未认领→删陈旧行；拔线→标离线保留；插上→自动在线）。让「插上手机
+    # 自动显示在线」不再依赖用户手点扫描。
+    from user_platform import ios_device_reconcile
+    ios_reconcile_task = asyncio.create_task(
+        ios_device_reconcile.sync_loop(), name="ios-device-reconcile"
+    )
+
     # 外部榜单候选池：默认关闭的 opt-in 同步。循环内部先查开关，未配置市场管理或
     # 未打开 leaderboard_sync_enabled 的部署只是空转复查配置，不抓取、不写库。
     from user_platform.marketplace import leaderboard_sync
@@ -451,6 +505,14 @@ async def lifespan(_app: FastAPI):
     )
     skillhub_sync_task = asyncio.create_task(
         skillhub_convert.sync_loop(), name="skillhub-sync"
+    )
+
+    # 模型元数据自动导入：扫描缺元数据的运行时模型，按来源顺序精确匹配目录
+    # （llm-metadata → OpenRouter → models.dev）批量补齐。默认关闭，循环内部
+    # 自查配置，未开启只空转复查（每 5 分钟热开启）。
+    import model_metadata_auto_import
+    model_metadata_auto_import_task = asyncio.create_task(
+        model_metadata_auto_import.sync_loop(), name="model-metadata-auto-import"
     )
 
     # 消费侧市场读缓存：索引与根 marker 后台预热，单条 manifest read-through；
@@ -594,13 +656,26 @@ async def lifespan(_app: FastAPI):
 
     logger.info("服务启动完成")
 
-    # 启动定时任务调度器
+    # 启动工作流调度器。闸门 = agent.runner.scheduler_wanted()：库里存在声明了
+    # 启用 cron 启动方式的工作流定义。定时任务（prompt/script 任务）面已删，
+    # cron 统一走工作流的「启动方式（triggers）」。
     try:
-        main_cfg = await config.CONFIG_STORE.read_main_async() if hasattr(config.CONFIG_STORE, "read_main_async") else config.Config._load()
-        agent_cfg = AgentConfig.from_dict(main_cfg.get("agent", {}))
+        if await scheduler_wanted():
+            AgentTaskRunner.start()
+        else:
+            logger.info("无定时工作流（无启用 cron 启动方式），工作流调度器不启动")
     except Exception:
-        agent_cfg = AgentConfig()
-    AgentTaskRunner.start(config=agent_cfg)
+        logger.exception("工作流调度器启动失败")
+
+    # 服务重启时在跑的工作流 run：标记 interrupted 并按 def 的 retry_on_reboot
+    # （默认 true）从头重跑一遍（用户口径：正在跑 → 重跑；不兼容旧数据）。
+    try:
+        from agent import workflow_store
+        relaunched = await workflow_store.recover_interrupted_runs()
+        if relaunched:
+            logger.info("服务重启工作流恢复：%d 条在跑的 run 已重新启动", relaunched)
+    except Exception:
+        logger.exception("工作流重启恢复失败")
 
     # GA chapter6.1/6.3 后台 worker：reflect 脚本热重载 + 自主 TODO 闲置触发。
     # 每个 enabled Agent 一个 ReflectWorker（无脚本即空转），autonomous_enabled 的
@@ -612,10 +687,11 @@ async def lifespan(_app: FastAPI):
         logger.exception("[agent-bg] orchestrator start failed; reflect/autonomous unavailable")
 
     # 启动 device_code 授权中央扫描器
-    from admin import start_auth_scanner, stop_auth_scanner, start_daily_auth_refresh, stop_daily_auth_refresh
+    from admin import start_auth_scanner, stop_auth_scanner, start_account_action_scheduler, stop_account_action_scheduler
     await start_auth_scanner()
-    # 启动每日 10:00 授权定时刷新（SCHEDULED_REFRESH=True 的渠道，如 atomcode / 声明了 refresh_auth 的代码渠道）
-    await start_daily_auth_refresh()
+    # 启动账号动作调度器（签到 / 同步额度 / refresh_auth 定时刷新；
+    # 频率由渠道「账号动作」面板配置，daily/minutes/hours 三档）
+    await start_account_action_scheduler()
 
     # MCP Runtime 已合并进主程序：进程内恢复活动插件（builtin 常驻 + custom 热加载），
     # 注册进 registry 内存单例。不再拉起独立子进程/回环。失败不阻断主服务启动。
@@ -704,6 +780,40 @@ async def lifespan(_app: FastAPI):
 
     attachment_sweeper = asyncio.create_task(_sweep_attachments(), name="attachment-sweeper")
 
+    # 会话运行时状态注册表空闲回收：逐出「空闲超 TTL 且非 busy 且无人订阅」的
+    # 内存实例（实例本身只有几百字节，TTL 是护栏不是救命的；写穿保证 DB 始终有
+    # 最新值，逐出后下次触碰从 DB 装回即收敛）。busy 判断除注册表自身标记外再并
+    # 入两个入口的 _CONV_TASKS，避免漏回收正在跑但忘打标记的会话。
+    session_state_sweeper: asyncio.Task | None = None
+
+    def _extra_session_busy(conv_id: str) -> bool:
+        for mod_name in ("agent.api", "agent.cdp_chat_service"):
+            try:
+                import importlib
+                tasks = getattr(importlib.import_module(mod_name), "_CONV_TASKS", None)
+                t = tasks.get(conv_id) if tasks else None
+                if t is not None and not t.done():
+                    return True
+            except Exception:  # noqa: BLE001 — 模块未导入/无该表按不 busy
+                continue
+        return False
+
+    async def _sweep_session_state() -> None:
+        interval = max(300, int(os.environ.get("SESSION_STATE_SWEEP_INTERVAL", "300")))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                from agent import conversation_state
+                conversation_state.sweep(ttl_seconds=1800.0, extra_busy=_extra_session_busy)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[session-state-sweeper] cycle failed: {}", exc)
+
+    session_state_sweeper = asyncio.create_task(
+        _sweep_session_state(), name="session-state-sweeper"
+    )
+
     orphan_reservation_reaper: asyncio.Task | None = None
 
     async def _reap_orphan_reservations_loop() -> None:
@@ -743,6 +853,37 @@ async def lifespan(_app: FastAPI):
                 )
 
     loop_lag_probe = asyncio.create_task(_loop_lag_probe(), name="loop-lag-probe")
+    # 创空间节点保活：免费档创空间闲置会休眠（官方文档「若实例一段时间未使用后，
+    # 将进入休眠」），节点随之掉线。循环只对**离线**的创空间节点打一次公开地址
+    # 探针把它叫醒——在线节点不打，否则等于抵消平台省资源的设计。
+    # 无创空间部署时该循环空转（每轮一次 DB 查询），代价可忽略。
+    studio_keepalive_task: asyncio.Task | None = None
+    try:
+        from user_platform.studio_deploy import keepalive_loop
+
+        studio_keepalive_task = asyncio.create_task(keepalive_loop(), name="studio-keepalive")
+    except Exception:
+        logger.exception("[studio] keepalive loop startup failed; main service continues")
+
+    # 节点载体（创空间 / AutoClaw 沙箱 / 自定义载体）：
+    # ① 灌出厂 spec —— DB 缺行才灌（运营改过的不覆盖）；坏出厂文件跳过并告警。
+    # ② 共享保活循环 —— 只对 keepalive_policy=timed 的绑定按各自 interval 唤醒。
+    # Phase 3 之后创空间节点也在这里管（modelscope_studio spec 的 keepalive 与旧
+    # 循环共用同一份 keepalive_one，行为不变）；旧 studio 循环只兜底**没有绑定**的
+    # 创空间行（互斥见 _keepalive_tick），全部补挂绑定后它自然空转。
+    try:
+        from user_platform.carrier_service import keepalive_loop as carrier_keepalive_loop
+        from user_platform.carrier_service import seed_builtin_specs, sync_studio_bindings
+
+        asyncio.create_task(seed_builtin_specs(), name="carrier-seed")
+        # Phase 3 迁移：给已有创空间补挂载体绑定（缺行才补，孤儿不补）
+        asyncio.create_task(sync_studio_bindings(), name="carrier-studio-sync")
+        carrier_keepalive_task: asyncio.Task | None = asyncio.create_task(
+            carrier_keepalive_loop(), name="carrier-keepalive"
+        )
+    except Exception:
+        carrier_keepalive_task = None
+        logger.exception("[carrier] keepalive loop startup failed; main service continues")
 
     # 局域网发现（UDP 广播应答，见 lan_discovery.py / docs/lan-discovery.md）。
     # 失败只 warning 不阻断启动；loopback HTTP bind 时自动抑制响应。
@@ -774,10 +915,28 @@ async def lifespan(_app: FastAPI):
             await loop_lag_probe
         except asyncio.CancelledError:
             pass
+    if studio_keepalive_task:
+        studio_keepalive_task.cancel()
+        try:
+            await studio_keepalive_task
+        except asyncio.CancelledError:
+            pass
+    if carrier_keepalive_task:
+        carrier_keepalive_task.cancel()
+        try:
+            await carrier_keepalive_task
+        except asyncio.CancelledError:
+            pass
     if attachment_sweeper:
         attachment_sweeper.cancel()
         try:
             await attachment_sweeper
+        except asyncio.CancelledError:
+            pass
+    if session_state_sweeper:
+        session_state_sweeper.cancel()
+        try:
+            await session_state_sweeper
         except asyncio.CancelledError:
             pass
     if channel_catalog_task:
@@ -804,6 +963,12 @@ async def lifespan(_app: FastAPI):
             await ios_wda_renew_task
         except asyncio.CancelledError:
             pass
+    if ios_reconcile_task:
+        ios_reconcile_task.cancel()
+        try:
+            await ios_reconcile_task
+        except asyncio.CancelledError:
+            pass
     if leaderboard_sync_task:
         leaderboard_sync_task.cancel()
         try:
@@ -826,6 +991,12 @@ async def lifespan(_app: FastAPI):
         agentscope_sync_task.cancel()
         try:
             await agentscope_sync_task
+        except asyncio.CancelledError:
+            pass
+    if model_metadata_auto_import_task:
+        model_metadata_auto_import_task.cancel()
+        try:
+            await model_metadata_auto_import_task
         except asyncio.CancelledError:
             pass
     if consumer_cache_task:
@@ -877,7 +1048,7 @@ async def lifespan(_app: FastAPI):
     import runtime_sync
     await _shutdown_step("runtime_sync", runtime_sync.stop())
     await _shutdown_step("auth_scanner", stop_auth_scanner())
-    await _shutdown_step("daily_auth_refresh", stop_daily_auth_refresh())
+    await _shutdown_step("account_action_scheduler", stop_account_action_scheduler())
     await _shutdown_step("agent_task_runner", AgentTaskRunner.stop())
     try:
         from agent.background_workers import AgentBackgroundOrchestrator
@@ -909,6 +1080,11 @@ async def lifespan(_app: FastAPI):
         await _shutdown_step("notify_worker", notify_core.stop())
     except Exception:
         logger.exception("[notify] outbox worker shutdown failed")
+    try:
+        from user_platform import session_sync_worker
+        await _shutdown_step("env_sync_worker", session_sync_worker.stop())
+    except Exception:
+        logger.exception("[env-sync] session sync worker shutdown failed")
     await _shutdown_step("postgres", PostgresClient.close())
     from rd import JdbcClient as _JdbcClient
     await _shutdown_step("redis_pool", _JdbcClient.close(), timeout=5.0)
@@ -920,6 +1096,33 @@ app = FastAPI(
     description="OpenAI Compatible API",
     lifespan=lifespan
 )
+
+# ── OpenAPI 规格加工：线上 GET /openapi.json 与离线导出共用 ───────────────────
+# FastAPI 默认吐出的 tag 是路由文件里声明的英文名（admin / agent / ...），粒度粗、
+# 对外读者不友好。这里覆盖 app.openapi()：走 server/openapi_tags.decorate_spec 把
+# tag 切成「一级域 / 二级模块」的中文两级目录，与 scripts/export_openapi.py 离线导出
+# 的 docs/openapi.json 走**同一份逻辑**，两处产物一致，不会漂移。
+# 失败时回退原始规格——文档加工失败绝不阻塞服务正常响应。
+_app_raw_openapi = app.openapi
+try:  # openapi_tags 在 server/ 下；运行时 sys.path 已含 server（见 bootstrap）
+    from openapi_tags import decorate_spec as _decorate_openapi_spec
+except Exception:  # 模块缺失/循环导入时退回原样，不阻塞服务启动
+    _decorate_openapi_spec = None
+    logger.warning("[openapi] server/openapi_tags 载入失败，/openapi.json 将使用原始英文 tag")
+
+
+def _openapi_with_cn_tags() -> dict:
+    spec = _app_raw_openapi()
+    if _decorate_openapi_spec is not None:
+        try:
+            return _decorate_openapi_spec(spec)
+        except Exception:
+            logger.exception("[openapi] tag 加工失败，回退原始规格")
+    return spec
+
+
+app.openapi = _openapi_with_cn_tags
+
 
 @app.middleware("http")
 async def _capture_user_session_cookie(request, call_next):
@@ -949,6 +1152,89 @@ async def _capture_user_session_cookie(request, call_next):
     except Exception:
         pass
     return response
+
+
+# ── 前端产物缓存策略 + 静态压缩 ─────────────────────────────────────────────
+# 打包后 JS/CSS/字体全带内容 hash，旧构建的文件会被直接删掉，而 index.html
+# 本身不带 hash。若 HTML 被浏览器按启发式缓存复用，旧页面就会去请求已经消失
+# 的 hash 文件 —— 懒加载分块 404 → React.lazy 抛错 → 没有 ErrorBoundary 时
+# 整棵树卸载 = 白屏（线上日志里出现过整批 index-B4gZWLc9.js 404）。
+# 因此：HTML 必须回源校验；带 hash 的 assets 可以长缓存；其余静态短缓存。
+_HASHED_ASSET_RE = re.compile(r"-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$")
+
+
+@app.middleware("http")
+async def _frontend_cache_control(request, call_next):
+    response = await call_next(request)
+    try:
+        path = request.url.path
+        if path.startswith("/admin-static/"):
+            if path.endswith(".html"):
+                # 打包一次换一次内容，必须让浏览器每次都回源拿最新版。
+                policy = "no-cache"
+            elif "/assets/" in path and _HASHED_ASSET_RE.search(path.split("?")[0]):
+                # 文件名自带内容指纹，变了就是新 URL，可以放心存一年。
+                policy = "public, max-age=31536000, immutable"
+            else:
+                # iconfont.js / 验证码 wasm 等无指纹静态：短缓存，便于更新。
+                policy = "public, max-age=3600"
+            response.headers["Cache-Control"] = policy
+        elif response.headers.get("content-type", "").startswith("text/html"):
+            # SPA 回退（/console、/ops/... 等直接刷新拿到的也是 index.html）。
+            response.headers["Cache-Control"] = "no-cache"
+    except Exception:
+        pass
+    return response
+
+
+_GZIP_CONTENT_TYPES = (
+    "text/",
+    "application/javascript",
+    "application/json",
+    "application/manifest+json",
+    "application/xml",
+    "image/svg+xml",
+)
+
+
+class _TypedGZipResponder(_GZipResponder):
+    """按 Content-Type 决定是否 gzip。
+
+    Starlette 自带的 GZipMiddleware 会无差别压缩，而 SSE（text/event-stream）
+    的事件会被攒进 gzip 缓冲再 flush，长对话事件流会被延迟/打散；已带
+    content-encoding 的响应也不该二次压缩。这两种情况都在 response.start 上
+    一次性判定为「直通」。
+    """
+
+    async def send_with_gzip(self, message):
+        await super().send_with_gzip(message)
+        if message["type"] == "http.response.start" and not self.content_encoding_set:
+            ct = Headers(raw=self.initial_message["headers"]).get("content-type", "").lower()
+            # SSE 命中 text/ 前缀也必须排除：事件流被 gzip 攒批会延迟长对话输出。
+            compressible = ct.startswith(_GZIP_CONTENT_TYPES) and not ct.startswith("text/event-stream")
+            if not compressible:
+                # 置 True 即走进 Starlette 的「已有编码 → 原样透传」分支。
+                self.content_encoding_set = True
+
+
+class _SelectiveGZipMiddleware(_GZipMiddleware):
+    """文本类响应 gzip：首屏 3MB 的 JS/CSS/HTML 压到 1/4 左右；SSE 直通。"""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and "gzip" in Headers(scope=scope).get("accept-encoding", "").lower():
+            responder = _TypedGZipResponder(self.app, self.minimum_size, compresslevel=self.compresslevel)
+            await responder(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+# 放在 CORS 之前 add：Starlette 后加的在更外层，这样 CORS（含预检短路）
+# 仍是最外层，gzip 只处理真正回源的响应。
+app.add_middleware(
+    _SelectiveGZipMiddleware,
+    minimum_size=1024,
+    compresslevel=6,
+)
 
 
 # CORS：/api/v1/users/* 等 C 端接口挂在主 app 上。原生客户端不受 CORS 限制，
@@ -1162,6 +1448,37 @@ def _openai_error(message: str, error_type: str = "invalid_request_error", code:
     return {"error": error}
 
 
+# ── API 文档闸门（/docs /redoc /openapi.json）────────────────────────────────
+# FastAPI 默认把这三个端点挂在根路径且不带鉴权；公网部署时等于整份接口面公开。
+# 开关在管理端「系统设置 → 基础配置 → API 文档」（config.Config.api_docs_enabled），
+# 关闭时统一返回 OpenAI 错误信封（走全局 handler 同一形状，code=api_docs_disabled）。
+# 离线导出（scripts/export_openapi.py）走 app.openapi() 进程内生成，不受此闸门影响。
+_API_DOC_PATHS = ("/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect", "/redoc/standalone")
+
+
+def _is_api_doc_path(path: str) -> bool:
+    return path in _API_DOC_PATHS or any(path.startswith(p + "/") for p in _API_DOC_PATHS)
+
+
+@app.middleware("http")
+async def _api_docs_gate(request, call_next):
+    if _is_api_doc_path(request.url.path):
+        try:
+            enabled = config.Config.api_docs_enabled()
+        except Exception:
+            enabled = False  # 配置读取失败按关处理：不暴露文档比误暴露安全
+        if not enabled:
+            return JSONResponse(
+                _openai_error(
+                    "API 文档未开启：请在管理端「系统设置 → 基础配置 → API 文档」开启后访问。",
+                    "permission_error",
+                    "api_docs_disabled",
+                ),
+                status_code=404,
+            )
+    return await call_next(request)
+
+
 def _error_message_from_detail(detail) -> str:
     if isinstance(detail, dict):
         error = detail.get("error")
@@ -1205,17 +1522,29 @@ def _anthropic_error_type_for_status(status_code: int) -> str:
 @app.exception_handler(HTTPException)
 async def openai_http_exception_handler(request: Request, exc: HTTPException):
     detail = exc.detail
-    # 先做零 IO 的硬编码超限识别；只有命中时再按开关决定是否归一。普通错误读取开关
-    # 同样会触发 config store IO，故开关读取延迟到命中后。开关关掉则不归一、原样透传。
-    canonical = retry_policy.canonicalize_upstream_error(exc.status_code, detail)
-    if canonical is not None and config.Config.context_overflow_not_retryable_enabled():
-        # 超限统一出口：status=400、type=invalid_request_error、code/message 由分类查表固定，
-        # 不来自上游、不加前缀。上游原文只进日志（detail 里保留）。
-        if request.url.path in ("/v1/messages", "/messages"):
-            body = {"type": "error", "error": {"type": canonical.type, "message": canonical.message, "code": canonical.code}}
+    # 内部选路错误（NoAvailableAccountError）自带显式业务 code 与 400/429 分流，是内部
+    # 事实源——绝不能拿它的中文 detail 文案去撞上游超限特征表（否则「冷却 9 + 窗口 1」
+    # 这类混合原因会被 detail 里的窗口字样误判成超限 400）。其余错误走硬编码超限识别：
+    # 只有命中时再读开关（普通错误不增加 config store IO）；开关关掉则不归一、原样透传。
+    if not isinstance(exc, NoAvailableAccountError):
+        canonical = retry_policy.canonicalize_upstream_error(exc.status_code, detail)
+        if canonical is not None and config.Config.context_overflow_not_retryable_enabled():
+            # 超限统一出口：status=400、type=invalid_request_error、code/message 由分类查表固定，
+            # 不来自上游、不加前缀。上游原文只进日志（detail 里保留）。compact/suggested_action
+            # 是给第一方客户端（agent 面板/CDP）的机器可读信号：命中即触发/提示压缩。
+            if request.url.path in ("/v1/messages", "/messages"):
+                body = {"type": "error", "error": {
+                    "type": canonical.type, "message": canonical.display_message, "code": canonical.code,
+                    "compact": True, "suggested_action": "compact",
+                }}
+                if canonical.window:
+                    body["error"]["context_window"] = canonical.window
+                return JSONResponse(body, status_code=canonical.status_code, headers=exc.headers)
+            body = _openai_error(canonical.display_message, canonical.type, canonical.code)
+            body["error"].update({"compact": True, "suggested_action": "compact"})
+            if canonical.window:
+                body["error"]["context_window"] = canonical.window
             return JSONResponse(body, status_code=canonical.status_code, headers=exc.headers)
-        body = _openai_error(canonical.message, canonical.type, canonical.code)
-        return JSONResponse(body, status_code=canonical.status_code, headers=exc.headers)
     if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
         normalized_detail = dict(detail)
         normalized_error = dict(normalized_detail["error"])
@@ -1225,10 +1554,22 @@ async def openai_http_exception_handler(request: Request, exc: HTTPException):
         return JSONResponse(normalized_detail, status_code=exc.status_code, headers=exc.headers)
     message = _error_message_from_detail(detail)
     extra = {}
+    response_status = exc.status_code
     if isinstance(exc, NoAvailableAccountError):
         code = getattr(exc, "code", None) or "no_available_account"
         message = TERMINAL_ERROR_MESSAGES.get(code, TERMINAL_ERROR_MESSAGES["no_available_account"])
         extra = {"kind": code, "code": code}
+        # 窗口超限是载荷/配置类问题，重试无意义：收口成 400 + context_too_large
+        # （与入口预检 _validate_context_budget 同码），客户端据此压缩/调整输入，
+        # 而不是按 429 退避重试空耗。
+        if code == "context_too_large":
+            response_status = 400
+            extra["retries"] = 0
+            extra["compact"] = True
+            extra["suggested_action"] = "compact"
+            message = TERMINAL_ERROR_MESSAGES.get("context_too_large") or (
+                "Your input exceeds the context window of the model. Please compact the conversation or adjust your input."
+            )
         retry_after = _retry_after_for_code(code)
         if retry_after:
             extra["retry_after"] = retry_after
@@ -1246,14 +1587,14 @@ async def openai_http_exception_handler(request: Request, exc: HTTPException):
         except (TypeError, ValueError):
             pass
     if request.url.path in ("/v1/messages", "/messages"):
-        body = {"type": "error", "error": {"type": _anthropic_error_type_for_status(exc.status_code), "message": message}}
+        body = {"type": "error", "error": {"type": _anthropic_error_type_for_status(response_status), "message": message}}
         if extra:
             body["error"].update(extra)
-        return JSONResponse(body, status_code=exc.status_code, headers=headers or None)
-    body = _openai_error(message, _openai_error_type_for_status(exc.status_code), extra.get("code") or extra.get("kind"))
+        return JSONResponse(body, status_code=response_status, headers=headers or None)
+    body = _openai_error(message, _openai_error_type_for_status(response_status), extra.get("code") or extra.get("kind"))
     if extra:
         body["error"].update(extra)
-    return JSONResponse(body, status_code=exc.status_code, headers=headers or None)
+    return JSONResponse(body, status_code=response_status, headers=headers or None)
 
 
 @app.exception_handler(RequestValidationError)
@@ -1329,6 +1670,14 @@ def _validate_context_budget_for_parts(model: str, body: dict, model_info: dict,
     if not config.Config.context_token_detection_enabled():
         return
 
+    # 压缩请求**必须跳过本地窗口预检**：它的 body 就是「即将超限的整段历史」，本地
+    # 估算拦在门口 = 压缩永远发不出去 = 超限死循环（客户端只会拿 400 反复尝试压缩再
+    # 被 400 拦下）。压缩链路的口径与选路层一致：关掉一切本地窗口判定，让**上游真实
+    # 窗口**裁决（见 _resolve_compress_candidates / rate_limiter 的 input_token_estimate=0）。
+    # 上游真报了超限，仍由 canonicalize 归一成 400 超限码，语义不变。
+    if compaction_detect.detect_compaction(body) is not None:
+        return
+
     # 复用公共计算层（estimate_request_tokens），入口校验用 total_tokens 跟窗口比。
     tokens = estimate_request_tokens(model, body, endpoint)
     total_tokens = tokens["total_tokens"]
@@ -1345,15 +1694,28 @@ def _validate_context_budget_for_parts(model: str, body: dict, model_info: dict,
         f"请求上下文超限: model={model}, endpoint={endpoint}, input≈{input_tokens}, "
         f"output={output_tokens}, limit={context_limit}, fields={largest_parts}"
     )
-    raise HTTPException(
-        status_code=400,
-        detail=_openai_error(
-            "Your input exceeds the context window of this model. Please adjust your input and try again.",
-            "invalid_request_error",
-            "context_too_large",
-            largest_parts,
-        ),
+    # 文案必须保留客户端压缩触发锚点（"context window"），并在其后回显具体窗口大小与本次
+    # 估算输入量——客户端据此知道该压到多少，而不是只知道「超了」。
+    message = "Your input exceeds the context window of this model. Please adjust your input and try again."
+    sizes = []
+    if context_limit > 0:
+        sizes.append(f"context window: {context_limit} tokens")
+    if input_tokens > 0:
+        sizes.append(f"estimated input: {input_tokens} tokens")
+    if sizes:
+        message = f"{message} ({'; '.join(sizes)})"
+    detail = _openai_error(
+        message,
+        "invalid_request_error",
+        "context_too_large",
+        largest_parts,
     )
+    # 结构化窗口字段（无歧义）——全局异常处理器会用 canonicalize_upstream_error 重新归一，
+    # 只靠文案正则抽窗口会被「estimated input: N tokens」这类相邻数字干扰；显式字段才是
+    # 稳健路径（retry_policy._explicit_context_window 优先读它）。
+    if context_limit > 0:
+        detail["error"]["context_window"] = context_limit
+    raise HTTPException(status_code=400, detail=detail)
 
 
 async def _record_api_key_usage(api_key: str | None, usage: dict) -> None:
@@ -2177,6 +2539,7 @@ def _build_channel_attempt_log(
         "endpoint": client_request_path or "",
         "client_type": client_type,
         "session_id": route_info.get("session_id"),
+        "subagent_id": route_info.get("subagent_id"),
         "editor_id": route_info.get("editor_id"),
         "editor_session_id": route_info.get("editor_session_id"),
         "task_id": route_info.get("task_id"),
@@ -2223,6 +2586,15 @@ def _build_channel_attempt_log(
             # 客户端在上游已服务后断开（status=cancelled 但 200+token 已产出）：
             # 由 _finalize_failed_attempt 设置，让取消不再被误读为上游失败。
             "termination_reason": route_info.get("termination_reason") or "",
+            # 命中「异常输出拦截」的规则名（status=output_intercepted 时非空），
+            # 让详情页不必从 error 文案里抠规则名。
+            "intercepted_by": route_info.get("intercepted_by") or "",
+            # 压缩识别：命中即 true（请求日志列表/详情在客户端列后打「压」标签）。
+            # compaction_client/compaction_source 记录是哪家客户端的哪种信号命中的
+            # （explicit=第一方显式标记；fingerprint=第三方文本指纹；client=命中标签）。
+            "is_compaction": bool(route_info.get("is_compaction")),
+            "compaction_client": (route_info.get("is_compaction") or {}).get("client") or "",
+            "compaction_source": (route_info.get("is_compaction") or {}).get("source") or "",
         },
         "channel_retry_attempts": list(route_info.get("channel_retry_attempts") or []),
         "error": error,
@@ -2253,11 +2625,17 @@ async def _acquire_client_with_routing_timing(
     request_protocol, provider_whitelist, provider_blacklist,
     account_whitelist, is_test, is_probe: bool = False, catalog_snapshot,
     token_estimate: int = 0, input_token_estimate: int = 0,
+    compression_candidates: list[str] | None = None,
+    request_ctx: dict | None = None,
 ) -> tuple:
     routing_timing: dict = {}
     route_started = time.monotonic()
     timing_token = begin_routing_timing(routing_timing)
     redis_token = begin_routing_redis_scope(routing_timing, token_estimate=token_estimate)
+    # 选路前把出站上下文（messages/tools/tool_choice——足够渠道在 check_message 里复现
+    # 自己实际发供应商的请求体）塞进任务级 ContextVar；reserve 阶段的 check_message 按需读。
+    # 作用域与 routing_timing 同（整个 acquire_client_with_provider 含 reserve），finally reset。
+    request_ctx_token = begin_routing_request_ctx(request_ctx)
     try:
         result = await ModelClientPool.acquire_client_with_provider(
             model, tried_accounts, messages, route, api_key,
@@ -2265,6 +2643,7 @@ async def _acquire_client_with_routing_timing(
             provider_whitelist=provider_whitelist, provider_blacklist=provider_blacklist,
             account_whitelist=account_whitelist, is_test=is_test, is_probe=is_probe,
             snapshot=catalog_snapshot, input_token_estimate=input_token_estimate,
+            compression_candidates=compression_candidates,
         )
         routing_timing["route_duration_ms"] = max(0, int((time.monotonic() - route_started) * 1000))
         redis_state = routing_redis_state()
@@ -2274,6 +2653,7 @@ async def _acquire_client_with_routing_timing(
                 routing_timing["redis_timeout_stage"] = redis_state["timeout_stage"]
         return result, routing_timing
     finally:
+        end_routing_request_ctx(request_ctx_token)
         end_routing_redis_scope(redis_token)
         end_routing_timing(timing_token)
 
@@ -2531,6 +2911,61 @@ def _should_inner_retry(
     ))
 
 
+def _record_attempt_failure_to_pool(
+    pool,
+    username: str | None,
+    error: Exception,
+    *,
+    error_text: str,
+    retryable_status: bool,
+    routed_model: str | None,
+    response_headers=None,
+) -> None:
+    """把一次候选失败按错误类型落进 ProviderPool 的账号状态（唯一收口点）。
+
+    分流优先级（docs/channel-error-semantics-design.md）：
+    1. 渠道语义异常（ChannelError 家族）→ ``apply_channel_error``：spec 明说这是什么错
+       （凭证失效/额度耗尽/临时冻结带时长），按 kind 写 category，不经状态码猜测。
+       已落到账号（返回 freeze/no_freeze）后**到此为止**——绝不能再走兜底：
+       ``mark_account_exception`` 按规则表/兜底冷却写入 category="" 的普通冻结，会把刚写的
+       credential/quota 覆盖掉——「凭证失效·需重新授权」变成「永久冻结/冷却」，且无到期
+       变成 300s 后又回可选（死 refresh_token 的账号每 5 分钟被重新选中再失败，
+       实测 2026-10-21 两个账号 7 小时被重打 40+ 次）。同理 no_freeze 声明
+       （UpstreamTransient/RateLimited/InvalidRequest）也会被兜底冷却违反。
+    2. 裸 HTTPException → 渠道 freeze_policy（状态码/响应头/错误码/模型都是匹配上下文，
+       如 403 当天不可用）。命中规则即冻结；未命中且可重试时才走 handle_response_error
+       的全局 cooldown 兜底；未命中且不可重试（普通参数错）不冻结。
+       语义异常但收口没落到账号（apply_channel_error 返回空，如账号不在池内）也回落
+       这里，行为不变。
+    3. 非 HTTP 异常（网络层等）→ mark_account_exception 按异常规则/兜底冷却。
+    """
+    from providers.base import ChannelError
+
+    channel_error_handled = False
+    if isinstance(error, ChannelError):
+        handled = pool.apply_channel_error(username, error, model_id=routed_model)
+        channel_error_handled = handled in ("freeze", "no_freeze")
+    if channel_error_handled:
+        return
+    if isinstance(error, HTTPException):
+        if not pool.apply_freeze_policy(
+            username,
+            status_code=error.status_code,
+            headers=response_headers,
+            model_id=routed_model,
+            reason=error_text,
+            error_code=getattr(error, "code", None),
+        ) and retryable_status:
+            pool.handle_response_error(username, error.status_code, error_text, model_id=routed_model)
+    elif not isinstance(error, EmptyNonStreamResponseError):
+        pool.mark_account_exception(
+            username,
+            reason=error_text,
+            error_code=getattr(error, "code", None),
+            model_id=routed_model,
+        )
+
+
 async def _handle_attempt_failure(
     *,
     error: Exception,
@@ -2611,7 +3046,7 @@ async def _handle_attempt_failure(
                 client_request_body=client_request_body,
                 attempt_start=attempt_start,
                 attempt_stream_summary=attempt_stream_summary,
-                status="empty_non_stream" if isinstance(error, EmptyNonStreamResponseError) else "error",
+                status=_attempt_failure_status(error),
             )
         else:
             route_info = dict(route_info)
@@ -2623,27 +3058,13 @@ async def _handle_attempt_failure(
             tried_accounts.append((provider_name, username))
             pool = ModelClientPool.get_provider_pool(provider_name)
             if pool:
-                if isinstance(error, HTTPException):
-                    # 所有上游 HTTP 异常先走渠道 freeze_policy（状态码/响应头/错误码/模型都是匹配
-                    # 上下文，如 403 当天不可用）。命中规则即冻结；未命中且可重试时才走
-                    # handle_response_error 的全局 cooldown 兜底；未命中且不可重试（普通参数错）不冻结。
-                    if not pool.apply_freeze_policy(
-                        username,
-                        status_code=error.status_code,
-                        headers=route_info.get("response_headers"),
-                        model_id=route_info.get("routed_model") or model,
-                        reason=error_text,
-                        error_code=getattr(error, "code", None),
-                    ) and retryable_status:
-                        pool.handle_response_error(username, error.status_code, error_text, model_id=route_info.get("routed_model") or model)
-                else:
-                    if not isinstance(error, EmptyNonStreamResponseError):
-                        pool.mark_account_exception(
-                            username,
-                            reason=error_text,
-                            error_code=getattr(error, "code", None),
-                            model_id=route_info.get("routed_model") or model,
-                        )
+                _record_attempt_failure_to_pool(
+                    pool, username, error,
+                    error_text=error_text,
+                    retryable_status=retryable_status,
+                    routed_model=route_info.get("routed_model") or model,
+                    response_headers=route_info.get("response_headers"),
+                )
     else:
         route_info = {
             "provider": None,
@@ -2660,6 +3081,14 @@ async def _handle_attempt_failure(
     non_retryable_override = None
     if isinstance(error, HTTPException):
         non_retryable_override = _is_non_retryable_upstream_error(error)
+    # 出口是否会把本错误归一成 400+固定 code（canonical 命中且开关开启）。与
+    # _canonical_context_overflow_exception 同条件；仅此时 classify_failure 允许它
+    # 绕过状态码白名单，避免开关关闭时把上游 500/502 原样吐给客户端。
+    overflow_canonical_active = bool(
+        isinstance(error, HTTPException)
+        and retry_policy.canonicalize_upstream_error(error.status_code, error.detail) is not None
+        and config.Config.context_overflow_not_retryable_enabled()
+    )
     decision = retry_policy.classify_failure(retry_policy.FailureInput(
         is_http_exception=isinstance(error, HTTPException),
         status_code=error.status_code if isinstance(error, HTTPException) else None,
@@ -2670,6 +3099,7 @@ async def _handle_attempt_failure(
         candidates_remaining=retry_count < total_attempts - 1,
         upstream_started=client is not None,
         non_retryable_override=non_retryable_override,
+        overflow_canonical_active=overflow_canonical_active,
         transient_exception=_is_transient_request_exception(error),
         # 流式不完整响应（空流/零 completion，且尚未向客户端输出）与非流式空响应都视为
         # 候选渠道响应质量问题，允许切候选/同账号重试；已输出由 downstream_started 分支优先阻止。
@@ -2947,6 +3377,41 @@ def _apply_api_key_thinking(body: dict, thinking: dict, client_type: str, protoc
     return _inject_thinking_for_protocol(body, mode, max_thinking_tokens, protocol)
 
 
+async def _resolve_compress_candidates(body: dict, api_key: str | None) -> tuple[list[str] | None, dict | None]:
+    """识别「上下文压缩」请求 → 返回 (压缩候选列表，识别命中信息)；非压缩/未配置返回 (None, None)。
+
+    与早期"改写 body.model"的方案不同：这里**不改写 body**，只把候选列表透传给选路层
+    （`_chat_with_retry_for_model` → `acquire_client_with_provider(compression_candidates=...)`），
+    让选路层按"窗口从大到小 + 关掉本地窗口过滤"挑一个发上游——上游用其真实窗口裁决，
+    不再因本地窗口估算把压缩打成 no_available_account。压缩模型配置从「被压缩的模型」
+    （自定义模型/模型策略/真实模型，model_groups 同表）上读，与 selection_strategy /
+    backup_group 同族，绝不写进模型元数据（避免污染 /v1/models）。
+
+    - 命中识别后剥离第一方保留键 ``_purpose``（绝不下发上游）。
+    - 压缩候选读 ``config.Config.get_model_group_compress_models``，空列表 = 未配置 = 当作非压缩走原模型。
+    - 第二返回值是 ``compaction_detect.detect_compaction`` 的命中 dict（{"client","marker","source"}），
+      与候选列表解耦——没配压缩模型也照常返回命中，供请求日志打「压缩」标记。
+    """
+    if not isinstance(body, dict):
+        return None, None
+    hit = compaction_detect.detect_compaction(body)
+    if not hit:
+        return None, None
+    # 剥离保留键，避免下发上游（responses 的原样透传路径会把它带出去）。
+    body.pop(compaction_detect.EXPLICIT_BODY_KEY, None)
+    requested_model = body.get("model")
+    if not requested_model:
+        return None, hit
+    candidates = await config.Config.get_model_group_compress_models(str(requested_model))
+    if not candidates:
+        return None, hit
+    logger.info(
+        "[compaction] armed compress route: client={} source={} model={} candidates={}",
+        hit["client"], hit["source"], requested_model, candidates,
+    )
+    return candidates, hit
+
+
 async def _prepare_client_request_body(body: dict, api_key: str | None, headers: dict | None, endpoint: str, protocol: str = "openai") -> tuple[dict, str]:
     if model_catalog.is_internal_model_id(body.get("model")):
         raise HTTPException(
@@ -3045,19 +3510,22 @@ def _stream_response_headers() -> dict:
     }
 
 
-def _openai_stream_error_chunk(message: str, code: str = "rate_limit_exceeded", error_type: str = "rate_limit_error", status_code: int = 429) -> str:
+def _openai_stream_error_chunk(message: str, code: str = "rate_limit_exceeded", error_type: str = "rate_limit_error", status_code: int = 429, context_window: int | None = None) -> str:
     payload = {"error": {"message": normalize_upstream_error_message(message) or message, "type": error_type, "code": code, "status_code": status_code}}
+    if context_window:
+        payload["error"]["context_window"] = context_window
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 class StreamStartedChannelError(Exception):
-    def __init__(self, message: str, status_code: int = 429, code: str = "rate_limit_exceeded", error_type: str = "rate_limit_error", last_route_info: dict | None = None, upstream_status: int | None = None):
+    def __init__(self, message: str, status_code: int = 429, code: str = "rate_limit_exceeded", error_type: str = "rate_limit_error", last_route_info: dict | None = None, upstream_status: int | None = None, context_window: int | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.error_type = error_type
         self.last_route_info = last_route_info or {}
         self.upstream_status = upstream_status
+        self.context_window = context_window
 
 
 def _stream_error_from_exception(error: Exception, last_route_info: dict | None = None) -> StreamStartedChannelError:
@@ -3069,15 +3537,17 @@ def _stream_error_from_exception(error: Exception, last_route_info: dict | None 
     code = "rate_limit_exceeded"
     error_type = "rate_limit_error"
     status_code = 429
+    context_window = None
     if isinstance(error, HTTPException):
         # 唯一例外：上下文超限。零 IO 的硬编码超限识别先行，命中且开关开时才归一。
         canonical = retry_policy.canonicalize_upstream_error(upstream_status, error.detail)
         if canonical is not None and config.Config.context_overflow_not_retryable_enabled():
-            # 超限统一出口：message/code 由分类查表固定，不来自上游。
-            message = canonical.message
+            # 超限统一出口：message/code 由分类查表固定，不来自上游；窗口大小若上游原文带出则回显。
+            message = canonical.display_message
             code = canonical.code
             error_type = canonical.type
             status_code = canonical.status_code
+            context_window = canonical.window
     return StreamStartedChannelError(
         message,
         status_code=status_code,
@@ -3085,6 +3555,7 @@ def _stream_error_from_exception(error: Exception, last_route_info: dict | None 
         error_type=error_type,
         last_route_info=last_route_info or getattr(error, "_last_route_info", {}) or {},
         upstream_status=upstream_status,
+        context_window=context_window,
     )
 
 
@@ -3272,7 +3743,10 @@ def _response_has_content(data: dict) -> bool:
                 continue
             msg = choice.get("message") or choice.get("delta")
             if isinstance(msg, dict):
-                if msg.get("content") or msg.get("tool_calls") or msg.get("reasoning_content") or msg.get("reasoning"):
+                # thinking 与 reasoning 同为真实模型输出：非流式响应只带思考、
+                # 正文为空时不能判成空响应（口径与 _has_first_token_content 对齐）。
+                if (msg.get("content") or msg.get("tool_calls") or msg.get("reasoning_content")
+                        or msg.get("reasoning") or msg.get("thinking")):
                     return True
     if isinstance(data.get("content"), (list, str)) and data["content"]:
         return True
@@ -3383,6 +3857,19 @@ def _intercepted_by_output_rule(content: str) -> str | None:
     return None
 
 
+def _attempt_failure_status(error: Exception) -> str:
+    """一次 attempt 失败落到请求日志的 status：命中「异常输出拦截」时单列
+    ``output_intercepted``，不再和真空响应（``empty_non_stream``）混为一谈。
+
+    两者都走同一套换候选重试语义（同为 IncompleteStreamError/EmptyNonStreamResponseError），
+    仅日志口径区分：拦截命中说明上游其实回了完整正文、只是命中了规则；空响应才是
+    真的没有内容。
+    """
+    if is_output_intercepted_error(error):
+        return "output_intercepted"
+    return "empty_non_stream" if isinstance(error, EmptyNonStreamResponseError) else "error"
+
+
 def _validate_upstream_usage_payload(payload, stream: bool = False, had_content: bool = False) -> None:
     payload_has_content = had_content
     zero_usage_payloads: list[dict] = []
@@ -3446,15 +3933,22 @@ def _chunk_has_stream_content(chunk) -> bool:
                 continue
             delta = choice.get("delta") or {}
             if isinstance(delta, dict):
-                if delta.get("content") or delta.get("tool_calls") or delta.get("reasoning_content") or delta.get("reasoning"):
+                # thinking 系列与 reasoning 同属真实输出；口径与 _has_first_token_content 对齐，
+                # 避免 reasoning-only 的 OpenAI 形态 delta 被判成空流。
+                if (delta.get("content") or delta.get("tool_calls") or delta.get("reasoning_content")
+                        or delta.get("reasoning") or delta.get("thinking")):
                     return True
         obj_type = obj.get("type", "")
         if not isinstance(obj_type, str):
             obj_type = ""
         if "content_block_delta" in obj_type:
             delta = obj.get("delta") or {}
-            if isinstance(delta, dict) and (delta.get("text") or delta.get("partial_json") is not None):
-                return True
+            if isinstance(delta, dict):
+                # thinking_delta 是真实模型输出：纯思考（正文为空）是合法响应，不能
+                # 因为 content 为空就判成空流——否则 reasoning-only 报文会被误判
+                # zero completion 空响应，并连带冻结账号。
+                if delta.get("text") or delta.get("thinking") or delta.get("partial_json") is not None:
+                    return True
         if "content_block_start" in obj_type:
             cb = obj.get("content_block") or {}
             if isinstance(cb, dict):
@@ -3462,7 +3956,14 @@ def _chunk_has_stream_content(chunk) -> bool:
                     return True
                 if cb.get("type") == "text" and cb.get("text"):
                     return True
+                # 少数上游把整段思考放在 start 块里；thinking 非空才算内容，空块不算，
+                # 保持「纯结构帧不判有输出」的既有语义。
+                if cb.get("type") == "thinking" and cb.get("thinking"):
+                    return True
         if obj_type in ("response.output_text.delta", "response.output_item.added"):
+            return True
+        # Responses 协议的思考增量同理：reasoning-only 流也是真实输出。
+        if obj_type in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta") and obj.get("delta"):
             return True
     return False
 
@@ -4068,6 +4569,18 @@ async def dispatch_entry(
         model, messages = await _validate_chat_request(body, api_key)
         full_kwargs = _build_protocol_kwargs(body, "openai", "openai")
 
+    # ── 上下文压缩 → 压缩选路 ──
+    # 命中「上下文压缩」且被压缩的模型配了压缩候选列表时，把候选列表透传给选路层，
+    # 让选路层「按窗口从大到小 + 关掉本地窗口过滤」挑一个压缩模型发上游（上游用真实窗口
+    # 裁决），而不是本地窗口估算把压缩打成 no_available_account。识别在 model 校验之后、
+    # orchestrator 之前：body 仍是客户端原协议（含识别锚点），改的是 full_kwargs 透传键。
+    # compaction_hit（识别命中信息，无论是否配了压缩模型）也透传，落 request_logs 打「压缩」标记。
+    compression_candidates, compaction_hit = await _resolve_compress_candidates(body, api_key)
+    if compression_candidates:
+        full_kwargs["compression_candidates"] = compression_candidates
+    if compaction_hit:
+        full_kwargs["_compaction_hit"] = compaction_hit
+
     stream = _request_stream_enabled(body)
     request_id = _new_request_id()
     if editor_request_context and editor_request_context.get("first_request"):
@@ -4232,7 +4745,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 status = "error"
                 error = str(e)
                 last_route_info = e.last_route_info or last_route_info
-                yield _openai_stream_error_chunk(error, e.code, e.error_type, e.status_code)
+                yield _openai_stream_error_chunk(error, e.code, e.error_type, e.status_code, e.context_window)
                 yield "data: [DONE]\n\n"
             except IncompleteStreamError as e:
                 status = "error"
@@ -4249,7 +4762,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 status = "error"
                 error = str(e)
                 stream_error = _stream_error_from_exception(e, last_route_info)
-                yield _openai_stream_error_chunk(str(stream_error), stream_error.code, stream_error.error_type, stream_error.status_code)
+                yield _openai_stream_error_chunk(str(stream_error), stream_error.code, stream_error.error_type, stream_error.status_code, stream_error.context_window)
                 yield "data: [DONE]\n\n"
             finally:
                 if status == "ok":
@@ -4328,13 +4841,16 @@ def _canonical_context_overflow_exception(error: HTTPException) -> HTTPException
     canonical = retry_policy.canonicalize_upstream_error(status_code, detail)
     if canonical is None or not config.Config.context_overflow_not_retryable_enabled():
         return None
+    detail_body = _openai_error(
+        canonical.display_message,
+        canonical.type,
+        canonical.code,
+    )
+    if canonical.window:
+        detail_body["error"]["context_window"] = canonical.window
     return HTTPException(
         status_code=canonical.status_code,
-        detail=_openai_error(
-            canonical.message,
-            canonical.type,
-            canonical.code,
-        ),
+        detail=detail_body,
         headers=getattr(error, "headers", None),
     )
 
@@ -4377,10 +4893,17 @@ TERMINAL_ERROR_MESSAGES = {
     "concurrent_limit_exceeded":        "Concurrency limit exceeded; please retry later.",
     "quota_exhausted":                  "Upstream quota exhausted.",
     "no_available_account":              "No available account for the requested model.",
+    "context_too_large":                "Your input exceeds the context window of the model. Please compact the conversation or adjust your input.",
+    # 上游超限归一码（retry_policy.canonicalize_upstream_error 产出）。message 与归一表
+    # 固定文案同源，且必须带客户端可识别的锚点：Claude Code 靠 "prompt is too long"
+    # 触发自动压缩，OpenAI 系客户端靠 "context_length_exceeded"/"maximum context length"。
+    "context_length_exceeded":          "Your input exceeds the context window of the model. Please compact the conversation or adjust your input.",
+    "prompt_too_long":                  "prompt is too long: Please compact the conversation or adjust your input.",
+    "input_too_long":                   "Your input exceeds the context window of the model. Please compact the conversation or adjust your input.",
+    "model_context_limit":              "Your input exceeds the context window of the model. Please compact the conversation or adjust your input.",
+    "max_tokens_exceeded":              "max_tokens exceeds the remaining context window. Please compact the conversation or lower max_tokens.",
     "service_busy":                     "Service temporarily busy; please retry.",
     "retry_exhausted":                  "Request failed after retries.",
-    "upstream_exception":               "Upstream service error; please retry.",
-    "incomplete_response":              "Upstream returned an incomplete response.",
     "api_key_expired":                  "API key has expired.",
     "api_key_disabled":                 "API key has been disabled.",
     "api_key_invalid":                  "Invalid API key.",
@@ -4407,36 +4930,128 @@ def _retryable_client_error_detail(code: str, retries: int, upstream_status: int
 
 
 def _terminal_429_from_last_error(last_error: Exception | None, max_retries: int) -> tuple[str, int | None]:
-    """从最后一次失败推导 (code, upstream_status)。retry_after 由调用方按 code 决定。"""
+    """从最后一次失败推导 (code, upstream_status)。retry_after 由调用方按 code 决定。
+
+    架构口径：对客户端只有两类终态——400（请求不可继续）与 429（可重试，分类型）。
+    上游 5xx / 网络断 / 超时 / 空响应都是**内部事件**，只用于日志与冻结判定，耗尽后
+    一律归 `retry_exhausted`（429 的一个类型），不再发明 `upstream_exception` 这种
+    「其它」兜底码——它把性质完全不同的失败揉成一句，且诱导客户端重试永不成功的请求。
+
+    唯一例外：上下文/输入超限。中继常把它降级成 500/502、丢 code、用自己方言写文案，
+    attempt 级归一就可能漏接；走到耗尽说明重试已无意义，唯一有用的动作是让客户端压缩。
+    所以这里对**所有**错误类型（含渠道 spec 抛的原生异常、不完整流挂的上游原因）再做一次
+    零 IO 的超限识别，认出即归对应的超限 code，由调用方转 400——绝不落 429 让客户端空等。
+    判定优先级与 attempt 级一致：显式业务 code > 超限文案 > 状态码。
+    """
     if last_error is None:
         return "no_available_account", None
     # 改动 4 新增的 API-Key 级失败：detail dict 带 code，优先透传
     if isinstance(last_error, HTTPException):
         detail = last_error.detail
         if isinstance(detail, dict) and detail.get("code"):
+            # 候选窗口过滤归因（context_too_large）与其它业务码都原样透传；调用方按
+            # code 决定终态（超限码 → 400，其余 → 429）。
             return str(detail["code"]), last_error.status_code
+    # 选号/资源级失败：按 reason 映射的业务码（no_available_account/concurrent/quota/
+    # service_busy/rate_limit），重试无意义或按码决定，不在此改写。
     if isinstance(last_error, NoAvailableAccountError):
         return getattr(last_error, "code", None) or "no_available_account", None
+    # 超限识别：HTTPException 看 detail、原生异常看 str(e)、不完整流看挂载的上游原因。
+    # canonical_overflow_error 零 IO，只认超限类目（跳过 thinking_budget_invalid 这类
+    # 同样归一但与超限无关的参数错）。
+    status_hint = last_error.status_code if isinstance(last_error, HTTPException) else None
+    detail_hint = last_error.detail if isinstance(last_error, HTTPException) else str(last_error)
+    if isinstance(last_error, IncompleteStreamError) and getattr(last_error, "upstream_error", None):
+        upstream = last_error.upstream_error
+        if isinstance(upstream, HTTPException):
+            status_hint, detail_hint = upstream.status_code, upstream.detail
+        else:
+            detail_hint = f"{detail_hint} {upstream}"
+    canonical = retry_policy.canonical_overflow_error(status_hint, detail_hint)
+    if canonical is not None and config.Config.context_overflow_not_retryable_enabled():
+        return canonical.code, status_hint
+    # 空响应/不完整流：内部事件（换候选常能解决），耗尽归 retry_exhausted，不作对外码。
     if isinstance(last_error, (EmptyNonStreamResponseError, IncompleteStreamError)):
-        return getattr(last_error, "code", None) or "incomplete_response", None
+        return "retry_exhausted", None
     if isinstance(last_error, HTTPException):
         sc = last_error.status_code
         if sc == 429:
             return "rate_limit_exceeded", sc
-        return "upstream_exception", sc
+        # 401/403/404：账号失效/无权限/模型不存在——每个候选都返回它=没有可用账号，
+        # 重试永不成功，归 no_available_account（不在可重试集合，不挂 Retry-After）。
+        if sc in (401, 403, 404):
+            return "no_available_account", sc
+        # 5xx 及其它渠道 HTTP 错误：瞬时故障耗尽 → retry_exhausted。
+        return "retry_exhausted", sc
+    # 网络/传输/超时/停滞等原生异常：瞬时故障耗尽 → retry_exhausted。
     return "retry_exhausted", None
 
 
+def _overflow_window_from_last_error(last_error: Exception | None) -> int | None:
+    """从最后一次失败里抽出上游声称的上下文窗口大小（token），未知返回 None。
+
+    与 ``_terminal_429_from_last_error`` 同源取值：HTTPException 看 detail、原生异常看
+    str(e)、不完整流看挂载的上游原因。供终端把「具体窗口」回显给客户端（400 超限文案）。
+    """
+    if last_error is None:
+        return None
+    if isinstance(last_error, HTTPException):
+        detail_hint = last_error.detail
+    else:
+        detail_hint = str(last_error)
+    if isinstance(last_error, IncompleteStreamError) and getattr(last_error, "upstream_error", None):
+        upstream = last_error.upstream_error
+        detail_hint = upstream.detail if isinstance(upstream, HTTPException) else f"{detail_hint} {upstream}"
+    return retry_policy.extract_context_window(detail_hint)
+
+
 # 哪些业务码建议客户端短退避重试（挂 Retry-After: 1）。配额/失效类不挂——重试无意义。
+# no_available_account 不在此：账号/模型不可用，重试永不成功。
+# retry_exhausted 在此：上游 5xx/网络/超时/空响应等瞬时事件耗尽，短退避后再试有意义。
+# 空响应不再单列 incomplete_response 对外码——它是内部事件，耗尽后归 retry_exhausted。
 _RETRYABLE_CODES = {
     "rate_limit_exceeded", "concurrent_limit_exceeded", "service_busy",
-    "retry_exhausted", "incomplete_response", "upstream_exception",
+    "retry_exhausted",
     "api_key_rate_limit_exceeded", "api_key_concurrent_limit_exceeded",
 }
 
 
 def _retry_after_for_code(code: str) -> int | None:
     return 1 if code in _RETRYABLE_CODES else None
+
+
+def _terminal_client_error(code: str, retries: int, upstream_status: int | None, context_window: int | None = None) -> HTTPException:
+    """重试耗尽后的终端 HTTPException：429（可重试，挂 Retry-After）或 400（请求不可继续）。
+
+    超限类 code 一律转 400 + 压缩提示，绝不落进 429：429 会被 Claude Code / SDK 内部退避
+    重试、并在耗尽后渲染成「API Error: Request rejected (429) · …」，客户端只会等不会压缩；
+    而输入超限时重发必然再失败，唯一有用的动作是压缩。终端各调用点（对话/媒体/TTS）统一
+    走本函数，避免「code 已归因成超限、状态码却还是 429」的分裂态。
+
+    ``context_window``：上游声称的上下文窗口大小（token），已知时附到文案后并把
+    ``context_window`` 字段一并回显，让客户端知道具体上限；未知则不显示。
+
+    detail 用标准 error 信封（不是 429 的 kind/code 平铺形状）：400 由出口 handler 直接
+    透传；超限开关开着时 handler 的 canonicalize 分支会把它再归一一次并补 compact 字段。
+    """
+    if retry_policy.overflow_code_of(code):
+        message = TERMINAL_ERROR_MESSAGES.get(code) or TERMINAL_ERROR_MESSAGES["context_too_large"]
+        detail = _openai_error(message, "invalid_request_error", code)
+        detail["error"].update({
+            "compact": True,
+            "suggested_action": "compact",
+            "retryable": False,
+            "upstream_status": upstream_status,
+            "retries": retries,
+        })
+        if context_window:
+            detail["error"]["message"] = retry_policy.with_context_window(detail["error"]["message"], context_window)
+            detail["error"]["context_window"] = context_window
+        return HTTPException(status_code=400, detail=detail)
+    return HTTPException(
+        status_code=429,
+        detail=_retryable_client_error_detail(code, retries, upstream_status, _retry_after_for_code(code)),
+    )
 
 
 
@@ -4620,6 +5235,7 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
     client_request_path = kwargs.pop("client_request_path", None)
     client_type = kwargs.pop("client_type", "unknown")
     session_id = kwargs.pop("session_id", None) or kwargs.pop("client_session_id", None)
+    subagent_id = kwargs.pop("subagent_id", None)
     editor_id = kwargs.pop("editor_id", None)
     editor_session_id = kwargs.pop("editor_session_id", None)
     task_id = kwargs.pop("task_id", None) or kwargs.pop("_task_id", None)
@@ -4629,6 +5245,18 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
     api_key_parent_id = kwargs.pop("api_key_parent_id", None)
     client_request_body = kwargs.pop("client_request_body", None)
     request_protocol = kwargs.pop("request_protocol", None)
+    # 压缩专用选路候选：非 None 时本次请求走「压缩候选列表 + 按窗口从大到小 + 关本地窗口过滤」。
+    # 必须在深拷贝 kwargs 进 attempt_kwargs（见 build_attempt_body）之前取出，避免透传上游。
+    compression_candidates = kwargs.pop("compression_candidates", None) or None
+    # 压缩识别命中信息（{"client","marker","source"}）：与是否配了压缩模型无关，只要识别为
+    # 压缩就带进来，落 routing_detail.is_compaction 让请求日志打「压」标签。同样必须在下发
+    # 前弹出——虽然出站 body 走 payload_keys 白名单不会带它，但 attempt_kwargs 还会被
+    # build_attempt_body 深拷贝进 request_body 落库/诊断，留着只会污染这两处。
+    compaction_hit = kwargs.pop("_compaction_hit", None) or None
+    # 网关内部选路重试（渠道内层同账号 / 换候选 / 组回退）是平台细节，绝不该冒泡到
+    # 对话 UI——之前 agent 链路传 on_retry 回调把「切换候选 xxx/yyy」漏到面板是架构
+    # 越界。GatewayLLMBridge 已不再传 on_retry；这里也不再 pop/调用，彻底切断这条线。
+    # 网关重试仍可在 RequestLogs 里查到（routing_detail.channel_retry_attempts）。
 
     client = None
     account_client = None
@@ -4674,7 +5302,9 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
         if not reuse_candidate:
             provider_name = None
             username = None
-        route_info = {"estimated_prompt_tokens": estimated_prompt_tokens}
+        # 每个 attempt 重建一次诊断槽。is_compaction 与候选无关，一并给到初始槽，
+        # 让「选路就失败、尚未走到 last_route_info 重建」的行也不丢压缩标记。
+        route_info = {"estimated_prompt_tokens": estimated_prompt_tokens, "is_compaction": compaction_hit}
         attempt_start = time.time()
         attempt_logged = False
         attempt_stream_summary = None
@@ -4710,6 +5340,9 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
                     catalog_snapshot=catalog_snapshot,
                     token_estimate=token_reservation_estimate,
                     input_token_estimate=estimated_prompt_tokens,
+                    compression_candidates=compression_candidates,
+                    request_ctx={"messages": messages, "tools": kwargs.get("tools"),
+                                 "tool_choice": kwargs.get("tool_choice")},
                 )
                 username = getattr(client, 'username', None)
                 candidate_reservation = CandidateReservation(
@@ -4746,6 +5379,10 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
             route_info["_is_save_log"] = is_save_log
             route_info["client_type"] = client_type
             route_info["session_id"] = session_id
+            route_info["subagent_id"] = subagent_id
+            # 压缩识别命中（{"client","marker","source"}）：命中即落 routing_detail.is_compaction，
+            # 请求日志列表与详情据此在客户端列后打「压」标签。未命中为 None，不打标。
+            route_info["is_compaction"] = compaction_hit
             route_info["editor_id"] = editor_id
             route_info["editor_session_id"] = editor_session_id
             route_info["task_id"] = task_id
@@ -4852,6 +5489,17 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
             route_info["public_model_id"] = public_model_id
             route_info["upstream_model_id"] = upstream_model_id
             route_info["response_model"] = client_response_model
+            # 诊断日志：一次请求的四种模型身份与渠道映射结果。线上任何「任务选了模型
+            # X 但实际跑的是 Y」「多个模型塌成一个」的报告，先用这条核对——
+            # requested 是客户端要的、routed 是路由后的公开名、upstream 是真正发给
+            # 上游的 id。upstream == routed 说明该渠道没有配这个模型的映射行
+            # （Channel.resolve_upstream_id 找不到就原样返回），而不是映射写错了。
+            logger.info(
+                "[gateway] model-identity task_id={} provider={} requested='{}' routed='{}' "
+                "upstream='{}' response='{}'",
+                route_info.get("task_id") or "-", provider_name or "-",
+                model, public_model_id, upstream_model_id, client_response_model or "-",
+            )
 
             attempt_kwargs = attempt_builder.build_attempt_body(kwargs)
             attempt.request_body = attempt_kwargs
@@ -4996,7 +5644,9 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
                     raise IncompleteStreamError(
                         f"output intercepted by rule: {hit_rule}", "output_intercepted"
                     )
-                raise EmptyNonStreamResponseError(f"output intercepted by rule: {hit_rule}")
+                raise EmptyNonStreamResponseError(
+                    f"output intercepted by rule: {hit_rule}", code="output_intercepted"
+                )
             if stream and buffered_stream_chunks:
                 for buffered_chunk in buffered_stream_chunks:
                     if not (isinstance(buffered_chunk, dict) and "_last_route_info" in buffered_chunk):
@@ -5206,7 +5856,7 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
                     client_request_body=client_request_body, attempt_start=candidate_started_at,
                     duration_ms_override=_channel_retry_total_duration(channel_attempts),
                     success=False,
-                    status="empty_non_stream" if isinstance(e, EmptyNonStreamResponseError) else "error",
+                    status=_attempt_failure_status(e),
                     response_body=None, error=route_info.get("error") or str(e), usage=None,
                 )
                 # 外层换候选：消耗一个候选名额，下一轮重新选路。
@@ -5225,7 +5875,7 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
                 request_headers=request_headers, client_request_path=client_request_path,
                 client_request_body=client_request_body, attempt_start=candidate_started_at,
                 duration_ms_override=_channel_retry_total_duration(channel_attempts),
-                success=False, status="error", response_body=None,
+                success=False, status=_attempt_failure_status(e), response_body=None,
                 error=route_info.get("error") or str(e), usage=None,
             )
             break
@@ -5282,13 +5932,12 @@ async def _chat_with_retry_for_model(model, messages, stream, api_key: str | Non
             last_route_info,
         )
     # 所有不可重试客户端错误已在 attempt 内原样抛出；走到这里的都是资源/上游暂时失败，
-    # 对客户端统一 429 + 英文业务码（真实 upstream_status 仍在 attempt 日志）。
+    # 对客户端统一 429 + 英文业务码（真实 upstream_status 仍在 attempt 日志）。超限归因
+    # （context_too_large 等）由 _terminal_client_error 转 400 + 压缩提示。
     code, upstream_status = _terminal_429_from_last_error(last_error, max_retries)
-    raise HTTPException(
-        status_code=429,
-        detail=_retryable_client_error_detail(
-            code, max_retries, upstream_status, _retry_after_for_code(code),
-        ),
+    raise _terminal_client_error(
+        code, max_retries, upstream_status,
+        context_window=_overflow_window_from_last_error(last_error),
     )
 
 
@@ -5596,13 +6245,16 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                 err_status = getattr(e, "status_code", None)
                 err_detail = getattr(e, "detail", None) if isinstance(e, HTTPException) else None
                 canonical = retry_policy.canonicalize_upstream_error(err_status, err_detail if err_detail is not None else str(e))
+                error_payload = {"type": error_type, "message": normalized_error_message, "code": error_code}
                 if canonical is not None and config.Config.context_overflow_not_retryable_enabled():
-                    normalized_error_message = canonical.message
-                    error_type = canonical.type
-                    error_code = canonical.code
+                    error_payload["message"] = canonical.display_message
+                    error_payload["type"] = canonical.type
+                    error_payload["code"] = canonical.code
+                    if canonical.window:
+                        error_payload["context_window"] = canonical.window
                 error_event = make_anthropic_sse_event("error", {
                     "type": "error",
-                    "error": {"type": error_type, "message": normalized_error_message, "code": error_code}
+                    "error": error_payload,
                 })
                 yield error_event
             finally:
@@ -6078,8 +6730,10 @@ async def _media_generation_with_retry(
                 await account_client.release()
 
     code, upstream_status = _terminal_429_from_last_error(last_error, max_retries)
-    detail = _retryable_client_error_detail(code, max_retries, upstream_status, _retry_after_for_code(code))
-    raise HTTPException(status_code=429, detail=detail)
+    raise _terminal_client_error(
+        code, max_retries, upstream_status,
+        context_window=_overflow_window_from_last_error(last_error),
+    )
 
 
 async def _tts_generation_with_retry(
@@ -6356,8 +7010,10 @@ async def _tts_generation_with_retry(
                 await account_client.release()
 
     code, upstream_status = _terminal_429_from_last_error(last_error, max_retries)
-    detail = _retryable_client_error_detail(code, max_retries, upstream_status, _retry_after_for_code(code))
-    raise HTTPException(status_code=429, detail=detail)
+    raise _terminal_client_error(
+        code, max_retries, upstream_status,
+        context_window=_overflow_window_from_last_error(last_error),
+    )
 
 
 async def _media_generation_endpoint(kind: str, request: Request, authorization: Optional[str]) -> JSONResponse:
@@ -6450,24 +7106,45 @@ async def _tts_endpoint(request: Request, authorization: Optional[str]) -> Respo
 @app.post("/v1/images/generations")
 @app.post("/images/generations")
 async def images_generations(request: Request, authorization: Optional[str] = Header(None)):
+    """图像生成（OpenAI 兼容 /v1/images/generations）。
+
+    双路径注册：带 /v1 前缀与不带前缀等价，供不同客户端习惯调用。鉴权走
+    Authorization 头，实际调度在 _media_generation_endpoint("image", …)。
+    """
     return await _media_generation_endpoint("image", request, authorization)
 
 
 @app.post("/v1/videos/generations")
 @app.post("/videos/generations")
 async def videos_generations(request: Request, authorization: Optional[str] = Header(None)):
+    """视频生成（OpenAI 兼容 /v1/videos/generations）。
+
+    双路径注册：带 /v1 前缀与不带前缀等价。鉴权走 Authorization 头，
+    实际调度在 _media_generation_endpoint("video", …)。
+    """
     return await _media_generation_endpoint("video", request, authorization)
 
 
 @app.post("/v1/audio/speech")
 @app.post("/audio/speech")
 async def audio_speech(request: Request, authorization: Optional[str] = Header(None)):
+    """语音合成 TTS（OpenAI 兼容 /v1/audio/speech）。
+
+    双路径注册：带 /v1 前缀与不带前缀等价。鉴权走 Authorization 头，
+    实际调度在 _tts_endpoint。
+    """
     return await _tts_endpoint(request, authorization)
 
 
 from agent.api import router as agent_router
 
 app.include_router(agent_router)
+
+# 统一实时网关：一条 WS 承载 agent/chat/task 等业务频道的订阅与发送。
+# 与既有 SSE 端点并存（纯新增），客户端逐端切换后再删旧通道。
+from agent.realtime import router as agent_realtime_router
+
+app.include_router(agent_realtime_router)
 
 from agent.llm_config_api import router as agent_llm_config_router
 
@@ -6526,6 +7203,16 @@ try:
 except Exception:
     logger.exception("[user-platform] mount skipped")
 
+# AI 测试平台能力面（/api/v1/testing，design §17）。与 user_platform 同样
+# lazy + 容错：import/挂载失败只记日志，绝不阻断主服务与 /v1 管线。
+# 前缀已在 _API_PREFIXES 的 /api 下，不会被 SPA 回退吞掉。
+try:
+    from testing_platform.surface.api import router as testing_router
+    app.include_router(testing_router)
+except Exception:
+    logger.exception("[testing-platform] mount skipped")
+
+
 
 # ── 前端 SPA 静态资源与路由回退 ──────────────────────────────────────────
 # 生产环境：将 user-frontend/dist 作为 SPA 资产目录暴露，并对未匹配的
@@ -6537,7 +7224,9 @@ _ADMIN_DIST_DIR = BASE_DIR / "user-frontend" / "dist"
 _ADMIN_INDEX_FILE = _ADMIN_DIST_DIR / "index.html"
 
 # API 前缀：这些路径交给后端路由处理，绝不回退到 SPA
-_API_PREFIXES = ("/admin", "/agent", "/mcp", "/v1", "/api", "/static", "/docs", "/project-docs", "/openapi", "/redoc", "/oauth")
+# /auth 是 LobsterAI 环回回调路径（127.0.0.1:{port}/auth/callback，portal 登录页硬校验），
+# 不进这里会被 SPA catch-all 当页面吞掉，回调就变成前端页而非认领接口。
+_API_PREFIXES = ("/admin", "/agent", "/mcp", "/v1", "/api", "/static", "/docs", "/project-docs", "/openapi", "/redoc", "/oauth", "/authorize", "/auth")
 
 if _ADMIN_DIST_DIR.exists():
     app.mount("/admin-static", StaticFiles(directory=_ADMIN_DIST_DIR), name="admin-static")

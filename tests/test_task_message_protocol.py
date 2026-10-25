@@ -258,6 +258,8 @@ async def test_switch_task_model_moves_selection_to_head(monkeypatch):
         id=TASK_ID,
         api_key_id=None,
         parent_api_key_id=None,
+        provider="",
+        model_mapping=None,
         models_snapshot=["model-a", "model-b", "model-c"],
         save=lambda **_kw: _async_return(None),
     )
@@ -290,6 +292,8 @@ async def test_switch_task_model_adds_target_outside_snapshot(monkeypatch):
         id=TASK_ID,
         api_key_id=7,
         parent_api_key_id=1,
+        provider="",
+        model_mapping=None,
         models_snapshot=["model-a"],
         save=lambda **_kw: _async_return(None),
     )
@@ -371,6 +375,8 @@ async def test_switch_task_model_first_selection_on_empty_snapshot(monkeypatch):
         id=TASK_ID,
         api_key_id=7,
         parent_api_key_id=1,
+        provider="",
+        model_mapping=None,
         models_snapshot=None,
         save=lambda **_kw: _async_return(None),
     )
@@ -427,6 +433,107 @@ async def test_switch_task_model_first_selection_on_empty_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_switch_task_model_on_mapped_task_writes_main(monkeypatch):
+    """配了映射的任务：切主模型 = 改映射 ``main``（新形状），并把
+    快照头部同步成新主模型（派发帧的 model 与 llm.model 都取 main，须一致）。
+    映射任务不收窄子 Key 白名单——不调 update_task_key_model_whitelist。"""
+    service = TaskService()
+    whitelist_updates: list[tuple[int, list[str]]] = []
+    task = SimpleNamespace(
+        id=TASK_ID,
+        api_key_id=7,
+        parent_api_key_id=1,
+        provider="claude",
+        models_snapshot=["old-model"],
+        # 新形状 {main, slots}；旧形状（roles/fallback）读取时经 _migrate 归一。
+        model_mapping={"main": "old-model", "slots": {"sonnet": {"model": "old-model"}}},
+        save=lambda **_kw: _async_return(None),
+    )
+
+    async def owned(user_id, task_id, role=None):
+        return task
+
+    async def validate(key, models, *, active_model=None):
+        return models, active_model
+
+    async def update_whitelist(key_id, whitelist):
+        whitelist_updates.append((key_id, list(whitelist)))
+        return True
+
+    import db as db_module
+
+    monkeypatch.setattr(service, "_owned_task_or_raise", lambda *a, **kw: owned(*a, **kw))
+    monkeypatch.setattr(task_service_module, "_validate_models_for_key", validate)
+    monkeypatch.setattr(
+        db_module.PostgresClient, "update_task_key_model_whitelist",
+        classmethod(lambda cls, key_id, whitelist: update_whitelist(key_id, whitelist)),
+    )
+    result = await service.switch_task_model("user", str(TASK_ID), "new-model")
+
+    assert result["model_id"] == "new-model"
+    # claude 切「当前模型」= 改 opus 档（主循环实际跑的），main（档名）不动。
+    assert task.model_mapping["main"] == "old-model"
+    assert task.model_mapping["slots"]["opus"] == {"model": "new-model"}
+    # 其余槽保留（切当前模型不该抹掉别的档）。
+    assert task.model_mapping["slots"]["sonnet"] == {"model": "old-model"}
+    # 快照头部同步成新模型。
+    assert task.models_snapshot == ["new-model", "old-model"]
+    # 映射任务不收窄白名单。
+    assert whitelist_updates == []
+
+
+@pytest.mark.asyncio
+async def test_update_task_model_mapping_hot_edit(monkeypatch):
+    """详情页齿轮弹框整体替换映射：校验复用 _normalize_model_mapping，落库即生效
+    （llm 配置按消息现算），非法值 / 缺主模型被拒；空 dict = 清除映射。"""
+    from user_platform import task_service as _ts
+
+    service = TaskService()
+    task = SimpleNamespace(
+        id=TASK_ID,
+        api_key_id=None,
+        parent_api_key_id=1,
+        provider="claude",
+        model_mapping={"main": "m1", "slots": {"sonnet": {"model": "m1"}}},
+        node_session_id="",
+        save=lambda **_kw: _async_return(None),
+    )
+
+    async def owned(user_id, task_id, role=None):
+        return task
+
+    async def validate(key, models, *, active_model=None):
+        legal = {"m1", "m2"}
+        kept: list[str] = []
+        for m in models:
+            if m in legal and m not in kept:
+                kept.append(m)
+        return kept, (kept[0] if kept else (active_model or ""))
+
+    monkeypatch.setattr(service, "_owned_task", owned)
+    monkeypatch.setattr(_ts, "_validate_models_for_key", validate)
+
+    # 合法替换：slots 更新 + main 保持。
+    result = await service.update_task(
+        "user", str(TASK_ID),
+        {"model_mapping": {"main": "m1", "slots": {"sonnet": {"model": "m2"}}}},
+    )
+    assert result["ok"] is True
+    assert task.model_mapping == {"main": "m1", "slots": {"sonnet": {"model": "m2"}}}
+
+    # claude 的 main 缺省落 opus 档（不报错）；其余 provider 缺 main 才被拒。
+    task.provider = "codex"
+    with pytest.raises(ValueError, match="model_mapping_fallback_required"):
+        await service.update_task(
+            "user", str(TASK_ID), {"model_mapping": {"main": "", "slots": {"N": {"model": "m1"}}}},
+        )
+
+    # 空 dict = 清除映射（回落 models 白名单语义）。
+    await service.update_task("user", str(TASK_ID), {"model_mapping": {}})
+    assert task.model_mapping is None
+
+
+@pytest.mark.asyncio
 async def test_add_task_models_appends_without_moving_active(monkeypatch):
     """添加模型：合法者并入集合（追加，不动头部活跃模型），白名单同步为并集。"""
     service = TaskService()
@@ -435,6 +542,8 @@ async def test_add_task_models_appends_without_moving_active(monkeypatch):
         id=TASK_ID,
         api_key_id=7,
         parent_api_key_id=1,
+        provider="",
+        model_mapping=None,
         models_snapshot=["model-a"],
         save=lambda **_kw: _async_return(None),
     )
@@ -477,6 +586,8 @@ async def test_add_task_models_first_add_on_empty_snapshot(monkeypatch):
         id=TASK_ID,
         api_key_id=7,
         parent_api_key_id=1,
+        provider="",
+        model_mapping=None,
         models_snapshot=None,
         save=lambda **_kw: _async_return(None),
     )

@@ -28,6 +28,7 @@ class CodeRunApprovalBatch:
         caller: str | None,
         emit: EventSink | None,
         timeout_seconds: int = CONFIRMATION_TIMEOUT_SECONDS,
+        auto_approve: "bool | Callable[[], bool]" = False,
     ):
         self.conversation_id = conversation_id
         self.agent_id = agent_id
@@ -36,7 +37,16 @@ class CodeRunApprovalBatch:
         # 注册表到期时刻与本地 wait_for 必须同值，否则两边各按各的到期：
         # 注册表判过期后 reap 成 deny，而等待方还在等，或者反过来。
         self.timeout_seconds = int(timeout_seconds)
+        # auto 模式放行开关。传 callable 时**每次 prepare 现取**（读会话活状态），
+        # 传 bool 时用快照——历史 bug 是这里只收 bool，回合开始切走 auto 后同回合
+        # 后续审批还拿旧值弹卡。会话状态收进 ConversationState 后，调用方传
+        # `lambda: state.auto_approve` 即可让中途切 auto 立即生效。
+        self._auto_approve = auto_approve
         self._decisions: list[tuple[str, str, str | None]] = []
+
+    def _is_auto(self) -> bool:
+        aa = self._auto_approve
+        return bool(aa() if callable(aa) else aa)
 
     def _timeout(self) -> float | None:
         """wait_for 的 timeout：恰好 0 表示不过期（None＝永久等待）。
@@ -65,9 +75,20 @@ class CodeRunApprovalBatch:
                 args = raw if isinstance(raw, dict) else json.loads(raw)
             except (TypeError, ValueError):
                 args = {}
+            # Management operations (list/output/kill) execute no new code, so
+            # they must not trigger an approval card — the whole batch would
+            # otherwise ask the user to approve an empty script.
+            if args.get("operation"):
+                continue
             canonical = self._canonical(args)
             calls.append((canonical, args))
         if not calls:
+            return
+        # auto 模式：全部自动放行，不建审批卡也不等裁决（用户显式选择了自动模式）。
+        # 但 emit=None（无人值守）时仍 fail closed：auto_approve 只由交互入口传入，
+        # 这里双重保险——没有事件出口就没有「用户在场」的前提。
+        if self._is_auto() and self.emit is not None:
+            self._decisions = [(canonical, "allow", None) for canonical, _args in calls]
             return
         if self.emit is None:
             self._decisions = [(canonical, "deny", None) for canonical, _args in calls]
@@ -81,7 +102,7 @@ class CodeRunApprovalBatch:
             command=canonical_batch,
             commands=[canonical for canonical, _args in calls],
             requester=self.caller,
-            shell_flavor="python/powershell",
+            shell_flavor="shell/python/powershell",
             timeout_seconds=self.timeout_seconds,
             metadata={
                 "agent_id": self.agent_id,

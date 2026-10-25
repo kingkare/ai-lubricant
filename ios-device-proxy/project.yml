@@ -1,0 +1,40 @@
+# XcodeGen spec — fallback / regeneration path for DeviceProxy.xcodeproj.
+# The checked-in project.pbxproj is hand-written and authoritative; this file
+# documents the same settings and can regenerate an equivalent project with
+# `xcodegen generate` if the pbxproj is ever lost.
+name: DeviceProxy
+
+options:
+  bundleIdPrefix: com.ailubricant
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    SWIFT_VERSION: "5.0"
+    SDKROOT: iphoneos
+
+targets:
+  DeviceProxy:
+    type: application
+    platform: iOS
+    sources:
+      - path: DeviceProxy
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ailubricant.deviceproxy
+        PRODUCT_NAME: "$(TARGET_NAME)"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: DeviceProxy/Info.plist
+        IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_EMIT_LOC_STRINGS: YES

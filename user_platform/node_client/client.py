@@ -335,11 +335,23 @@ class NodeClient:
         envs = resp.get("environments") or []
         return [e for e in envs if isinstance(e, dict)]
 
-    async def manage_environment(self, node_id: str, env_id: str, action: str) -> dict[str, Any]:
-        """Create ("create") or remove ("remove") a shared-environment directory."""
-        return await self._rpc(
-            "ManageNodeEnvironment", {"nodeId": node_id, "envId": env_id, "action": action}
-        )
+    async def manage_environment(
+        self, node_id: str, env_id: str, action: str, git: dict | None = None,
+        target_path: str = "",
+    ) -> dict[str, Any]:
+        """Create ("create") or remove ("remove") a shared-environment directory.
+
+        ``git`` 只在 create 时有意义：fresh/worktree 模式把项目仓库 clone 好，让
+        第一个任务只做 `git worktree add`（秒级）。``target_path``：空 = clone 进
+        环境共享检出（worktree 模式）；非空 = clone 进该绝对路径（fresh 模式）。
+        remove 与导入模式都不带这两者（目录本就存在/操作者自己的）。
+        """
+        payload = {"nodeId": node_id, "envId": env_id, "action": action}
+        if git:
+            payload["git"] = git
+        if target_path:
+            payload["target_path"] = target_path
+        return await self._rpc("ManageNodeEnvironment", payload)
 
     async def sync_environment(
         self, node_id: str, env_id: str, skills: list[dict], plugins: list[dict]
@@ -533,6 +545,9 @@ class NodeClient:
         timeout_seconds: int = 0,
         artifact_name: str = "",
         artifact_version: str = "",
+        source_kind: str = "",
+        source_subdir: str = "",
+        source_no_proxy: bool = False,
     ) -> dict[str, Any]:
         """Dispatch a build job to a node that mounts the build runner.
 
@@ -555,6 +570,9 @@ class NodeClient:
                 "timeoutSeconds": int(timeout_seconds or 0),
                 "artifactName": artifact_name,
                 "artifactVersion": artifact_version,
+                "sourceKind": source_kind,
+                "sourceSubdir": source_subdir,
+                "sourceNoProxy": bool(source_no_proxy),
             },
         )
 
@@ -581,6 +599,11 @@ class NodeClient:
             "RuntimeUpgradeNode", {"nodeId": node_id, "target": target},
             timeout=NODE_LONG_RPC_TIMEOUT,
         )
+
+    async def get_node_upgrade_status(self, node_id: str) -> dict[str, Any]:
+        """升级进度快照（runtime + 节点程序两步）。纯内存读，默认超时即可；
+        节点重启窗口必须仍可查询，所以控制面侧不做在线检查。"""
+        return await self._rpc("GetNodeUpgradeStatus", {"nodeId": node_id})
 
     async def upgrade_node(
         self,
@@ -755,6 +778,16 @@ class NodeClient:
         timeout_ms: int = 0,
         max_output_bytes: int = 0,
     ) -> dict[str, Any]:
+        # 载体 on_demand 唤醒（可选钩子）：节点离线且绑了 on_demand 载体时，
+        # 先让载体唤醒再下发（AI 沙箱可能要重跑安装）。普通节点/失败一律不阻断——
+        # 命令该失败就按控制面的 UNAVAILABLE 语义失败，不让载体异常冒泡成 host_exec 错。
+        try:
+            from ..carrier_service import ensure_node_awake_maybe
+
+            await ensure_node_awake_maybe(node_id)
+        except Exception:  # noqa: BLE001 - 载体层不可用（单测/早期启动）完全跳过
+            pass
+
         # 节点按请求自带的 timeout_ms 执行（默认 2 分钟、硬顶 10 分钟），
         # 数据面超时必须覆盖该预算 + 往返余量，否则长命令会被 30s 全局默认
         # 掐断（节点还在跑），报假 503。与 install_host_tool 同口径。

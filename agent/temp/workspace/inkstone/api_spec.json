@@ -1,0 +1,524 @@
+{
+  "site": "https://discovery.intern-ai.org.cn",
+  "auth": {
+    "header": "Authorization",
+    "format": "Bearer <uaa-token>",
+    "token_source": "cookie uaa-token (JWT)"
+  },
+  "sdk_patterns": {
+    "ml_api": "S.http.get(path,{params}) / S.http.post(path,{data}) / S.http.put(path,{data}) / S.http.delete(path)",
+    "users_api": "Rt.post(url,{data,forbidCheckLogin})",
+    "upload": "Rt.uploadRaw(url, file, {headers:{'Content-Type':...}})"
+  },
+  "note": "RemoteApp.js 不含 /api/orbit/v1/ 对话模块和 /models 端点(orbit=0)；这些在其它 bundle。本文件覆盖该 bundle 内全部 37 个 /api/ 端点。",
+  "endpoints": [
+    {
+      "path": "/api/ml/v1/cloud-disk/list",
+      "method": "GET",
+      "params": {
+        "query": [
+          "page_size",
+          "page_token",
+          "dir_path",
+          "keyword",
+          "sort_by",
+          "sort_order",
+          "dirs_only",
+          "recursive"
+        ]
+      },
+      "verified": {
+        "status": 200,
+        "note": "dir_path=/ 返回 code:0,data.list/total/page/size"
+      }
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/quota",
+      "method": "GET",
+      "params": {},
+      "verified": {
+        "status": 200,
+        "note": "返回配额信息"
+      }
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/default-name-list",
+      "method": "GET",
+      "params": {
+        "query": [
+          "dir_path",
+          "is_dir"
+        ]
+      },
+      "verified": {
+        "status": 400,
+        "note": "缺 dir_path 报 field dir_path is not set"
+      }
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/mkdir",
+      "method": "POST",
+      "body": [
+        "dir_path",
+        "dir_name"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/copy",
+      "method": "POST",
+      "body": [
+        "src_keys",
+        "dst_dir",
+        "conflict_strategy"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/move",
+      "method": "POST",
+      "body": [
+        "src_keys",
+        "dst_dir",
+        "conflict_strategy"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/rename",
+      "method": "POST",
+      "body": [
+        "src_key",
+        "new_name",
+        "conflict_strategy"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/delete",
+      "method": "POST",
+      "body": [
+        "file_keys"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/upload-url",
+      "method": "POST",
+      "body": [
+        "dir_path",
+        "files"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/download-url",
+      "method": "POST",
+      "body": [
+        "file_keys"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/cloud-disk/check",
+      "method": "POST",
+      "body": [
+        "dst_dir",
+        "file_names"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/dev-machine/list",
+      "method": "GET",
+      "params": {
+        "query": [
+          "(page,size等list过滤参数)"
+        ]
+      },
+      "verified": {
+        "status": 200,
+        "note": "返回 list/total"
+      }
+    },
+    {
+      "path": "/api/ml/v1/dev-machine/user_resource",
+      "method": "GET",
+      "params": {},
+      "verified": {
+        "status": 200,
+        "note": "返回 user_ssoid,computility_point_total/used/remaining,notebook_total/used/remaining"
+      }
+    },
+    {
+      "path": "/api/ml/v1/dev-machine/create",
+      "method": "POST",
+      "body": [
+        "(创建开发机完整对象 e)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/dev-machine/start",
+      "method": "POST",
+      "body": [
+        "(id)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/dev-machine/stop",
+      "method": "POST",
+      "body": [
+        "(id)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/dev-machine/delete",
+      "method": "POST",
+      "body": [
+        "(id)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/dev-machine/rename",
+      "method": "POST",
+      "body": [
+        "(id,new_name)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/training/list",
+      "method": "GET",
+      "params": {
+        "query": [
+          "page",
+          "size",
+          "(其它过滤)"
+        ]
+      },
+      "verified": {
+        "status": 200,
+        "note": "返回 list/total/size/next_token"
+      }
+    },
+    {
+      "path": "/api/ml/v1/training/list-monitor",
+      "method": "GET",
+      "params": {
+        "query": [
+          "ids(可多值)"
+        ]
+      },
+      "verified": {
+        "status": 200,
+        "note": "?ids=...&ids=... 返回 data.list"
+      }
+    },
+    {
+      "path": "/api/ml/v1/training/code_upload_url",
+      "method": "GET",
+      "params": {
+        "query": [
+          "file_name"
+        ]
+      }
+    },
+    {
+      "path": "/api/ml/v1/training/create",
+      "method": "POST",
+      "body": [
+        "(训练任务对象 e)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/training/stop",
+      "method": "POST",
+      "body": [
+        "(id)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/training/delete",
+      "method": "POST",
+      "body": [
+        "(id)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/training/update_name",
+      "method": "POST",
+      "body": [
+        "(id,name)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/training/extend_duration",
+      "method": "POST",
+      "body": [
+        "(id,duration等)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/dataset/mount-list",
+      "method": "GET",
+      "params": {
+        "query": [
+          "(params:e,可能含 dev_machine_id)"
+        ]
+      },
+      "verified": {
+        "status": 404,
+        "note": "404,可能需 query 参数或路径已变更"
+      }
+    },
+    {
+      "path": "/api/ml/v1/mirrors",
+      "method": "GET",
+      "params": {
+        "query": [
+          "page",
+          "size",
+          "keyword",
+          "building_status",
+          "category",
+          "sort_type"
+        ]
+      },
+      "verified": {
+        "status": 200,
+        "note": "返回 list+pagination.total"
+      }
+    },
+    {
+      "path": "/api/ml/v1/mirrors",
+      "method": "POST",
+      "body": [
+        "category",
+        "name",
+        "basic_mirror_id",
+        "resource_id",
+        "build_config_method",
+        "build_config.dockerfile_content",
+        "(更多 build_config 字段)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/mirrors/limit",
+      "method": "GET",
+      "params": {},
+      "verified": {
+        "status": 200,
+        "note": "返回 max_count 限制"
+      }
+    },
+    {
+      "path": "/api/ml/v1/mirrors/{id}",
+      "method": "GET",
+      "params": {
+        "path": [
+          "id"
+        ]
+      }
+    },
+    {
+      "path": "/api/ml/v1/mirrors/{id}",
+      "method": "PUT",
+      "params": {
+        "path": [
+          "id"
+        ]
+      },
+      "body": [
+        "category",
+        "name",
+        "basic_mirror_id",
+        "resource_id",
+        "build_config_method",
+        "build_config.dockerfile_content"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/mirrors/{id}",
+      "method": "DELETE",
+      "params": {
+        "path": [
+          "id"
+        ]
+      }
+    },
+    {
+      "path": "/api/ml/v1/inference/list",
+      "method": "GET",
+      "params": {
+        "query": [
+          "page",
+          "size",
+          "(其它过滤 ...)"
+        ]
+      },
+      "verified": {
+        "status": 200,
+        "note": "返回 list/total/next_token"
+      }
+    },
+    {
+      "path": "/api/ml/v1/inference/share_list",
+      "method": "GET",
+      "params": {
+        "query": [
+          "page",
+          "size",
+          "(过滤)"
+        ]
+      }
+    },
+    {
+      "path": "/api/ml/v1/inference/view",
+      "method": "GET",
+      "params": {
+        "query": [
+          "(params:e,含 service_id)"
+        ]
+      }
+    },
+    {
+      "path": "/api/ml/v1/inference/code_upload_url",
+      "method": "GET",
+      "params": {
+        "query": [
+          "file_name"
+        ]
+      }
+    },
+    {
+      "path": "/api/ml/v1/inference/share_user_list",
+      "method": "GET",
+      "params": {
+        "query": [
+          "service_id"
+        ]
+      }
+    },
+    {
+      "path": "/api/ml/v1/inference/create",
+      "method": "POST",
+      "body": [
+        "(推理服务对象 e)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/edit",
+      "method": "POST",
+      "body": [
+        "(e)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/start",
+      "method": "POST",
+      "body": [
+        "(id)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/stop",
+      "method": "POST",
+      "body": [
+        "(id)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/delete",
+      "method": "POST",
+      "body": [
+        "(id)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/rename",
+      "method": "POST",
+      "body": [
+        "(id,name)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/renewal",
+      "method": "POST",
+      "body": [
+        "(id,duration等)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/share_delete",
+      "method": "POST",
+      "body": [
+        "(e)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/user/call_api",
+      "method": "POST",
+      "body": [
+        "(e)"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/inference/query_user",
+      "method": "POST",
+      "body": [
+        "query_words"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/resource/capacity-cfg",
+      "method": "GET",
+      "params": {},
+      "verified": {
+        "status": 200,
+        "note": "返回云盘容量申请选项配置"
+      }
+    },
+    {
+      "path": "/api/ml/v1/resource/computility-cfg",
+      "method": "GET",
+      "params": {},
+      "verified": {
+        "status": 200,
+        "note": "返回 total+items 算力配置"
+      }
+    },
+    {
+      "path": "/api/ml/v1/resource/capacity-apply",
+      "method": "POST",
+      "body": [
+        "inc_quota_amount",
+        "apply_reason"
+      ]
+    },
+    {
+      "path": "/api/ml/v1/resource/computility-apply",
+      "method": "POST",
+      "body": [
+        "(申请对象 e)"
+      ]
+    },
+    {
+      "path": "/api/v1/users/auth",
+      "method": "POST",
+      "body": [
+        "code"
+      ],
+      "sdk": "Rt.post(url,{data:{code},forbidCheckLogin:true})",
+      "note": "登录认证"
+    },
+    {
+      "path": "/api/v1/users/getUserInfo",
+      "method": "POST",
+      "body": [
+        "jwt"
+      ],
+      "sdk": "Rt.post(url,{data:{jwt}})",
+      "note": "获取用户信息"
+    },
+    {
+      "path": "/api/v1/users/logout",
+      "method": "POST",
+      "body": [
+        "jwt"
+      ],
+      "sdk": "Rt.post(url,{data:{jwt}})",
+      "note": "登出"
+    }
+  ]
+}

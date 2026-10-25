@@ -74,6 +74,7 @@ class UpdateBotReq(BaseModel):
 # ---- Git identities -------------------------------------------------------
 @identity_router.get("")
 async def list_identities(user: User = Depends(get_current_user)) -> list[dict]:
+    """获取当前用户的 Git 身份列表（令牌已脱敏）。"""
     return await git_service.list_identities(str(user.id), role=user.role)
 
 
@@ -86,6 +87,11 @@ async def get_identity(
     size: int = Query(0, ge=0, le=100, description="每页数量（默认 20，上限 100）"),
     keyword: str = Query("", description="按仓库名关键字过滤"),
 ) -> dict:
+    """获取单个 Git 身份的详情（含可访问仓库列表）。
+
+    ``flush`` 强制刷新缓存；``page``/``size``/``keyword`` 控制仓库分页与过滤
+    （目前 GitHub/GitLab 支持）。身份不存在或无权访问返回 404。
+    """
     identity = await git_service.get_identity(
         str(user.id),
         identity_id,
@@ -174,6 +180,10 @@ async def create_repository(
 async def add_identity(
     body: AddIdentityReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """新增 Git 身份（平台 + 访问令牌等凭据）。
+
+    令牌为机密只落库；缺少平台类型返回 400；写审计日志（密钥字段自动脱敏）。
+    """
     try:
         result = await git_service.add_identity(str(user.id), body.model_dump(exclude_none=True))
     except ValueError as exc:
@@ -189,6 +199,10 @@ async def add_identity(
 async def update_identity(
     identity_id: str, body: UpdateIdentityReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """更新 Git 身份（基础 URL/用户名/令牌等，部分字段）。
+
+    身份不存在或无权访问返回 404；写审计日志（密钥字段自动脱敏）。
+    """
     ok = await git_service.update_identity(
         str(user.id), identity_id, body.model_dump(exclude_none=True), role=user.role
     )
@@ -206,6 +220,10 @@ async def update_identity(
 async def delete_identity(
     identity_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除一个 Git 身份（连同其缓存）。
+
+    身份不存在或无权访问返回 404；写审计日志。
+    """
     ok = await git_service.delete_identity(str(user.id), identity_id, role=user.role)
     if not ok:
         raise HTTPException(status_code=404, detail="Git 身份不存在或无权访问")
@@ -219,6 +237,7 @@ async def delete_identity(
 # ---- Git bots -------------------------------------------------------------
 @bot_router.get("")
 async def list_bots(user: User = Depends(get_current_user)) -> list[dict]:
+    """获取当前用户的 Git Bot 列表（令牌已脱敏）。"""
     return await git_service.list_bots(str(user.id), role=user.role)
 
 
@@ -226,6 +245,10 @@ async def list_bots(user: User = Depends(get_current_user)) -> list[dict]:
 async def create_bot(
     body: CreateBotReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """创建 Git Bot（平台 + 宿主机 ID，可带 webhook 令牌）。
+
+    缺少平台类型或宿主机 ID 返回 400；令牌为机密只落库。
+    """
     try:
         result = await git_service.create_bot(str(user.id), body.model_dump(exclude_none=True))
     except ValueError as exc:
@@ -244,6 +267,10 @@ async def create_bot(
 async def update_bot(
     bot_id: str, body: UpdateBotReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """更新 Git Bot（名称/宿主机/令牌，部分字段）。
+
+    Bot 不存在或无权访问返回 404；写审计日志（密钥字段自动脱敏）。
+    """
     ok = await git_service.update_bot(
         str(user.id), bot_id, body.model_dump(exclude_none=True), role=user.role
     )
@@ -261,6 +288,10 @@ async def update_bot(
 async def delete_bot(
     bot_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除一个 Git Bot。
+
+    Bot 不存在或无权访问返回 404；写审计日志。
+    """
     ok = await git_service.delete_bot(str(user.id), bot_id, role=user.role)
     if not ok:
         raise HTTPException(status_code=404, detail="Git Bot 不存在或无权访问")

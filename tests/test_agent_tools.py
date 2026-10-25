@@ -339,8 +339,11 @@ async def test_web_execute_without_browser_mcp_returns_not_configured(ga_registr
 
 @pytest.mark.asyncio
 async def test_web_scan_missing_url_errors(ga_registry: ToolRegistry) -> None:
-    result = await ga_registry.execute("web", {"operation": "scan"})
+    # both the canonical name and the legacy alias must demand a url
+    result = await ga_registry.execute("web", {"operation": "read_page"})
     assert result["status"] == "error"
+    legacy = await ga_registry.execute("web", {"operation": "scan"})
+    assert legacy["status"] == "error"
 
 
 @pytest.mark.asyncio
@@ -353,7 +356,7 @@ async def test_web_scan_defaults_to_http_even_with_browser_mcp(
     monkeypatch.setattr(ga_registry, "_web_browser_scan", browser)
     ga_registry._browser_service = "browser-service"
 
-    result = await ga_registry.execute("web", {"operation": "scan", "url": "https://example.com"})
+    result = await ga_registry.execute("web", {"operation": "read_page", "url": "https://example.com"})
 
     assert result["source"] == "http"
     http.assert_awaited_once()
@@ -388,6 +391,153 @@ async def test_web_routes_platform_cdp_method_names(ga_registry: ToolRegistry) -
     runtime.call_tool.assert_awaited_with(
         "dynamic-browser__browser_screenshot",
         {"tab_id": "tab-1"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_routes_every_browser_operation(ga_registry: ToolRegistry) -> None:
+    """The full CDP method set (navigate/open_tab/tabs-mgmt/batch/wait/network)
+    is reachable through `web` — the browser MCP is otherwise unadvertised, so
+    the web tool is the model's only door."""
+    runtime = type("Runtime", (), {})()
+    runtime.call_tool = AsyncMock(return_value={"status": "ok"})
+    ga_registry.set_mcp_runtime(
+        runtime,
+        capability_index=[{
+            "service": "dynamic-browser",
+            "browser": True,
+            "method_names": [
+                "browser_navigate", "browser_open_tab", "browser_close_tab",
+                "browser_switch_tab",
+                "browser_focus_tab", "browser_batch", "browser_wait",
+                "browser_watch_network", "browser_read_network", "browser_unwatch_network",
+            ],
+            "methods": [],
+        }],
+        browser_service="dynamic-browser",
+    )
+
+    await ga_registry.execute("web", {"operation": "navigate", "url": "https://x.test/a"})
+    runtime.call_tool.assert_awaited_with("dynamic-browser__browser_navigate", {"url": "https://x.test/a"})
+
+    await ga_registry.execute("web", {"operation": "open_tab", "url": "https://x.test/b", "new_window": True})
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__browser_open_tab",
+        {"url": "https://x.test/b", "new_window": True},
+    )
+
+    await ga_registry.execute("web", {"operation": "close_tab", "tab": "tab-7"})
+    runtime.call_tool.assert_awaited_with("dynamic-browser__browser_close_tab", {"tab_id": "tab-7"})
+
+    await ga_registry.execute("web", {"operation": "switch_tab", "tab": "tab-7"})
+    runtime.call_tool.assert_awaited_with("dynamic-browser__browser_switch_tab", {"tab_id": "tab-7"})
+
+    await ga_registry.execute("web", {"operation": "focus_tab", "tab": "tab-7"})
+    runtime.call_tool.assert_awaited_with("dynamic-browser__browser_focus_tab", {"tab_id": "tab-7"})
+
+    await ga_registry.execute("web", {"operation": "batch", "commands": [{"cmd": 1}], "tab": "tab-7"})
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__browser_batch",
+        {"commands": [{"cmd": 1}], "tab_id": "tab-7"},
+    )
+
+    await ga_registry.execute("web", {"operation": "wait", "condition_js": "!!ok", "tab": "tab-7", "interval": 0.2})
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__browser_wait",
+        {"condition_js": "!!ok", "interval": 0.2, "switch_tab_id": "tab-7"},
+    )
+
+    # 新 operation 名（watch_traffic/poll_traffic/unwatch_traffic）路由到
+    # browser_* MCP 名（MCP advertised 名未改，模型看不到这层）
+    await ga_registry.execute("web", {"operation": "watch_traffic", "tab": "tab-7", "url_pattern": "/api"})
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__browser_watch_network",
+        {"tab_id": "tab-7", "url_pattern": "/api"},
+    )
+
+    await ga_registry.execute("web", {"operation": "poll_traffic", "tab": "tab-7"})
+    runtime.call_tool.assert_awaited_with("dynamic-browser__browser_read_network", {"tab_id": "tab-7"})
+
+    await ga_registry.execute("web", {"operation": "unwatch_traffic", "tab": "tab-7"})
+    runtime.call_tool.assert_awaited_with("dynamic-browser__browser_unwatch_network", {"tab_id": "tab-7"})
+
+    # 旧 operation 名（watch/read/unwatch_network、network_*）仍作为 alias 路由到
+    # 同一实现——历史提示词/已保存工作流不许断
+    runtime.call_tool.reset_mock()
+    await ga_registry.execute("web", {"operation": "watch_network", "tab": "tab-7", "url_pattern": "/api"})
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__browser_watch_network",
+        {"tab_id": "tab-7", "url_pattern": "/api"},
+    )
+    await ga_registry.execute("web", {"operation": "read_network", "tab": "tab-7"})
+    runtime.call_tool.assert_awaited_with("dynamic-browser__browser_read_network", {"tab_id": "tab-7"})
+    await ga_registry.execute("web", {"operation": "unwatch_network", "tab": "tab-7"})
+    runtime.call_tool.assert_awaited_with("dynamic-browser__browser_unwatch_network", {"tab_id": "tab-7"})
+    await ga_registry.execute("web", {"operation": "network_start", "tab": "tab-7", "url_pattern": "/api"})
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__browser_watch_network",
+        {"tab_id": "tab-7", "url_pattern": "/api"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_routes_fill_credential(ga_registry: ToolRegistry) -> None:
+    """`web(fill_credential)` must reach the browser MCP's browser_fill_credential,
+    forwarding only the *intent* (kind/url/domain/account/selector) — never a value.
+    The credential is resolved server-side and typed into the page; the model only
+    ever gets a receipt back (asserted separately in test_cdp_backend_core)."""
+    runtime = type("Runtime", (), {})()
+    runtime.call_tool = AsyncMock(return_value={"status": "ok", "filled": True})
+    ga_registry.set_mcp_runtime(
+        runtime,
+        capability_index=[{
+            "service": "dynamic-browser",
+            "browser": True,
+            "method_names": ["browser_fill_credential", "browser_totp_code"],
+            "methods": [],
+        }],
+        browser_service="dynamic-browser",
+    )
+
+    await ga_registry.execute(
+        "web", {"operation": "fill_credential", "kind": "otp", "url": "https://x.test", "tab": "tab-7"}
+    )
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__browser_fill_credential",
+        {"kind": "otp", "url": "https://x.test", "tab_id": "tab-7"},
+    )
+
+    # password kind with account disambiguation — still no value in the forwarded args.
+    runtime.call_tool.reset_mock()
+    await ga_registry.execute(
+        "web",
+        {"operation": "fill_credential", "kind": "password", "domain": "github.com",
+         "account": "me@x.test", "tab": "tab-7"},
+    )
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__browser_fill_credential",
+        {"kind": "password", "domain": "github.com", "account": "me@x.test", "tab_id": "tab-7"},
+    )
+
+    # method-name tolerance: a browser MCP that advertises `fill_credential` (not the
+    # platform's `browser_fill_credential`) still resolves through the alias tuple.
+    runtime.call_tool.reset_mock()
+    ga_registry.set_mcp_runtime(
+        runtime,
+        capability_index=[{
+            "service": "dynamic-browser",
+            "browser": True,
+            "method_names": ["fill_credential"],
+            "methods": [],
+        }],
+        browser_service="dynamic-browser",
+    )
+    await ga_registry.execute(
+        "web", {"operation": "fill_credential", "kind": "otp", "url": "https://x.test", "tab": "tab-7"}
+    )
+    runtime.call_tool.assert_awaited_with(
+        "dynamic-browser__fill_credential",
+        {"kind": "otp", "url": "https://x.test", "tab_id": "tab-7"},
     )
 
 
@@ -429,6 +579,44 @@ async def test_web_screenshot_spills_mcp_envelope_to_requested_path(ga_registry:
     assert result["path"] == "workspace/shots/page.png"
     assert "content" not in result and "base64" not in result
     assert ga_registry.context.security.resolve_path(result["path"]).is_file()
+
+
+@pytest.mark.asyncio
+async def test_browser_service_sop_is_not_seeded(ga_registry: ToolRegistry, monkeypatch) -> None:
+    """An unadvertised browser service gets no L1 pointer / SOP file.
+
+    Every browser method is reachable as a `web` operation, so a seeded
+    mcp.<service> SOP would only route the model back to the capability_call
+    spelling the display layer hides.
+    """
+    seeded: list[str] = []
+    retired: list[str] = []
+
+    async def _seed_spy(service: str, entry: dict) -> None:
+        seeded.append(service)
+
+    def _retire_spy(service: str) -> None:
+        retired.append(service)
+
+    # Both spies: seeding an existing skeleton would touch the real agent
+    # memory dir (agent_id=1) — the registry fixture is not isolated there.
+    monkeypatch.setattr(ga_registry, "_maybe_seed_mcp_sop", _seed_spy)
+    monkeypatch.setattr(ga_registry, "_retire_browser_service_sop", _retire_spy)
+    runtime = type("Runtime", (), {})()
+    runtime.call_tool = AsyncMock(return_value={"status": "ok"})
+    ga_registry.set_mcp_runtime(
+        runtime,
+        capability_index=[
+            {"service": "cdp-bridge", "browser": True, "method_names": ["browser_scan"], "methods": []},
+            {"service": "mail", "browser": False, "method_names": ["send"], "methods": []},
+        ],
+        browser_service="cdp-bridge",
+    )
+
+    await ga_registry.seed_mcp_sops()
+
+    assert seeded == ["mail"]
+    assert retired == ["cdp-bridge"]
 
 
 # ---------------------------------------------------------------------------
@@ -828,3 +1016,79 @@ def test_ask_user_schema_has_no_base64_fields(registry: ToolRegistry) -> None:
     schema = next(s for s in registry.get_schema() if s["function"]["name"] == "ask_user")
     item_props = schema["function"]["parameters"]["properties"]["attachments"]["items"]["properties"]
     assert set(item_props) == {"path", "url", "name", "mime_type"}
+
+
+def test_ask_user_normalizes_multi_question_shape(ga_registry: ToolRegistry) -> None:
+    """新形状 questions[] → questions 列表；question/candidates 兼容字段也带上。"""
+    outcome = _run(ga_registry.execute(
+        "ask_user",
+        {
+            "questions": [
+                {"question": "用哪个方案？", "options": [{"label": "A"}, {"label": "B", "description": "B 更稳"}],
+                 "multi_select": True, "recommended": "B", "reason": "B 兼容旧数据"},
+                {"question": "开放题？", "allow_custom": True},
+            ],
+        },
+    ))
+    data = outcome.data
+    assert data["status"] == "question"
+    qs = data["questions"]
+    assert len(qs) == 2
+    assert qs[0]["question"] == "用哪个方案？"
+    assert qs[0]["options"] == [{"label": "A"}, {"label": "B", "description": "B 更稳"}]
+    assert qs[0]["multi_select"] is True
+    assert qs[0]["recommended"] == "B"
+    assert qs[0]["reason"] == "B 兼容旧数据"
+    # 兼容字段：单题题干 + candidates 取首题选项 label
+    assert data["question"] == "用哪个方案？"
+    assert data["candidates"] == ["A", "B"]
+
+
+def test_ask_user_legacy_shape_normalizes_to_single_question(ga_registry: ToolRegistry) -> None:
+    """旧形状 question + candidates → 合成单题 questions，不炸历史/旧提示。"""
+    outcome = _run(ga_registry.execute(
+        "ask_user",
+        {"question": "继续吗？", "candidates": ["继续", "停"]},
+    ))
+    data = outcome.data
+    assert data["status"] == "question"
+    qs = data["questions"]
+    assert len(qs) == 1
+    assert qs[0]["question"] == "继续吗？"
+    assert [o["label"] for o in qs[0]["options"]] == ["继续", "停"]
+
+
+@pytest.mark.asyncio
+async def test_tool_result_oversized_text_spills_to_workspace(
+    registry: ToolRegistry, tool_config: AgentConfig,
+) -> None:
+    """An oversized text result is saved whole and shown as a preview+locator."""
+    from pathlib import Path as _P
+
+    big = "LOG\n" * 20000  # ~80k chars, well over the 15k budget
+    async def _big(args):
+        return {"status": "ok", "stdout": big, "exit_code": 0}
+
+    registry.register("bigtool", _big, {"type": "function", "function": {"name": "bigtool"}})
+    out = await registry.execute("bigtool", {})
+
+    assert out["status"] == "ok"
+    assert out["exit_code"] == 0
+    assert "Saved to" in out["stdout"]
+    # Full text is on disk under workspace/spill/, readable by file_read.
+    spill_files = list((_P(tool_config.allowed_roots[0]) / "spill").glob("bigtool_*.txt"))
+    assert len(spill_files) == 1
+    assert spill_files[0].read_text(encoding="utf-8") == big
+
+
+@pytest.mark.asyncio
+async def test_tool_result_small_text_not_spilled(registry: ToolRegistry, tool_config: AgentConfig) -> None:
+    from pathlib import Path as _P
+
+    async def _small(args):
+        return {"status": "ok", "stdout": "tiny"}
+
+    registry.register("smalltool", _small, {"type": "function", "function": {"name": "smalltool"}})
+    out = await registry.execute("smalltool", {})
+    assert out["stdout"] == "tiny"
+    assert not (_P(tool_config.allowed_roots[0]) / "spill").exists()

@@ -489,7 +489,7 @@ async def resolve_external_cdp_client(token: str) -> str | None:
         return None
     if not resource.get("enabled", True) or not resource.get("token_hash"):
         return None
-    return str(resource["id"])
+    return cdp_client_id_of(resource)
 
 
 async def resolve_external_device_id(token: str) -> str | None:
@@ -537,9 +537,10 @@ async def cdp_driver_clients() -> list[dict]:
     """产出 CDP driver 期望的 client 行列表：每个 cdp_client 资源一行。
 
     连接 token 存资源行（token_hash + token_hint 落 data；哈希非明文凭据，明文
-    永不落库）。``client_id = 资源行 id``。driver 的 TokenManager 按 token_hash 建
+    永不落库）。``client_id`` 是资源对外身份：新建=随机串（data.client_id），存量
+    行无该字段则回落资源行 id（旧值不变）。driver 的 TokenManager 按 token_hash 建
     索引（clients_by_hash），authenticate_client 据此把连接 token → client 行 →
-    client_id=资源id，会话池按 client_id 隔离（一个客户端=一个浏览器）。
+    client_id，会话池按 client_id 隔离（一个客户端=一个浏览器）。
 
     只产出 enabled 且有 token_hash 的 cdp_client 资源（撤销会清 token_hash 并停用，
     故被过滤，driver 侧对应 token 立即失效）。
@@ -549,7 +550,7 @@ async def cdp_driver_clients() -> list[dict]:
     for d in resources:
         if not d.get("enabled", True) or not d.get("token_hash"):
             continue
-        client_id = str(d["id"])
+        client_id = cdp_client_id_of(d)
         clients.append({
             "id": client_id,
             "instance_key": client_id,
@@ -572,24 +573,66 @@ async def cdp_driver_clients() -> list[dict]:
 
 
 def cdp_client_present(resource: dict | None) -> dict | None:
-    """CDP 客户端资源对外形状：strip token_hash，补 client_id=资源 id。"""
+    """CDP 客户端资源对外形状：strip token_hash，补 client_id（随机串，回落行 id）。"""
     if resource is None:
         return None
     result = dict(resource)
     result.pop("token_hash", None)  # 哈希不外泄
-    result["client_id"] = str(result.get("id") or "")
+    result["client_id"] = cdp_client_id_of(result)
     return result
+
+
+def new_cdp_client_id() -> str:
+    """CDP 客户端对外身份：cc_ + 16 字节 base64url（22 字符随机串）。
+
+    与 device 的 new_device_id 同范式——不透明、不可枚举，不暴露资源行自增 id。
+    """
+    import base64
+    import os
+
+    return "cc_" + base64.urlsafe_b64encode(os.urandom(16)).decode("ascii").rstrip("=")
+
+
+def cdp_client_id_of(resource: dict | None) -> str:
+    """取某 cdp_client 资源的对外 client_id：优先 data.client_id（随机），
+    存量行没有该字段就回落资源行 id 字符串（旧数据保持原值）。"""
+    if not resource:
+        return ""
+    return str(resource.get("client_id") or resource.get("id") or "")
+
+
+async def find_cdp_client(client_id: str) -> dict | None:
+    """按对外身份定位 cdp_client 资源：随机 client_id 或旧数字资源 id 都认。
+
+    新客户端 data.client_id 是随机串（cc_ 前缀），存量行没有该字段、其对外身份
+    就是资源行 id 字符串。两者都命中同一条查询，调用方不用关心是哪一代。
+    """
+    from db import PostgresClient
+
+    cid = (client_id or "").strip()
+    if not cid or not PostgresClient.pool:
+        return None
+    async with PostgresClient.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM builtin_tool_resources "
+            "WHERE resource_type='cdp_client' "
+            "AND (data->>'client_id' = $1 OR id::text = $1) LIMIT 1",
+            cid,
+        )
+    return _resource_value(dict(row)) if row else None
 
 
 async def create_cdp_client(owner_user_id: str, name: str, extra: dict | None = None) -> tuple[dict, str]:
     """建一个浏览器客户端资源并签发连接 token。返回 (资源dict, 明文token)。
 
-    明文只此一次返回；DB 只存 token_hash + token_hint。client_id = 资源行 id。
+    明文只此一次返回；DB 只存 token_hash + token_hint。client_id = 随机串
+    （存 data.client_id），不再是可枚举的资源行自增 id。
     """
     token = generate_runtime_token()
     value = dict(extra or {})
     value["name"] = name
     value["enabled"] = True
+    value["client_id"] = new_cdp_client_id()
     value["token_hint"] = runtime_token_hint(token)
     value["token_hash"] = hash_runtime_token(token)
     resource = await create_resource(owner_user_id, "cdp_client", value)
@@ -824,9 +867,20 @@ async def mail_query_for_resource(
         account.get("username") or "", account.get("password") or "",
         account.get("base_url") or "", account.get("secret_key") or "",
     )
-    session = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=120), connector=make_insecure_connector(),
-    )
+    # 账户绑了代理池条目（proxy_id）就经共享 ProxyManager 路由（与 MCP 插件侧同口径，
+    # 五模式 + 热更新）；未绑保持直连原行为。mail 登录有 JWT 会话态，按账户 id 隔离。
+    proxy_id = str(account.get("proxy_id") or "").strip()
+    if proxy_id:
+        from providers.proxy_manager import get_proxy_manager
+        session = get_proxy_manager().session(
+            account_id=f"mail:{account.get('id') or resource_id}",
+            proxy_config_id=proxy_id,
+            default_timeout=aiohttp.ClientTimeout(total=120),
+        )
+    else:
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=120), connector=make_insecure_connector(),
+        )
     try:
         messages = await client.list_mail(
             session, limit=limit, offset=offset,
@@ -846,3 +900,4 @@ async def mail_query_for_resource(
         "received_address": source_address or normalized,
         "messages": messages, "count": len(messages), "limit": limit, "offset": offset,
     }
+

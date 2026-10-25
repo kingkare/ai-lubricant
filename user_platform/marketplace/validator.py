@@ -41,8 +41,10 @@ _MOBILE_RELEASE_SCHEMA_LEGACY = "model-api.mobile-release/v1"
 # 设备控制 App 发行：与 mobile 同骨架但独立模块与 schema（被控端 vs 控制端）
 _DEVICE_CONTROL_VERSION_SCHEMA = "ai-lubricant.device-control-version/v1"
 _DEVICE_CONTROL_RELEASE_SCHEMA = "ai-lubricant.device-control-release/v1"
-# 服务端自身发行：无二进制资产（一版 = 一个 git tag），manifest 只记 tag/备注。
+# 服务端自身发行：一个自包含升级包（主仓 + 两个子模块 + VERSION），
+# 放主仓 ai-lubricant 自己的 Release，不另建发行仓。
 _SERVER_VERSION_SCHEMA = "ai-lubricant.server-version/v1"
+_SERVER_RELEASE_SCHEMA = "ai-lubricant.server-release/v1"
 _CHANNEL_TEMPLATE_SCHEMA = "ai-lubricant.channel-template/v1"
 _CHANNEL_TEMPLATE_SCHEMA_LEGACY = "model-api.channel-template/v1"
 _CHANNEL_ICON_KEYS = {
@@ -503,6 +505,69 @@ def validate_device_control_assets(assets: Any) -> list[str]:
     return errors
 
 
+def validate_server_assets(assets: Any) -> list[str]:
+    """校验服务端升级包 assets。
+
+    与移动端/设备控制同构，但只有一个包（不分平台/架构），所以去重按 filename。
+    """
+    errors: list[str] = []
+    if not isinstance(assets, list) or not assets:
+        errors.append("assets 必须是非空数组")
+        return errors
+    seen: set[str] = set()
+    for index, asset in enumerate(assets):
+        if not isinstance(asset, dict):
+            errors.append(f"assets[{index}] 必须是对象")
+            continue
+        filename = _text(asset.get("filename"))
+        if not filename:
+            errors.append(f"assets[{index}].filename 必填")
+            continue
+        if not is_https_url(asset.get("download_url")):
+            errors.append(f"assets[{index}].download_url 必须是 HTTPS URL")
+        else:
+            query = _url_query(asset.get("download_url"))
+            if query:
+                leaked = [k for k in query if any(needle in k.lower() for needle in _FORBIDDEN_QUERY_KEYS)]
+                if leaked:
+                    errors.append(
+                        f"assets[{index}].download_url 不得携带可能含 token 的 query 字段: "
+                        f"{sorted(set(leaked))}"
+                    )
+        digest = asset.get("digest")
+        if not digest or not _DIGEST_RE.match(str(digest)):
+            errors.append(f"assets[{index}].digest 必须是 sha256: 加 64 位十六进制")
+        size = asset.get("size_bytes")
+        if not isinstance(size, int) or size <= 0:
+            errors.append(f"assets[{index}].size_bytes 必须是正整数")
+        if filename in seen:
+            errors.append(f"assets[{index}] 与其他资产重复（filename）")
+        seen.add(filename)
+    return errors
+
+
+def validate_server_release(data: Any) -> list[str]:
+    """校验 server-releases/version.json（消费侧读的那份）。"""
+    if not isinstance(data, dict):
+        return ["version.json 必须是一个对象"]
+    errors: list[str] = []
+    if data.get("schema") != _SERVER_RELEASE_SCHEMA:
+        errors.append(f'schema 必须为 "{_SERVER_RELEASE_SCHEMA}"')
+    version = _text(data.get("version"))
+    if not version:
+        errors.append("version 必填")
+    elif not _is_server_version(version):
+        errors.append("version 必须是日期串（如 v260912 / 260912）或 semver")
+    if not _text(data.get("version_notes")):
+        errors.append("version_notes 必填")
+    if not is_https_url(data.get("download_url")):
+        errors.append("download_url 必须是 HTTPS URL")
+    forbidden = _find_forbidden_key(data)
+    if forbidden:
+        errors.append(f"version.json 禁止携带敏感或本地字段: {forbidden}")
+    return errors
+
+
 def validate_device_control_release(data: Any) -> list[str]:
     """校验 device-control-releases/version.json。"""
     if not isinstance(data, dict):
@@ -748,9 +813,9 @@ def validate_manifest(module: str, manifest: Any) -> list[str]:
             errors.append(f"设备控制 App 版本禁止携带敏感或本地字段: {forbidden}")
 
     elif module == "server-versions":
-        # 服务端版本与另三条线的本质差异：没有二进制资产。一版 = 一个 git tag，
-        # 部署机 clone 该 tag 即得全套代码（前端 dist 已随库发布）。因此这里校验
-        # 的是「tag 指向的发布物」，不是文件清单。
+        # 与另三条发行线同构：一个升级包（tar.gz）挂 GitHub Release，manifest 记
+        # download_url + digest + size。包由 publish 脚本在打 tag 时产出（VERSION
+        # 在打包时就写进去），管理方像创建节点版本一样上传。
         if manifest.get("kind") != "server_app_version":
             errors.append('server-versions 模块的 kind 必须为 "server_app_version"')
         if manifest.get("schema") != _SERVER_VERSION_SCHEMA:
@@ -764,16 +829,20 @@ def validate_manifest(module: str, manifest: Any) -> list[str]:
             errors.append('status 必须为 "draft" 或 "published"')
         if not _text(manifest.get("version_notes")):
             errors.append("version_notes 必填")
-        # release_tag 是升级动作的实际输入（部署机 git checkout 它），必须显式给出
-        # 且与 version 同源——少了它升级链路无从下手，前端也不该靠 version 拼 tag。
-        release_tag = _text(manifest.get("release_tag"))
-        if not release_tag:
-            errors.append("release_tag 必填（升级时部署机 checkout 的 git 标签）")
-        elif not _RELEASE_TAG_RE.match(release_tag):
-            errors.append("release_tag 只能包含字母、数字、点、下划线、连字符和斜杠")
-        repo_url = _text(manifest.get("repo_url"))
-        if repo_url and not is_https_url(repo_url):
-            errors.append("repo_url 必须是 HTTPS URL")
+        errors.extend(validate_server_assets(manifest.get("assets")))
+        # 顶层 download_url 是升级卡片与宿主执行器的直接输入，必须给（URL 模式
+        # 与文件模式都会填）。与 assets 同口径：禁止带 token/sig 等凭据 query
+        # （会过期，且把凭据写进市场仓）。
+        if not is_https_url(manifest.get("download_url")):
+            errors.append("download_url 必须是 HTTPS URL（升级包下载地址）")
+        else:
+            query = _url_query(manifest.get("download_url"))
+            if query:
+                leaked = [k for k in query if any(needle in k.lower() for needle in _FORBIDDEN_QUERY_KEYS)]
+                if leaked:
+                    errors.append(
+                        f"download_url 不得携带可能含 token 的 query 字段: {sorted(set(leaked))}"
+                    )
         forbidden = _find_forbidden_key(manifest)
         if forbidden:
             errors.append(f"服务端版本禁止携带敏感或本地字段: {forbidden}")

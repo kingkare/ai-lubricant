@@ -18,8 +18,10 @@ revoked/offline node is reflected immediately.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -569,18 +571,29 @@ PROXY_URL={q_purl}
 PROXY_URL_PREFIX={q_pprefix}
 : "${{IMAGE:={_DEFAULT_NODE_IMAGE}}}"
 
+# 入驻排障第一行：这台机器下载走哪条出口路由。network 模式 URL 可能带凭据，
+# 打印前抹成「scheme://****@host」。纯 bash 参数展开，不用 sed —— sed 的反向
+# 引用写进 Python f-string 会被当成八进制转义吃掉。
+case "$PROXY_URL" in
+  *://*@*) PROXY_URL_SHOW="${{PROXY_URL%%://*}}://****@${{PROXY_URL#*@}}" ;;
+  *)       PROXY_URL_SHOW="$PROXY_URL" ;;
+esac
+echo "==> egress proxy: mode=${{PROXY_MODE:-direct}} url=$PROXY_URL_SHOW prefix=$PROXY_URL_PREFIX"
+
 # Proxy for GitHub downloads, baked from the server's global node egress proxy.
 # Empty PROXY_MODE means direct. network uses curl --proxy; url_prefix prepends
-# a mirror/reverse-proxy base to the asset URL.
+# a mirror/reverse-proxy base to the asset URL. --progress-bar shows a live bar
+# for the large binaries; -s is dropped for that reason (keep -f/-L).
 download() {{
   local url="$1" dest="$2"
   if [ "$PROXY_MODE" = "url_prefix" ] && [ -n "$PROXY_URL_PREFIX" ]; then
     url="${{PROXY_URL_PREFIX%/}}/${{url#/}}"
   fi
+  echo "    download: $url"
   if [ "$PROXY_MODE" = "network" ] && [ -n "$PROXY_URL" ]; then
-    curl -fsSL --proxy "$PROXY_URL" "$url" -o "$dest"
+    curl -fL --progress-bar --proxy "$PROXY_URL" "$url" -o "$dest"
   else
-    curl -fsSL "$url" -o "$dest"
+    curl -fL --progress-bar "$url" -o "$dest"
   fi
 }}
 
@@ -599,6 +612,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 # ── build the node image locally (once per host) ──────────────────────────────
+echo "==> [1/3] 准备节点镜像（首次需本地构建）"
 if [ "${{AGENT_COMPOSE_NODE_REBUILD:-}}" = "1" ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   arch="$(uname -m)"
   case "$arch" in
@@ -654,6 +668,7 @@ else
 fi
 
 CONTAINER="agent-compose-node"
+echo "==> [2/3] 清理旧容器（若有）"
 if docker inspect "$CONTAINER" >/dev/null 2>&1; then
   if [ "${{AGENT_COMPOSE_NODE_REPLACE:-}}" != "1" ]; then
     if [ -r /dev/tty ]; then
@@ -667,6 +682,7 @@ if docker inspect "$CONTAINER" >/dev/null 2>&1; then
   fi
   docker rm -f "$CONTAINER" >/dev/null
 fi
+echo "==> [3/3] 启动节点容器"
 docker run -d \\
   --name "$CONTAINER" \\
   --restart always \\
@@ -699,17 +715,38 @@ PROXY_MODE={q_pmode}
 PROXY_URL={q_purl}
 PROXY_URL_PREFIX={q_pprefix}
 
+# 入驻排障第一行：这台机器下载走哪条出口路由。network 模式 URL 可能带凭据，
+# 打印前抹成「scheme://****@host」。纯 bash 参数展开，不用 sed —— sed 的反向
+# 引用写进 Python f-string 会被当成八进制转义吃掉。
+case "$PROXY_URL" in
+  *://*@*) PROXY_URL_SHOW="${{PROXY_URL%%://*}}://****@${{PROXY_URL#*@}}" ;;
+  *)       PROXY_URL_SHOW="$PROXY_URL" ;;
+esac
+echo "==> egress proxy: mode=${{PROXY_MODE:-direct}} url=$PROXY_URL_SHOW prefix=$PROXY_URL_PREFIX"
+
 # Proxy for GitHub downloads, baked from the server's global node egress proxy.
+# --progress-bar 给大文件（node 程序 ~15MB、runtime ~55MB）一条实时进度条；去掉
+# -s（-s 会连进度表一起静默），保留 -f（HTTP 错误即失败）/ -L（跟随重定向）。
 download() {{
   local url="$1" dest="$2"
   if [ "$PROXY_MODE" = "url_prefix" ] && [ -n "$PROXY_URL_PREFIX" ]; then
     url="${{PROXY_URL_PREFIX%/}}/${{url#/}}"
   fi
+  echo "    download: $url"
   if [ "$PROXY_MODE" = "network" ] && [ -n "$PROXY_URL" ]; then
-    curl -fsSL --proxy "$PROXY_URL" "$url" -o "$dest"
+    curl -fL --progress-bar --proxy "$PROXY_URL" "$url" -o "$dest"
   else
-    curl -fsSL "$url" -o "$dest"
+    curl -fL --progress-bar "$url" -o "$dest"
   fi
+}}
+
+# 入驻进度：每个阶段前打印 ``==> [n/总] 说明``，让 ``curl | bash`` 的用户一眼看到
+# 当前走到第几步、还剩几步。总步数固定（见下面 step 调用），失败即中止不影响计数。
+STEP_TOTAL=6
+STEP_NO=0
+step() {{
+  STEP_NO=$((STEP_NO + 1))
+  printf '\n==> [%d/%d] %s\n' "$STEP_NO" "$STEP_TOTAL" "$1"
 }}
 # node-releases/version.json, same source as upgrade).
 {linux_lines}
@@ -734,6 +771,9 @@ case "$arch" in
   *) echo "error: unsupported arch '$arch'" >&2; exit 1 ;;
 esac
 
+# url/sha 必须先初始化：set -u 下若 case 落空（理论不可能，os/arch 已归一化为四组合），
+# 引用未赋值变量会直接把脚本打死在 unbound variable，而不是走到下面的友好报错。
+url=""; sha=""
 case "$os/$arch" in
   linux/amd64)   url="$URL_LINUX_AMD64";   sha="$SHA_LINUX_AMD64" ;;
   linux/arm64)   url="$URL_LINUX_ARM64";   sha="$SHA_LINUX_ARM64" ;;
@@ -746,6 +786,8 @@ if [ -z "$url" ]; then
   echo "error: 当前没有支持 $os/$arch 的节点发行版本，请在市场管理页上传该平台版本" >&2
   exit 1
 fi
+
+step "检测系统架构：${{os}}/${{arch}}"
 
 # Portable SHA-256: macOS 没有 sha256sum（自带 shasum -a 256）；两个都没有就报错。
 # 之前直接调 sha256sum，在 Mac 上 `set -e` + `$(sha256sum …)` 命令替换直接把脚本
@@ -781,7 +823,7 @@ work_root="${{AGENT_COMPOSE_NODE_WORK_ROOT:-$root/work}}"
 mkdir -p "$bindir" "$state_dir" "$work_root"
 binary="$bindir/{binary_name}"
 
-echo "downloading {binary_name} ($os/$arch) ..."
+step "下载节点程序 {binary_name} (${{os}}/${{arch}})"
 download "$url" "$binary"
 chmod +x "$binary"
 if [ -n "$sha" ]; then
@@ -790,6 +832,7 @@ if [ -n "$sha" ]; then
     echo "error: 下载校验失败 ($actual != $sha)" >&2
     exit 1
   fi
+  echo "    校验通过 (sha256 $sha)"
 fi
 
 # Install the universal agent-compose-runtime archive (node-runtime.tar.gz,
@@ -807,7 +850,7 @@ rt_archive="$state_dir/runtime.tar.gz.new"
 rt_stage="$state_dir/runtime-stage.new"
 rm -f "$rt_archive"
 rm -rf "$rt_stage"
-echo "downloading agent-compose runtime (universal) ..."
+step "下载并解压 agent-compose runtime（通用包）"
 download "$rt_url" "$rt_archive"
 if [ -n "$rt_sha" ]; then
   actual="$(sha256 "$rt_archive")"
@@ -816,6 +859,7 @@ if [ -n "$rt_sha" ]; then
     rm -f "$rt_archive"
     exit 1
   fi
+  echo "    校验通过 (sha256 $rt_sha)"
 fi
 mkdir -p "$rt_stage"
 if ! tar -xzf "$rt_archive" -C "$rt_stage"; then
@@ -835,10 +879,12 @@ mv "$rt_stage/runtime" "$state_dir/runtime"
 rm -f "$rt_archive"
 rm -rf "$rt_stage"
 
-# Stop any old node we recognize so the new one can take the host lock. Only
-# processes whose executable lives under our bindir are touched.
-pkill -f "$bindir/node-execution" 2>/dev/null || true
-pkill -f "$bindir/agent-compose-node-management" 2>/dev/null || true
+# 不在这里杀旧节点：node 二进制的 --install --yes 自带优雅换绑（AcquireInstance
+# replace=true）——读 owner.json 校验后给旧进程发 SIGTERM，等它 drain 会话、清
+# owner.json 并释放 flock，最多等 10s。之前这里直接按名字杀进程，旧节点来不及清
+# owner.json，新二进制 trustedOwner 校验到 PID 已死直接报
+# 「another node holds the host lock but its process could not be verified」，
+# 表现为重新入驻提示「节点被锁」。残留锁的手工清理：rm state 目录下 owner.json。
 
 # Persist the single set of credentials and take the host-wide lock. --install-only
 # saves the config and exits; the launcher below owns staying in the foreground.
@@ -851,12 +897,14 @@ pkill -f "$bindir/agent-compose-node-management" 2>/dev/null || true
 # ~/.config/agent-compose/node），而 launcher 拉起的进程读 $root/state —— 两边
 # 不一致时节点一启动就报「node is not installed on this machine」退出。
 echo "saving node configuration..."
+step "保存节点配置与凭据"
 AGENT_COMPOSE_NODE_STATE_DIR="$state_dir" "$binary" --install --install-only --yes --server "$SERVER" --node-id "$NODE_ID" --secret "$NODE_SECRET" --work-root "$work_root"
 
 # One secret-free launcher. Reinstalling with a different role overwrites it so the
 # single daemon entry always runs the current node. __STATE_DIR__ 占位符在安装时
 # sed 注入：state 目录不走持久化 config（Go 侧读 AGENT_COMPOSE_NODE_STATE_DIR 环境变量），
 # 所以 launcher 必须导出它，systemd/crontab 拉起的进程才有正确的 state 落点。
+step "写入启动脚本与开机自启"
 cat > "$root/start-node.sh" <<'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -877,6 +925,7 @@ sed -i.bak "s#__STATE_DIR__#$state_dir#g" "$root/start-node.sh"
 rm -f "$root/start-node.sh.bak"
 chmod +x "$root/start-node.sh"
 
+step "启动节点服务"
 if command -v systemctl >/dev/null 2>&1 && systemctl --user show >/dev/null 2>&1; then
   mkdir -p "$HOME/.config/systemd/user"
   cat > "$HOME/.config/systemd/user/agent-compose-node.service" <<'UNIT'
@@ -941,6 +990,7 @@ ENTRY
   echo "desktop entry: $desktop_dir"
 fi
 echo ""
+echo "==> [$STEP_NO/$STEP_TOTAL] 入驻完成"
 echo "agent-compose node installed to: $root"
 echo "  binary : $bindir/{binary_name}"
 echo "  config : $state_dir/config.json"
@@ -1075,6 +1125,10 @@ set "STATE_DIR=%APPDATA%\\agent-compose\\node"
 set "RT_DIR=%STATE_DIR%\\runtime"
 set "SHORTCUT=%USERPROFILE%\\Desktop\\AiLubricantNode.lnk"
 
+rem 入驻排障第一行：打印本次下载实际走的出口路由。proxy_url 本来就已明文写在本
+rem .bat 里（服务端烘焙进来的运营方自有代理），回显到操作者自己的控制台不额外泄露。
+echo ==^> egress proxy: mode=%PROXY_MODE% url=%PROXY_URL% prefix=%PROXY_URL_PREFIX%
+
 if not exist "%ROOT%" mkdir "%ROOT%"
 if not exist "%BINDIR%" mkdir "%BINDIR%"
 where curl.exe >nul 2>&1
@@ -1093,6 +1147,11 @@ rem Pick the download URL for this machine's arch from version.json (GitHub
 rem direct link, same source as upgrade). An empty URL means no published
 rem version covers that arch — fail loudly so the operator can upload it.
 rem The runtime (node-runtime.tar.gz) is platform-independent: one URL for all.
+rem Progress markers are ASCII only: cmd.exe parses .bat with the OEM codepage,
+rem so Chinese in the source would mangle (the desktop shortcut name avoids this
+rem by going through a PowerShell Base64 command).
+echo.
+echo ==^> [1/5] detect system arch
 set "URL="
 set "SHA="
 if /I "%PROCESSOR_ARCHITECTURE%"=="AMD64" (
@@ -1134,14 +1193,19 @@ echo Cancelled. Existing node data was not changed.
 exit /b 0
 :confirmed
 
-echo stopping known Agent Compose node processes...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$root=[IO.Path]::GetFullPath('%BINDIR%').TrimEnd([char]92)+[char]92; Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -and ($_.Name -like 'node-execution*' -or $_.Name -like 'agent-compose-node-management*') }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}" >nul 2>&1
+rem 不在这里强杀旧节点：二进制的 --install --yes 自带优雅换绑（AcquireInstance
+rem replace=true）——读 owner.json 校验后 taskkill /PID（不带 /F，WM_CLOSE），
+rem 等旧节点 drain 会话、清 owner.json 并释放锁，最多等 10s。之前这里用
+rem PowerShell 强杀，旧节点来不及清 owner.json，新二进制 trustedOwner
+rem 校验到 PID 已死会直接报「another node holds the host lock but its process
+rem could not be verified」，即重新入驻提示「节点被锁」。
 
 echo migrating old startup tasks...
 schtasks.exe /Delete /F /TN "%TASK%" >nul 2>&1
 for /f "tokens=1 delims=," %%T in ('schtasks.exe /Query /FO CSV /NH 2^>nul ^| findstr /I /C:"agent-compose-node-node-"') do schtasks.exe /Delete /F /TN %%~T >nul 2>&1
 del /q "%ROOT%\\run-node-*.bat" >nul 2>&1
 
+echo ==^> [2/5] download node program
 echo downloading {binary_name}...
 set "DL_URL=%URL%"
 set "DL_PROXY="
@@ -1149,7 +1213,8 @@ if /I "%PROXY_MODE%"=="url_prefix" if not "%PROXY_URL_PREFIX%"=="" (
   set "DL_URL=%PROXY_URL_PREFIX%/%URL%"
 )
 if /I "%PROXY_MODE%"=="network" if not "%PROXY_URL%"=="" set "DL_PROXY=--proxy %PROXY_URL%"
-curl.exe -fL %DL_PROXY% "%DL_URL%" -o "%BINARY%.new"
+echo     download: %DL_URL%
+curl.exe -fL --progress-bar %DL_PROXY% "%DL_URL%" -o "%BINARY%.new"
 if errorlevel 1 (
   del /q "%BINARY%.new" >nul 2>&1
   echo error: failed to download the node program >&2
@@ -1190,6 +1255,7 @@ rem "runtime/" - extract it into Go's stateDir so RuntimeDir sees
 rem runtime/dist/cli.js and the node reports runtime_version on its first
 rem register. Without this the approve gate deadlocks: runtime can only be
 rem pushed after approval, but approval requires runtime_version.
+echo ==^> [3/5] download + extract agent-compose runtime
 echo downloading agent-compose runtime...
 set "RT_DL_URL=%RT_URL%"
 set "RT_ARCHIVE=%STATE_DIR%\\runtime.tar.gz.new"
@@ -1205,7 +1271,8 @@ rem "if A if B (X) else (Y)" binds the else to the inner if, silently skipping
 rem the download when the outer condition is false).
 if /I "%PROXY_MODE%"=="url_prefix" if not "%PROXY_URL_PREFIX%"=="" set "RT_DL_URL=%PROXY_URL_PREFIX%/%RT_URL%"
 if /I "%PROXY_MODE%"=="network" if not "%PROXY_URL%"=="" set "RT_DL_PROXY=--proxy %PROXY_URL%"
-curl.exe -fL %RT_DL_PROXY% "%RT_DL_URL%" -o "%RT_ARCHIVE%"
+echo     download: %RT_DL_URL%
+curl.exe -fL --progress-bar %RT_DL_PROXY% "%RT_DL_URL%" -o "%RT_ARCHIVE%"
 if errorlevel 1 (
   del /q "%RT_ARCHIVE%" >nul 2>&1
   echo error: failed to download the agent-compose runtime >&2
@@ -1263,6 +1330,7 @@ rem The Go node owns the persisted credential write + host-wide single-instance
 rem lock. --yes records the approval already collected above; --install-only saves
 rem the config and exits. The secret is never written into the runner, the
 rem scheduled task or the desktop shortcut.
+echo ==^> [4/5] save node configuration
 echo saving node configuration...
 "%BINARY%" --install --install-only --yes --server "%SERVER%" --node-id "%NODE_ID%" --secret "%NODE_SECRET%"
 if errorlevel 2 (
@@ -1272,6 +1340,7 @@ if errorlevel 2 (
 
 rem One fixed, secret-free launcher. Reinstalling with a different role overwrites
 rem it so the single desktop entry/task always starts the current node.
+echo ==^> [5/5] register autostart + start service
 >"%RUNNER%" echo @echo off
 >>"%RUNNER%" echo rem Fixed Agent Compose node launcher. Credentials are read from the saved config.
 {win_npm_runner_line}>>"%RUNNER%" echo "%BINARY%"
@@ -1297,6 +1366,7 @@ rem exit, so this never produces a duplicate process.
 start "Ai Lubricant node" /min cmd.exe /d /c call "%RUNNER%"
 
 echo.
+echo ==^> [5/5] install complete
 echo Agent Compose node installed.
 echo   task:     %TASK% ^(logon autostart^)
 echo   launcher: %RUNNER%
@@ -1419,20 +1489,6 @@ class NodesService:
             return 0
         if deleted:
             logger.info("[nodes] removed {} binding(s) for deleted node {}", deleted, node_id)
-        # A node being hard-deleted/revoked may still carry a TaskNodeBinding
-        # (exclusive occupation) whose task never reached a terminal cleanup —
-        # e.g. the process died mid-dispatch. That zombie row would permanently
-        # pin node_id via unique(node_id) and block any re-registration reusing
-        # the same id. Drop them here alongside the group grants.
-        try:
-            from .models_task import TaskNodeBinding
-
-            stale = await TaskNodeBinding.filter(node_id=nid).delete()
-        except Exception as exc:  # noqa: BLE001 - control-plane mutation already committed
-            logger.warning("[nodes] cleanup task bindings for {} failed: {}", node_id, exc)
-            stale = 0
-        if stale:
-            logger.info("[nodes] removed {} stale TaskNodeBinding(s) for node {}", stale, node_id)
         return int(deleted or 0)
 
     async def delete_node(self, node_id: str) -> dict:
@@ -1564,6 +1620,8 @@ class NodesService:
             return await self.start_xcode_install_job(node_id, proxy_config_id=proxy_config_id)
 
         # 没显式传代理就用节点常驻绑定；再空才直连（与 upgrade_node 同规则）。
+        # 显式直连哨兵 __direct__ 非空，会原样进 resolve_proxy，由其兜底为
+        # {"proxy_mode": "direct"}（见 node_upgrade_targets.resolve_proxy）。
         chosen_proxy_id = (proxy_config_id or "").strip() or str(node.get("proxy_config_id") or "")
         from node_upgrade_targets import UpgradeTargetError, resolve_nodejs_asset, resolve_proxy
 
@@ -1667,10 +1725,21 @@ class NodesService:
     # ── 共享环境：node_server 只做「下发 + 回报磁盘事实」，不持台账 ──────────────
     # 用户级台账（哪些环境、各自的资源集）在 environment_service，这里只把
     # create/remove/sync/inspect 透传给 node-server 控制面。
-    async def manage_environment(self, node_id: str, env_id: str, action: str) -> dict:
-        """在节点上创建/删除一个共享环境目录（create 幂等；remove 回收磁盘）。"""
+    async def manage_environment(
+        self, node_id: str, env_id: str, action: str, git: dict | None = None,
+        target_path: str = "",
+    ) -> dict:
+        """在节点上创建/删除一个共享环境目录（create 幂等；remove 回收磁盘）。
+
+        ``git`` 给 create 时节点顺手把仓库 clone 好（分钟级），第一个任务只做
+        `git worktree add`。``target_path``：空 = clone 进环境共享检出（worktree
+        模式）；非空 = clone 进该绝对路径（fresh 模式，用户选定的 external_path）。
+        导入（external）模式 git/target_path 都不带——目录本就存在。
+        """
         client = get_local_node_client()
-        return await client.manage_environment(node_id, env_id, action)
+        return await client.manage_environment(
+            node_id, env_id, action, git=git, target_path=target_path
+        )
 
     async def sync_environment(
         self, node_id: str, env_id: str, skills: list[dict], plugins: list[dict]
@@ -1683,6 +1752,132 @@ class NodesService:
         """回报节点上该环境 HOME 里物理装了哪些 skill/plugin，供服务端做差异。"""
         client = get_local_node_client()
         return await client.inspect_environment(node_id, env_id)
+
+    async def list_environment_sessions(
+        self, node_id: str, env_id: str, provider: str, workdir: str = "", days: int = 7
+    ) -> list[dict]:
+        """读节点上该环境里编辑器的真实会话记录（只读，节点不写任何东西）。
+
+        会话历史是编辑器自己的事——它写就写、不写就不写。这里做的是去读它留下的
+        记录（跟「列项目」同一套来源），不新增 proto 帧、不要求节点持久化状态。
+
+        三条范围限制，都是「不要全量」来的：
+          * 按 **workdir** 筛 —— 一个 HOME 下可能有该编辑器跑过的所有项目，不筛
+            就会把操作者别的项目历史当成这个环境的会话（不隔离环境尤其明显）；
+          * 只要近 **days** 天 —— 更久的会话不扫；
+          * 只推元信息 —— 消息内容不入库，点开时才拉。标题是唯一的例外：它是从
+            记录里派生的一行文字（最近一次提问），随元信息一起推，页面列表直接用。
+
+        ``workdir`` 为空时不筛（不隔离环境没绑目录时的兜底）。
+        """
+        from .routes_nodes_files import (
+            _editor_session_command,
+            _parse_editor_sessions,
+        )
+
+        provider = str(provider or "").strip().lower()
+        if not provider:
+            return []
+        days = max(1, min(int(days or 7), 90))
+        since = int(time.time()) - days * 86400
+
+        home = await self.environment_home_path(node_id, env_id)
+        is_windows = await self.node_is_windows(node_id)
+        if not home:
+            # 拿不到环境目录（不隔离环境本来就以操作者 HOME 为 HOME，或节点没报
+            # work_root）——退回操作者 HOME。
+            home = await self.node_user_home(node_id, is_windows)
+
+        client = get_local_node_client()
+        command = _editor_session_command(
+            provider, is_windows=is_windows, home=home, workdir=workdir, since=since
+        )
+        if command is None:
+            return []
+        try:
+            result = await client.host_exec(
+                node_id, command, cwd="", timeout_ms=60_000, max_output_bytes=1_000_000
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise NodesServiceError(f"节点扫描会话失败：{exc}") from exc
+        # 退出码在这里没有意义（grep 找不到东西就退 1），只看 stdout。
+        return _parse_editor_sessions(str(result.get("stdout") or ""), workdir)
+
+    async def environment_home_path(self, node_id: str, env_id: str) -> str:
+        """节点上某个环境的 HOME 目录。**只对隔离环境成立**，其余一律空串。
+
+        隔离环境（shared/worktree/fresh）的编辑器就住在 ``<work_root>/envs/<env_id>``
+        —— ``work_root`` 是节点上报的 capability（见 nodes/common/agent/client.go 的
+        capabilityLabels），``envs/<env_id>`` 是节点的内部布局。
+
+        不隔离环境（external，目录是操作者自己的 checkout）用的本来就是操作者的
+        全局配置，编辑器跑在他的真实 HOME 下，**没有「环境目录」这回事**——返回空串，
+        调用方回退操作者 HOME。这个判断必须跟派发时算 env_mode 用同一个真相源
+        （``resolve_isolated``，task_service 那边是
+        ``"shared" if resolve_isolated(mode) else "system"``）：external 在节点上是
+        ``system`` 档、HOME 就是 ``os.UserHomeDir()``。两边各判各的就会错位——实测
+        踩过：节点升上来开始上报 ``work_root`` 之后，external 环境的会话扫描被打到
+        ``envs/<env_id>``（编辑器从没在那儿写过任何记录），列表恒空。
+
+        隔离环境也只在节点报了 ``work_root`` 时才给路径；拿不到就空串回退，不猜。
+        """
+        env_key = str(env_id or "").strip()
+        if not env_key:
+            return ""
+        if any(part in ("", ".", "..") for part in env_key.replace("\\", "/").split("/")):
+            return ""
+
+        from .models_environment import TaskEnvironment, resolve_isolated
+
+        try:
+            env_pk = uuid.UUID(env_key)
+        except ValueError:
+            return ""  # 不是合法环境 id，谈不上环境目录
+        row = await TaskEnvironment.get_or_none(id=env_pk)
+        if row is None or str(row.node_id or "") != str(node_id or ""):
+            # 环境不存在、或压根不在这个节点上——别把 A 节点的目录当 B 节点的用。
+            return ""
+        if not resolve_isolated(str(row.workspace_mode or "")):
+            return ""  # external：编辑器用的是操作者 HOME，见上。
+
+        node = await self.get_node_if_exists(node_id)
+        caps = (node.get("capabilities") or {}) if isinstance(node, dict) else {}
+        work_root = str(caps.get("work_root") or "").strip()
+        if not work_root:
+            return ""
+        return f"{work_root.rstrip('/\\')}/envs/{env_key}"
+
+    async def node_is_windows(self, node_id: str) -> bool:
+        """该节点是不是 Windows 宿主（决定下发 POSIX 还是 PowerShell 命令）。"""
+        node = await self.get_node_if_exists(node_id)
+        caps = (node.get("capabilities") or {}) if isinstance(node, dict) else {}
+        return str(caps.get("os") or "").strip().lower() == "windows"
+
+    async def node_user_home(self, node_id: str, is_windows: bool) -> str:
+        """节点上的用户目录。拿不到返回空串（调用方据此跳过扫描，不猜路径）。
+
+        PowerShell 片段必须经 ``_powershell_command`` 包一层：host_exec 默认走节点
+        的本地 shell（Windows 上是 cmd.exe），裸发 ``[Console]::Out.Write(...)``
+        会被 cmd 当成路径解析，回一句 "The filename, directory name, or volume
+        label syntax is incorrect."、stdout 是空——而这里又把异常和空输出都吞成
+        空串，于是「节点没有 HOME」和「命令根本没跑对」看起来一模一样。实测踩过：
+        不隔离环境的会话扫描拿不到兜底 HOME，列表恒空。
+        """
+        from .routes_nodes_files import _powershell_command
+
+        client = get_local_node_client()
+        try:
+            result = await client.host_exec(
+                node_id,
+                _powershell_command("[Console]::Out.Write($env:USERPROFILE)")
+                if is_windows
+                else "printf '%s' \"$HOME\"",
+                cwd="",
+                max_output_bytes=8192,
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(result.get("stdout") or "").strip()
 
     # ── 系统内置环境（节点操作者的真实 HOME）────────────────────────────────
     # 与上面共用环境的三个方法平行，但不带 env_id：一个节点只有一个操作者 HOME，
@@ -1718,10 +1913,20 @@ class NodesService:
     async def upgrade_node(self, node_id: str, *, proxy_config_id: str = "") -> dict:
         """统一升级节点：先 Runtime，再节点程序，两个步骤共用一个代理。
 
-        ``proxy_config_id`` 为空时回退到该节点记录上的常驻绑定
-        (``proxy_config_id``)，再空才直连——升级默认沿用节点自己的代理。
+        代理选择优先级：
+        1. 调用方显式传 ``DIRECT_PROXY_ID`` 哨兵 → 强制直连，忽略节点常驻绑定；
+        2. 传代理 id → 用该条目；
+        3. 传空 → 回退到节点记录上的常驻绑定 ``proxy_config_id``，
+           再空才直连——升级默认沿用节点自己的代理。
         成功后才把这次用的 proxy_config_id 落到节点的 ``last_proxy_config_id``，
         供下次升级弹窗预选；失败不落，语义=「上次成功升级」。
+
+        「卡半天才开始下载」的历史成因：资产可达性探测是串行两次、每次最多
+        20s，且探测全部在 :meth:`NodeClient.upgrade_node` 发帧之前完成，而
+        控制面的进度快照要到 node-server 收到 UpgradeNode 时才 init——于是
+        探测期间前端轮询 upgrade-status 拿到的是 404「暂无进度」，观感就是点
+        了没反应。现在探测并发跑（两个资产并行，最慢一个计时），不再把窗口
+        无谓拉长一倍。
         """
         node = await self.get_node_if_exists(node_id)
         if node is None:
@@ -1733,10 +1938,18 @@ class NodesService:
             raise NodesServiceError("invalid_argument", "节点尚未上报 os/arch，无法选择升级资产")
 
         import node_release_catalog
-        from node_upgrade_targets import UpgradeTargetError, probe_asset, resolve_proxy
+        from node_upgrade_targets import (
+            DIRECT_PROXY_ID,
+            UpgradeTargetError,
+            probe_asset,
+            resolve_proxy,
+        )
 
-        # 没显式传代理就用节点常驻绑定；再空才直连。
-        chosen_proxy_id = (proxy_config_id or "").strip() or str(node.get("proxy_config_id") or "")
+        requested = (proxy_config_id or "").strip()
+        # 显式直连哨兵不回落绑定；空串才回落。
+        chosen_proxy_id = requested if requested == DIRECT_PROXY_ID else (
+            requested or str(node.get("proxy_config_id") or "")
+        )
 
         latest = await node_release_catalog.get_latest_release()
         selected = node_release_catalog.select_upgrade_assets(
@@ -1755,10 +1968,35 @@ class NodesService:
                 f"版本 {selected['version']} 没有匹配节点 {os_name}/{arch} 的升级资产",
             )
         try:
-            proxy_fields = await resolve_proxy(chosen_proxy_id)
-            for asset in (runtime_asset, node_asset):
-                if asset is not None:
-                    await probe_asset(str(asset.get("download_url") or ""), proxy_fields)
+            if chosen_proxy_id == DIRECT_PROXY_ID:
+                # 帧里显式带 proxy_mode="direct"，而不是三字段全空——节点端把
+                # 「全空」当作「帧没带代理」并回落到常驻出口代理快照；显式
+                # direct 才能压住那次回落（与 start_xcode_install_job 同手法）。
+                proxy_fields: dict = {"proxy_mode": "direct"}
+            else:
+                proxy_fields = await resolve_proxy(chosen_proxy_id)
+            urls = [
+                url
+                for url in (
+                    str(runtime_asset.get("download_url") or "") if runtime_asset else "",
+                    str(node_asset.get("download_url") or "") if node_asset else "",
+                )
+                if url
+            ]
+            # 并发探测：两个资产同时探，最慢一个计满超时即可，串行会把窗口翻倍。
+            if urls:
+                results = await asyncio.gather(
+                    *(probe_asset(url, proxy_fields) for url in urls),
+                    return_exceptions=True,
+                )
+                for url, result in zip(urls, results):
+                    if isinstance(result, UpgradeTargetError):
+                        raise result
+                    if isinstance(result, BaseException):
+                        raise UpgradeTargetError(
+                            f"探测下载地址失败{'（经代理）' if proxy_fields.get('proxy_mode') else '（直连）'}: "
+                            f"{result}，请更换代理后重试"
+                        )
         except UpgradeTargetError as exc:
             raise NodesServiceError("invalid_argument", str(exc)) from exc
 
@@ -1783,12 +2021,34 @@ class NodesService:
             runtime_target=target(runtime_asset),
             node_target=target(node_asset),
         )
-        # 升级 RPC 成功才落「上次成功升级用的代理」；失败不落。
+        # 升级 RPC 成功才落「上次成功升级用的代理」；失败不落。哨兵本身不是
+        # 代理池 id，落成空串——upgrade-defaults 的口径就是「空=直连」。
         try:
-            await client.set_node_last_proxy(node_id, chosen_proxy_id)
+            remembered = "" if chosen_proxy_id == DIRECT_PROXY_ID else chosen_proxy_id
+            await client.set_node_last_proxy(node_id, remembered)
         except Exception:  # noqa: BLE001 - 记忆默认值绝不能让一次成功升级失败
             logger.debug("[nodes] set last_proxy for {} failed", node_id, exc_info=True)
         return result
+
+    async def upgrade_status(self, node_id: str) -> dict:
+        """升级进度快照（控制面内存态，按 node_id 跨重连存活）。
+
+        快照只在升级下发后存在：没跑过升级 = 未找到。不检查在线——节点程序
+        替换必然断连，重启窗口正是前端最需要读到进度的时候。前端轮询此接口
+        把「下发中...」换成阶段 + 下载进度条。
+        """
+        node_id = (node_id or "").strip()
+        if not node_id:
+            raise NodesServiceError("invalid_argument", "node_id 必填")
+        client = get_local_node_client()
+        try:
+            return await client.get_node_upgrade_status(node_id)
+        except RPCError as exc:
+            # 控制面对「该节点没跑过升级」回 not_found；转成本服务统一口径，
+            # 路由层据此回 404（前端把 404 当「暂无进度」静默处理）。
+            if getattr(exc, "code", "") == "not_found":
+                raise NodesServiceError("not_found", f"节点 {node_id} 没有升级进度记录") from exc
+            raise
 
     # ── node ↔ group bindings ───────────────────────────────────────────────
 

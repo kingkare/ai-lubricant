@@ -26,8 +26,13 @@ from typing import Any, Optional
 import certifi
 import requests
 
+from .errors import AnisetteError
+
 _GS_LOOKUP = "https://gsa.apple.com/grandslam/GsService2/lookup"
-_CLIENT_INFO = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+# 身份必须是 Windows（见 gsa.CLIENT_INFO_WINDOWS 注释）：Apple 自 2026-10-12 拒
+# Mac+Xcode 身份（-80045）。provisioning 打的 mid 端点也是 Apple 的，与登录保持
+# 同一 Windows 身份。
+from .gsa import CLIENT_INFO_WINDOWS as _CLIENT_INFO
 _UA = "akd/1.0 CFNetwork/808.1.4"
 _TIMEOUT = 30
 
@@ -217,7 +222,15 @@ def provision(state: dict, anisette_server: str) -> dict:
 
 
 def get_headers(anisette_server: str) -> dict:
-    """v3: 取完整 anisette 头（先用本地缓存的 adi_pb，没有则先 provision）。"""
+    """v3: 取完整 anisette 头（先用本地缓存的 adi_pb，没有则先 provision）。
+
+    get_headers 是**每次** Apple 请求（登录、物化、续签）都要过的热路径，公共
+    anisette 服务器（ani.sidestore.io 等）偶发 502/503/超时是常态。单发即抛会让
+    一次「初始化 Runner」直接失败——用户看到的就是那句 502 Bad Gateway。这里做
+    短重试（3 次、退避），瞬断自愈；持续性故障（4xx）不重试，直接抛。
+    """
+    import time
+
     if not anisette_server.startswith("http"):
         anisette_server = "https://" + anisette_server
     state = _load_state()
@@ -225,18 +238,44 @@ def get_headers(anisette_server: str) -> dict:
         state = provision(state, anisette_server)
     ident_b64 = base64.b64encode(state["keychain_identifier"]).decode()
     adi_b64 = base64.b64encode(state["adi_pb"]).decode()
-    r = _direct_session().post(anisette_server.rstrip("/") + "/v3/get_headers",
-                      headers={"Content-Type": "application/json"},
-                      data=json.dumps({"identifier": ident_b64, "adi_pb": adi_b64}),
-                      timeout=_TIMEOUT, verify=_ca_bundle())
-    r.raise_for_status()
-    data = r.json()
-    if "X-Apple-I-MD" not in data:
-        raise RuntimeError("v3 get_headers 返回无效: %s" % str(data)[:200])
-    out = {k: str(v) for k, v in data.items()}
-    # X-Mme-Device-Id 和 X-Apple-I-MD-LU 必须由本地 keychain_identifier 派生
-    # （isideload AnisetteData 用的就是 state.get_device_id() / get_md_lu()，不取 server
-    # 的值）。setdefault 在 server 也返回这俩时会用错值，导致 Apple -80009 MID is invalid。
-    out["X-Apple-I-MD-LU"] = _md_lu(state["keychain_identifier"]).hex()
-    out["X-Mme-Device-Id"] = _device_id(state["keychain_identifier"])
-    return out
+    url = anisette_server.rstrip("/") + "/v3/get_headers"
+
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            r = _direct_session().post(url,
+                              headers={"Content-Type": "application/json"},
+                              data=json.dumps({"identifier": ident_b64, "adi_pb": adi_b64}),
+                              timeout=_TIMEOUT, verify=_ca_bundle())
+            # 5xx/429 是服务端瞬断（可重试）；4xx 是请求本身有问题（重试无意义）。
+            if r.status_code >= 500 or r.status_code == 429:
+                raise RuntimeError("anisette get_headers HTTP %d" % r.status_code)
+            r.raise_for_status()
+            data = r.json()
+            if "X-Apple-I-MD" not in data:
+                raise RuntimeError("v3 get_headers 返回无效: %s" % str(data)[:200])
+            out = {k: str(v) for k, v in data.items()}
+            # X-Mme-Device-Id 和 X-Apple-I-MD-LU 必须由本地 keychain_identifier 派生
+            # （isideload AnisetteData 用的就是 state.get_device_id() / get_md_lu()，不取 server
+            # 的值）。setdefault 在 server 也返回这俩时会用错值，导致 Apple -80009 MID is invalid。
+            out["X-Apple-I-MD-LU"] = _md_lu(state["keychain_identifier"]).hex()
+            out["X-Mme-Device-Id"] = _device_id(state["keychain_identifier"])
+            return out
+        except requests.HTTPError as exc:
+            # 4xx（非 429）是请求本身的问题，重试无意义——直接抛。
+            status = getattr(getattr(exc, "response", None), "status_code", 0)
+            if 400 <= status < 500 and status != 429:
+                raise AnisetteError(
+                    "anisette 服务器拒绝请求（HTTP %d）：%s" % (status, exc)
+                ) from exc
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+        except Exception as exc:  # noqa: BLE001 — 网络/5xx 统一重试
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    raise AnisetteError(
+        "anisette 服务器取头失败（重试 3 次）：%s。可稍后重试，或换一个 anisette "
+        "服务器（登录弹框里可改，如 ani.sidestore.io 的备用源）。" % last_exc
+    )

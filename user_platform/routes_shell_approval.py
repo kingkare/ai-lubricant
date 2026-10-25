@@ -86,6 +86,7 @@ async def get_catalog(_: User = Depends(get_current_user)) -> dict:
 
 @router.get("")
 async def list_my_policy(user: User = Depends(get_current_user)) -> dict:
+    """列当前用户已加入免审的命令项。"""
     rows = await shell_approval_service.list_user_policy(str(user.id))
     return {"policies": rows}
 
@@ -96,6 +97,11 @@ async def put_my_policy(
     body: PutPolicyReq,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """加入/更新一条免审命令项（body 带 shell 与可选备注）。
+
+    命令经 ``_validate_command_key`` 归一为单一安全段——含连接符、重定向、
+    命令替换或脚本块的结构一律 400，永不进入免审。shell 非法 422、备注过长 422。
+    """
     shell = _normalize_shell(body.shell)
     note = (body.note or "").strip() or None
     if len(body.note or "") > _MAX_NOTE_LEN:
@@ -112,6 +118,7 @@ async def delete_my_policy(
     shell: str,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """移除一条免审命令项（shell 经查询参数指定）。命令键为空 422。"""
     flavor = _normalize_shell(shell)
     key = (command_key or "").strip().lower()
     if not key:
@@ -122,5 +129,6 @@ async def delete_my_policy(
 
 @router.delete("")
 async def clear_my_policy(user: User = Depends(get_current_user)) -> dict:
+    """清空当前用户的全部免审命令项，返回删除条数。"""
     count = await shell_approval_service.clear_policy(str(user.id))
     return {"deleted": count}

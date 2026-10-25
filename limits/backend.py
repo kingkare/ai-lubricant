@@ -536,6 +536,7 @@ class RedisLimitBackend:
         model_tpm_ttl: int = 60,
         allow_token_overflow: bool = True,
         window_ids: dict[str, str] | None = None,
+        skip_freeze_checks: bool = False,
     ) -> dict | None:
         """原子预占账号并发 + 请求数窗口 + token 窗口（可精确回滚的 per-reservation ledger）。
 
@@ -568,17 +569,21 @@ class RedisLimitBackend:
         account_model_freeze_redis_key = cls._key(account_model_freeze_key)
         token_amount = max(0, int(token_amount or 0))
         script = """
-        local freeze_ttl = redis.call('TTL', KEYS[4])
-        if freeze_ttl > 0 then
-            return {0, 'frozen', freeze_ttl, 0, 0}
-        end
-        local model_freeze_ttl = redis.call('TTL', KEYS[5])
-        if model_freeze_ttl > 0 then
-            return {0, 'model_frozen', model_freeze_ttl, 0, 0}
-        end
-        local account_model_freeze_ttl = redis.call('TTL', KEYS[6])
-        if account_model_freeze_ttl > 0 then
-            return {0, 'account_model_frozen', account_model_freeze_ttl, 0, 0}
+        -- 测试/探测预占（ARGV[32]=1）：不检查三个冻结键——测试的目的正是打到冻结账号；
+        -- 并发/计量照常原子占用。正常请求仍先查冻结（早于任何写入）。
+        if tonumber(ARGV[32]) ~= 1 then
+            local freeze_ttl = redis.call('TTL', KEYS[4])
+            if freeze_ttl > 0 then
+                return {0, 'frozen', freeze_ttl, 0, 0}
+            end
+            local model_freeze_ttl = redis.call('TTL', KEYS[5])
+            if model_freeze_ttl > 0 then
+                return {0, 'model_frozen', model_freeze_ttl, 0, 0}
+            end
+            local account_model_freeze_ttl = redis.call('TTL', KEYS[6])
+            if account_model_freeze_ttl > 0 then
+                return {0, 'account_model_frozen', account_model_freeze_ttl, 0, 0}
+            end
         end
 
         local concurrent_limit = tonumber(ARGV[2])
@@ -714,13 +719,17 @@ class RedisLimitBackend:
 
         -- 可恢复索引：只在预占真正写入后登记；meta 保存精确 rollback 所需上下文。
         -- TTL 覆盖最长（日）窗口 + grace，正常 reconcile/rollback 会主动摘除。
-        redis.call('SADD', KEYS[12], rid)
-        redis.call('HSET', KEYS[13],
-            'account_key', ARGV[27],
-            'model_id', ARGV[28],
-            'window_ids', ARGV[29],
-            'boot_id', ARGV[30])
-        redis.call('EXPIRE', KEYS[13], tonumber(ARGV[31]))
+        -- test_probe（测试/探测）只占并发，无账本可恢复，不登记（管理端活跃预占
+        -- 索引只反映真实流量）。
+        if tonumber(ARGV[32]) == 0 then
+            redis.call('SADD', KEYS[12], rid)
+            redis.call('HSET', KEYS[13],
+                'account_key', ARGV[27],
+                'model_id', ARGV[28],
+                'window_ids', ARGV[29],
+                'boot_id', ARGV[30])
+            redis.call('EXPIRE', KEYS[13], tonumber(ARGV[31]))
+        end
 
         local lease_expires_at = 0
         if concurrent_limit > 0 then
@@ -781,6 +790,7 @@ class RedisLimitBackend:
                     json.dumps(wids, separators=(",", ":")),
                     lease_id.split(":", 2)[1] if lease_id.startswith("lease:") and lease_id.count(":") >= 2 else "",
                     max(rpd_ttl, tpd_ttl, 86400) + cls._RESERVATION_GRACE,
+                    1 if skip_freeze_checks else 0,
                 ],
             )
             reason = str(result[1] or "")
@@ -1286,24 +1296,31 @@ class RedisLimitBackend:
             return None
 
     @classmethod
-    async def set_account_cooldown(cls, provider: str, username: str, seconds: int | None, reason: str = "") -> None:
-        """记账号冻结到 Redis 兜底；seconds>0 临时带 TTL，seconds=None 永久无 TTL。"""
+    async def set_account_cooldown(cls, provider: str, username: str, seconds: int | None, reason: str = "", category: str = "") -> None:
+        """记账号冻结到 Redis 兜底；seconds>0 临时带 TTL，seconds=None 永久无 TTL。
+
+        category（凭证失效 credential / 额度耗尽 quota / 临时 temporary / 普通 ""）随
+        冻结落 Redis JSON value，供跨重启回灌与跨实例广播还原账号状态类别；
+        value 无 category 时保持旧纯字符串格式（向后兼容）。
+        """
         redis = cls.redis()
         if redis is None:
             return
         if seconds is not None and seconds <= 0:
             return
+        value = json.dumps({"reason": reason or "", "category": category or ""},
+                           ensure_ascii=False) if category else (reason or "")
         try:
             if seconds is None:
                 # 永久冻结：无 TTL key，value 存原因（空串也合法）。
                 await redis.set(
                     f"limit:cooldown:{provider}:{username}",
-                    reason or "",
+                    value,
                 )
             else:
                 await redis.set(
                     f"limit:cooldown:{provider}:{username}",
-                    reason or "",
+                    value,
                     ex=seconds,
                 )
             await cls._index_mark(provider, username, None)
@@ -1342,7 +1359,13 @@ class RedisLimitBackend:
                         reason = ""
                     except (TypeError, ValueError):
                         pass
-                return {"until": None, "remaining": None, "reason": reason, "permanent": True}
+                category = ""
+                if value.strip().startswith("{"):
+                    try:
+                        category = str(json.loads(value).get("category") or "")
+                    except Exception:
+                        category = ""
+                return {"until": None, "remaining": None, "reason": reason, "category": category, "permanent": True}
             remaining = int(ttl) if isinstance(ttl, (int, float)) and ttl > 0 else 0
             if remaining <= 0:
                 return None
@@ -1363,7 +1386,13 @@ class RedisLimitBackend:
                     reason = ""
                 except (TypeError, ValueError):
                     pass
-            return {"until": time.time() + remaining, "remaining": remaining, "reason": reason, "permanent": False}
+            category = ""
+            if value.strip().startswith("{"):
+                try:
+                    category = str(json.loads(value).get("category") or "")
+                except Exception:
+                    category = ""
+            return {"until": time.time() + remaining, "remaining": remaining, "reason": reason, "category": category, "permanent": False}
         except Exception:
             return None
 

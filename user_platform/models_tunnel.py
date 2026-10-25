@@ -91,6 +91,13 @@ class TunnelBinding(Model):
     proxy_name = fields.CharField(max_length=128, null=True)
     remote_port = fields.IntField(null=True)
 
+    # chmlfrp only: the ChmlFrp *relay node* (服务节点) the tunnel is created on,
+    # picked from the panel's node list at binding time. The platform creates
+    # the panel tunnel on this node and pulls the frpc ini from it. Null for
+    # every other kind. (The binding's ``node_id`` is still the execution node
+    # the frpc client runs on — a different axis from the relay node.)
+    panel_node = fields.CharField(max_length=128, null=True)
+
     # Per-binding provider resources (managed cloudflared: dns_record_id).
     # The shared tunnel_id belongs to TunnelRuntime.provider_ref.
     provider_ref = fields.JSONField(default=dict)

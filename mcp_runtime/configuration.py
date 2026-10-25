@@ -94,6 +94,26 @@ async def build_builtin_snapshot(service: dict) -> BuiltinConfigSnapshot:
     return BuiltinConfigSnapshot(service_id, service["name"], bool(service.get("enabled", True)), env, auth_enabled, set(auth["allowed_tokens"]), resources)
 
 
+def notify_cdp_agents_changed() -> None:
+    """通知所有已连接的浏览器扩展：可操作 agent 列表可能已变，重拉一次。
+
+    网页对话面板是拉取式的（只在打开面板 / 点「切换 Agent」时拉列表），管理端或
+    用户端改了 cdp_client 的 agent_ids 后不推的话面板一直显示旧列表。这里不判定
+    具体哪个客户端变了（调用方不带变更 id，且客户端数量=浏览器数，很小），一律
+    通知；各端收到后自拉一次列表，多拉一次的代价远小于 diff 维护成本。
+
+    best-effort：driver 未起 / 没有活连接时静默跳过，绝不影响配置保存本身。
+    """
+    try:
+        from mcp_builtin.cdp_bridge.server import get_driver
+
+        driver = get_driver()
+        if driver is not None:
+            driver.notify_agents_changed()
+    except Exception:
+        pass
+
+
 async def resync_builtin_service(name: str) -> bool:
     """把某内置服务（cdp-bridge / mail）的最新配置重下发给运行中的 driver。
 
@@ -124,6 +144,10 @@ async def resync_builtin_service(name: str) -> bool:
             auth_enabled=snapshot.auth_enabled,
             allowed_tokens=snapshot.allowed_tokens,
         )
+        # CDP 客户端配置变了（可操作 agent 列表 / token / 启停）→ 通知已连接的浏览器
+        # 重拉列表。网页对话面板是拉取式的，不推的话面板会一直显示旧 agent 列表。
+        if name == "cdp-bridge":
+            notify_cdp_agents_changed()
         return True
     except Exception:
         return False

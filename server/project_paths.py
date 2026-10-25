@@ -86,6 +86,19 @@ def frontend_dist_dir() -> Path:
     return REPO_ROOT / "user-frontend" / "dist"
 
 
+def version_file() -> Path:
+    """服务端版本文件 ``VERSION``（仓库根，publish 打升级包时写入 tag）。
+
+    **只存在于发布产物里，不在 master 工作区**——发布流程用纯 plumbing 把 tag
+    写进快照/升级包，不提交到 master。这样开发机没有该文件 → 版本回落 ``dev``
+    （诚实：它确实不是发布版），而部署机解压升级包后就有 → 显示真实版本号。
+
+    版本号靠文件而不是环境变量：env 是「别人告诉进程的」，谁忘了传就撒谎
+    （曾出现生产显示 ``dev``）；文件是「产物自带的」，跟着代码走不会撒谎。
+    """
+    return REPO_ROOT / "VERSION"
+
+
 __all__ = [
     "REPO_ROOT",
     "SERVER_DIR",
@@ -100,4 +113,5 @@ __all__ = [
     "deleted_backups_dir",
     "model_metadata_json",
     "frontend_dist_dir",
+    "version_file",
 ]

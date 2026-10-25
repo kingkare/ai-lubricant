@@ -13,6 +13,15 @@ ENV PYTHONUNBUFFERED=1 \
 # 复制依赖文件
 COPY requirements.txt .
 
+# 系统依赖：git 是创空间（ModelScope Studio）节点部署链路必需的——那条链路要把
+# 生成的 Dockerfile/start.sh 推到用户的创空间仓库，平台没有「上传即部署」的 HTTP
+# API，官方推荐的就是 git push。另有一个已有调用点 ``server_upgrade.list_release_tags``
+# 会 ``git ls-remote``，此前在容器里因缺 git 而退化（该函数自己写了 FileNotFoundError
+# 分支）。python:3.11-slim 基于 Debian bookworm，默认源即可。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # 安装依赖（默认走清华镜像；海外构建可 --build-arg PIP_INDEX_URL=https://pypi.org/simple）
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 RUN --mount=type=cache,target=/root/.cache/pip \

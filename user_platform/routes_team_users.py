@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from .deps import client_meta as _client_meta, get_current_team_id, get_current_user
 from .models import TeamGroup, TeamGroupMember, TeamMember, User
 from .models_project import Project
-from .models_task import Task, TaskUsageStat
+from .models_task import Task
 from .session import USER_SESSION_COOKIE, session_store
 from .team_users_service import team_users_service
 
@@ -165,7 +165,11 @@ async def dashboard(
 
     projects = await Project.filter(user_id__in=user_ids) if user_ids else []
     tasks = await Task.filter(user_id__in=user_ids) if user_ids else []
-    usage_rows = await TaskUsageStat.filter(user_id__in=user_ids) if user_ids else []
+    # Per-task token accounting (mc_task_usage_stats) is retired storage — the
+    # gateway never wrote it, so the aggregate has always been empty and every
+    # token-derived metric below reads 0. Real usage now lives in request_logs;
+    # wiring the dashboard to it is a separate change, so keep the empty shape.
+    usage_rows: list[Any] = []
 
     project_total = len(projects)
     task_total = len(tasks)
@@ -308,6 +312,7 @@ async def list_users(
     role: str | None = Query(default=None),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """列出团队成员，可按 ``role`` 过滤。"""
     return await team_users_service.list_users(team_id, role=role)
 
 
@@ -316,6 +321,7 @@ async def users_status(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """返回当前用户在本团队的状态摘要。"""
     return await team_users_service.status(user, team_id)
 
 
@@ -324,6 +330,7 @@ async def users_logout(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """注销当前会话：删除该用户的会话 cookie 记录。"""
     cookie = request.cookies.get(USER_SESSION_COOKIE) or ""
     await session_store.delete(USER_SESSION_COOKIE, str(user.id), cookie)
     return {}
@@ -336,6 +343,7 @@ async def create_users_with_password(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """按邮箱批量创建带初始密码的用户，可指定分组，并记录创建审计。"""
     result = await team_users_service.create_users_with_password(
         team_id, body.emails, body.group_id
     )
@@ -354,6 +362,7 @@ async def delete_user(
     user: User = Depends(require_team_admin),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """删除团队成员（仅团队管理员），并记录 user.delete 审计。"""
     result = await team_users_service.delete_user(user_id)
     ip, ua = _client_meta(request)
     await team_users_service.record_audit(
@@ -370,6 +379,10 @@ async def change_password(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """当前用户修改自己的密码，并记录 user.change_password 审计。
+
+    密码强度不足（非 8-32 位）返回 400，当前密码不正确返回 403。
+    """
     try:
         result = await team_users_service.change_password(
             user, body.current_password, body.new_password
@@ -397,6 +410,7 @@ async def reset_password(
     user: User = Depends(require_team_admin),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """管理员重置指定用户的密码，并记录 user.reset_password 审计；用户不存在返回 404。"""
     try:
         result = await team_users_service.reset_password(user_id)
     except ValueError as exc:
@@ -427,6 +441,7 @@ async def create_user(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """创建单个团队用户，并记录 user.create 审计；邮箱格式不正确返回 400。"""
     try:
         result = await team_users_service.create_user(
             team_id, body.email, body.name, body.is_admin
@@ -449,6 +464,10 @@ async def set_user_admin(
     user: User = Depends(require_team_admin),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """设置成员的管理员身份（仅团队管理员），并记录 user.set_admin 审计。
+
+    受保护的首个管理员不可降权（返回 403），目标用户不存在返回 404。
+    """
     try:
         result = await team_users_service.set_admin(team_id, user_id, body.is_admin)
     except ValueError as exc:
@@ -473,6 +492,7 @@ async def update_user(
     user: User = Depends(require_team_admin),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """更新成员的名称或封禁状态（仅团队管理员），并记录 user.update 审计。"""
     try:
         result = await team_users_service.update_user(
             user_id, name=body.name, is_blocked=body.is_blocked
@@ -495,6 +515,7 @@ async def update_user(
 async def list_groups(
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """列出本团队的全部分组。"""
     return await team_users_service.list_groups(team_id)
 
 
@@ -530,6 +551,7 @@ async def rename_group(
     body: GroupReq,
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """重命名分组；分组不存在返回 404，名称为空返回 400。"""
     try:
         return await team_users_service.rename_group(team_id, group_id, body.name)
     except ValueError as exc:
@@ -546,6 +568,7 @@ async def delete_group(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """删除团队分组，并记录 group.delete 审计。"""
     result = await team_users_service.delete_group(team_id, group_id)
     ip, ua = _client_meta(request)
     await team_users_service.record_audit(
@@ -561,6 +584,7 @@ async def set_group_users(
     body: SetGroupUsersReq,
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """整体替换分组的成员集合（body.user_ids 即最终成员），分组不存在返回 404。"""
     try:
         return await team_users_service.set_group_users(team_id, group_id, body.user_ids)
     except ValueError as exc:
@@ -622,6 +646,7 @@ async def list_group_mcp_services(
     group_id: str,
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """列出分组已授权的内部 MCP 服务；分组不存在或不属于本团队返回 404。"""
     from mcp_plugin_store import list_services_for_group
 
     if await team_users_service._owned_group(team_id, group_id) is None:
@@ -637,6 +662,7 @@ async def set_group_mcp_services(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """设置分组可用的内部 MCP 服务集合（整体替换），并记录 group.set_mcp_services 审计。"""
     from mcp_plugin_store import set_group_services
 
     if await team_users_service._owned_group(team_id, group_id) is None:
@@ -656,6 +682,7 @@ async def set_group_mcp_services(
 
 @router.get("/skills")
 async def list_team_skills(team_id: str = Depends(get_current_team_id)) -> dict:
+    """列出本团队可用的技能。"""
     return {"skills": await team_users_service.list_team_skills(team_id)}
 
 
@@ -664,6 +691,7 @@ async def list_group_skills(
     group_id: str,
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """列出分组已授权的技能；分组不存在返回 404。"""
     try:
         return {"skills": await team_users_service.list_group_skills(team_id, group_id)}
     except ValueError as exc:
@@ -678,6 +706,7 @@ async def set_group_skills(
     user: User = Depends(get_current_user),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """设置分组可用的技能集合（整体替换），并记录 group.set_skills 审计；分组不存在返回 404。"""
     try:
         result = await team_users_service.set_group_skills(team_id, group_id, body.skill_ids)
     except ValueError as exc:
@@ -699,6 +728,7 @@ async def list_audits(
     user_id: str | None = Query(default=None),
     team_id: str = Depends(get_current_team_id),
 ) -> dict:
+    """分页列出团队审计日志，可按 operation / user_id 过滤（游标分页）。"""
     return await team_users_service.list_audits(
         team_id,
         cursor=cursor,

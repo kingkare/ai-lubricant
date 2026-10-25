@@ -45,3 +45,50 @@
 ## Plans
 
 - [`../plans/2026-08-30-credential-vault.md`](../plans/2026-08-30-credential-vault.md)
+
+## 已落地（插件侧密码管理器，2026-09-19）
+
+上面描述的密封金库（`{{password:uuid}}`、服务端不可解）**仍是独立未实施计划**。实际先落地的是
+另一条**取舍不同**的路线：**服务端可解密的密码管理器**——用户在插件里登录成功后，插件询问是否
+保存，密码 AES-256-GCM 列加密后存进服务端 `browser_passwords` 表并关联登录用户，配套候选下拉
+自动填充、popup 管理列表与随机密码生成。
+
+与本文档原则的**明确偏差**（需要知情）：
+
+- 本文档要求「明文不出浏览器、服务端不可解」；密码管理器按用户明确选择做**服务端可解**存储
+  （密钥 `BROWSER_PASSWORD_KEY`），因为要支持跨设备在任意浏览器会话中取回填充。
+- 因此本功能**不承诺**对抗服务端拖库：拿到密钥 + 库即得明文（列加密挡的是「只拖表」与备份泄漏）。
+- 密钥轮换 = 已存密码全部无法解密，`pwd_get` 会回「记录无法解密（服务端密钥已变更）」，**绝不静默轮换**。
+
+**已强制落地的两条配套**（与本文档原则一致，本功能因此没有扩大 AI 侧的暴露面）：
+
+- `mcp_builtin/cdp_bridge/simphtml.py`：新增 `isSecretField()`，密码类字段的 value **不再进入
+  `browser_scan` 输出**，只标 `data-secret="true"`；token 摘要链同步加 `secret` 标记。
+- `mcp_builtin/cdp_bridge/sop/tmwebdriver_sop.md`：删除「autofill 获取与登录 / 一键释放与登录」，
+  改写为「登录与密码（插件密码管理器）」——禁止 agent 读取密码值、禁止把密码写进脚本/参数/日志、
+  禁止代替用户输入密码，需要登录时用 `ask_user` 请用户自行在浏览器完成。
+  （2026-10-04 追加：该文件经查明是孤儿文档——无任何代码把它喂给 AI，管理端 SOP 编辑 tab 亦已一并下线，
+  整个 `mcp_builtin/cdp_bridge/sop/` 目录删除；AI 侧浏览器 SOP 的唯一事实源是 `agent/sop/browser_sop.md`。
+  强制防护在代码层：`simphtml.py` `isSecretField()` 令密码字段 value 永不出 `browser_scan`，只标 `data-secret="true"`。）
+
+其余原则（AI 不是消费方、审计只记 ID 不记内容）在密码管理器里同样成立：WS 帧不落日志、审计
+`security_events` 的 detail 只有 owner/entry_id/domain，**不含账号与密码**。
+
+### 管理页面（2026-09-19 追加）
+
+`/devices?kind=cdp` 顶部、「添加浏览器」旁边新增「密码管理」按钮，打开后是**当前用户**的密码列表。
+
+**密码是用户级资源**（`browser_passwords.owner_user_id` = C 端用户 id），不挂在某个 CDP 客户端上——
+同一个用户的所有浏览器客户端共享同一份密码库，所以管理弹框是全局的，没有「每个客户端一份」的语义。
+
+这条入口刻意做了三重收敛，避免把「服务端可解」放大成「谁都能看」：
+
+- **归属即当前用户**：路由无 `resource_id` 参数，owner 恒为 `str(user.id)`，不存在跨用户读取的路径。
+- **明文查看需二次鉴权**：列表只回 meta（`id/domain/username/url/updatedAt`，**永不含密文**）；
+  要看明文必须再次输入当前账号密码，`verify_password` 通过才解密，且明文 15 秒后自动收回。
+- **每次查看写审计**：`security_events` 记 `browser_password_viewed`（`severity="warning"`，
+  `tag="browser_password_admin"`），detail 同样只有 owner/entry_id/domain。
+
+明文消费面因此没有变成「任意 HTTP 调用即可拿密码」：**没有二次鉴权就拿不到明文**，且每次取用都留痕。
+风险仍在（服务端可解 + 网页端可查看，等于多了一条明文出口），这是用户明确选择「服务端可解存储 +
+网页管理」时接受的取舍。

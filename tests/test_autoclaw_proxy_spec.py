@@ -418,6 +418,44 @@ def test_claim_checkin_tasks_accumulates_rewards(channel_cls):
     assert result["newbie_local_lobster"] == 500
 
 
+def test_checkin_fields_write_badge_and_status(channel_cls):
+    """签到字段：last_checkin 徽标 + last_checkin_status 当日幂等标记（与 autoclaw.py 同款）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="t")
+
+    async def fake_claim(_p):
+        return {"daily_signin": 400, "daily_inspiration_center": "already"}
+
+    hook = channel_cls._spec_hooks["refresh_auth"]
+    g = hook.__globals__
+    saved = g["_claim_checkin_tasks"]
+    g["_claim_checkin_tasks"] = fake_claim
+    try:
+        fields = _run(g["_checkin_fields"](p))
+        done = g["_today_checkin_done"](p)
+    finally:
+        g["_claim_checkin_tasks"] = saved
+
+    assert fields["last_checkin"] == "已签到 +400"      # 只累计 int 分，"already" 不计
+    assert fields["last_checkin_status"].startswith(mod._today_key() + "|ok|+400")
+    assert done is True
+
+
+def test_today_checkin_done_rejects_stale_and_failed(channel_cls):
+    """当日幂等判断：昨天的记录 / 今天的失败记录都不算已签。"""
+    mod = _module()
+    g = channel_cls._spec_hooks["refresh_auth"].__globals__
+    today = mod._today_key()
+    p = _make_provider(channel_cls, password="t")
+
+    p.last_checkin_status = "2020-01-01|ok|+400"
+    assert g["_today_checkin_done"](p) is False
+    p.last_checkin_status = f"{today}|fail"
+    assert g["_today_checkin_done"](p) is False
+    p.last_checkin_status = f"{today}|ok|+400"
+    assert g["_today_checkin_done"](p) is True
+
+
 # ==================== 模型列表 ====================
 
 def test_fetch_models_returns_static_table(channel_cls):
@@ -501,7 +539,11 @@ def test_begin_device_flow_global_is_credential_paste(channel_cls):
     assert out["poll_params"]["login"] == "credential"
     assert out["auth_url"].startswith("https://autoclaw.z.ai")
     assert "localStorage" in out["message"]
-    assert "prompt(" in out["message"]       # 用 prompt 而非 Chrome 专有 copy()
+    # 不用 prompt（浏览器勾过「阻止此页面创建更多对话框」后会静默失败只返回 undefined），
+    # 改为浮层 textarea + execCommand('copy') + console.log
+    assert "prompt(" not in out["message"]
+    assert "createElement('textarea')" in out["message"]
+    assert "execCommand('copy')" in out["message"]
 
 
 def test_poll_device_flow_is_always_pending(channel_cls):
@@ -527,6 +569,37 @@ def test_loopback_credential_paste_garbage_errors(channel_cls):
     out = _run(channel_cls.handle_loopback_callback(
         p, {}, {"login": "credential"}, "这不是凭证"))
     assert out["status"] == "error"
+
+
+def test_loopback_credential_paste_takes_region_from_session(channel_cls):
+    """凭证块（尤其 localStorage dump）不含 region → 用会话发起时选的区域补位。
+
+    缺 region 会落到 schema 默认 cn，把海外 token 送到大陆域名 → 稳定 410000。
+    """
+    p = _make_provider(channel_cls, password="", region="cn")
+    pasted = json.dumps({"accessToken": "at-gl", "refreshToken": "rt-gl"})
+    out = _run(channel_cls.handle_loopback_callback(
+        p, {}, {"login": "credential", "region": "global"}, pasted))
+    assert out["status"] == "authorized"
+    assert out["account_data"]["region"] == "global"
+
+
+def test_loopback_credential_prefers_fresh_auth_token(channel_cls):
+    """authToken（网页每次 refresh 都刷新）必须压过 loginInfo.access_token（登录快照）。
+
+    用陈旧 token 建号会稳定 401 / code=410000（"This feature is available after logging in"）。
+    """
+    mod = _module()
+    p = _make_provider(channel_cls, password="", region="global")
+    pasted = json.dumps({
+        "autoclaw.web.loginInfo": json.dumps({"access_token": "at-STALE"}),
+        "autoclaw.web.authToken": "at-FRESH",
+        "autoclaw.web.refreshToken": "rt-1",
+    })
+    out = _run(channel_cls.handle_loopback_callback(
+        p, {}, {"login": "credential", "region": "global"}, pasted))
+    assert out["status"] == "authorized"
+    assert out["account_data"]["password"] == "at-FRESH"
 
 
 def test_loopback_sms_bare_code(channel_cls):

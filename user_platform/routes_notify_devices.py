@@ -51,6 +51,7 @@ class ReplaceRulesReq(BaseModel):
 
 @router.get("")
 async def list_devices(user: User = Depends(get_current_user)) -> dict:
+    """获取当前用户名下的移动推送设备列表（令牌脱敏）。"""
     return _ok(await notify_service.list_devices(str(user.id)))
 
 
@@ -58,6 +59,11 @@ async def list_devices(user: User = Depends(get_current_user)) -> dict:
 async def register_device(
     body: RegisterDeviceReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """注册（或就地更新）一台移动推送设备。
+
+    ``device_key`` 为安装标识，重复注册只更新令牌等字段并重新启用；令牌原属其他账号
+    时改绑到当前账号并禁用旧设备。``device_key``/``push_token`` 缺失返回 400。
+    """
     try:
         result = await notify_service.register_device(
             str(user.id), body.model_dump(exclude_none=True)
@@ -76,6 +82,10 @@ async def register_device(
 async def heartbeat_device(
     device_id: str, body: HeartbeatReq, user: User = Depends(get_current_user)
 ) -> dict:
+    """设备心跳：上报应用版本并刷新令牌。
+
+    设备不存在返回 404。
+    """
     result = await notify_service.heartbeat_device(
         str(user.id), device_id, body.model_dump(exclude_none=True)
     )
@@ -88,6 +98,10 @@ async def heartbeat_device(
 async def update_device(
     device_id: str, body: DevicePatchReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """更新设备名称或启用状态。
+
+    设备不存在返回 404；写审计日志。
+    """
     result = await notify_service.update_device(
         str(user.id), device_id, body.model_dump(exclude_none=True)
     )
@@ -105,6 +119,10 @@ async def update_device(
 async def delete_device(
     device_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除一台移动推送设备（连同其推送令牌）。
+
+    设备不存在返回 404；写审计日志。
+    """
     ok = await notify_service.delete_device(str(user.id), device_id)
     if not ok:
         raise HTTPException(status_code=404, detail="设备不存在")
@@ -150,6 +168,7 @@ async def test_device(
 
 @router.get("/rules")
 async def list_push_rules(user: User = Depends(get_current_user)) -> dict:
+    """获取当前用户的通知规则（应用内开关 + 推送设备绑定）。"""
     return _ok(await notify_service.list_push_rules(str(user.id)))
 
 
@@ -157,6 +176,11 @@ async def list_push_rules(user: User = Depends(get_current_user)) -> dict:
 async def replace_push_rules(
     body: ReplaceRulesReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """整体替换当前用户的通知规则。
+
+    ``app`` 为事件类型的应用内开关，``bindings`` 为事件类型 → 推送设备集合；
+    未提交的事件按空集处理。事件类型无效返回 400；写审计日志。
+    """
     try:
         result = await notify_service.replace_push_rules(
             str(user.id), body.model_dump()

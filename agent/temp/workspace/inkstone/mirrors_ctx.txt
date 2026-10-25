@@ -1,0 +1,32 @@
+
+===== mirrors limit =====
+
+--- @ 250564 ---
+[],total:0,max_count:0}}},xa=async()=>{try{const e=await S.http.get("/api/ml/v1/mirrors/limit");return e&&e.code===0&&e.data?typeof e.data=="number"?e.data:e.data.limit||0:10}catch(e){return console.warn("获取镜像个数限制失败，使用默认值:",e),10}},qf=async e=>{try{cons
+
+===== mirrors detail =====
+
+===== mirrors all ${...} =====
+
+--- @ 3011 ---
+fy(s)),d=`${e}/api/v1/bury/collect`,c=`/${a}/${r}/${i}?buryId=${n}&operatorUid=${o}&operatedObjInfo=${l}`,u=d+c,p=new Image;p.src=u},dt={collectClientInfo:"collectClientInfo",collectErrorInfo:"collectErrorInfo",collectActionLogInfo:"co
+
+===== mirrors occurrences =====
+
+--- @ 250072 ---
+ogs}),_a=async e=>{try{const t=await S.http.get("/api/ml/v1/mirrors",{params:{page:e.page,size:e.size,keyword:e.keyword||void 0,building_status:e.building_status||void 0,category:e.catego
+
+--- @ 250564 ---
+:0}}},xa=async()=>{try{const e=await S.http.get("/api/ml/v1/mirrors/limit");return e&&e.code===0&&e.data?typeof e.data=="number"?e.data:e.data.limit||0:10}catch(e){return console.warn("获取
+
+--- @ 250770 ---
+,10}},qf=async e=>{try{const t=await S.http.get(`/api/ml/v1/mirrors/${e}`);if(t&&t.code===0&&t.data)return t.data}catch(t){console.warn("获取镜像详情失败，尝试从模拟数据查找:",t)}return null},Wf=async e=>{
+
+--- @ 250940 ---
+ll},Wf=async e=>{try{return await S.http.delete(`/api/ml/v1/mirrors/${e}`)}catch(t){return console.error("删除镜像失败:",t),{code:-1,msg:"删除失败",data:null}}},$f=async e=>{const t={category:e.use
+
+--- @ 251680 ---
+ockerfile_content);try{return await S.http.post("/api/ml/v1/mirrors",{data:t})}catch(n){return console.error("创建镜像失败:",n),{code:-1,msg:"创建失败",data:{id:"",name:"",status:"failed"}}}},Gf=as
+
+--- @ 252453 ---
+dockerfile_content);try{return await S.http.put(`/api/ml/v1/mirrors/${e}`,{data:n})}catch(a){return console.error("编辑镜像失败:",a),{code:-1,msg:"编辑失败",data:null}}},O="/api/ml/v1/inference",Ea

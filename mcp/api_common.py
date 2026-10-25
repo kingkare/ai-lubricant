@@ -22,6 +22,9 @@ from fastapi import HTTPException
 # ── Manifest 加载：内置 MCP 从代码目录读 manifest.json；自定义服务套默认 manifest ──
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+# 内置服务的 manifest 目录。新服务名带 '-' 时必须在这里登记，否则管理页拿到
+# 默认 manifest（schema 1）而不是自带的那份。mcp_runtime/configuration.py 用
+# name.replace('-','_') 拼路径，是本表的正确来源——这里保留硬编码是历史形态。
 _BUILTIN_MANIFEST_DIRS = {
     "cdp-bridge": _REPO_ROOT / "mcp_builtin" / "cdp_bridge",
     "mail": _REPO_ROOT / "mcp_builtin" / "mail",

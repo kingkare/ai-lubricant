@@ -14,6 +14,7 @@ tool_result/done —— question 事件被静默丢弃，于是：
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -75,7 +76,8 @@ def test_question_event_merges_text_and_claims_media(media_env, monkeypatch):
     import agent.agent_loop as loop_mod
 
     async def _fake_runner(llm, *, system_prompt, user_input, handler, tools_schema,
-                           max_turns, on_event=None, on_tool_batch=None, initial_messages=None):
+                           max_turns, on_event=None, on_tool_batch=None, initial_messages=None,
+                           auto_compact=True):
         await on_event({"type": "content", "text": "先看页面"})
         await on_event({"type": "tool_call", "id": "c1", "name": "ask_user", "args": {}, "index": 0})
         await on_event({
@@ -109,6 +111,10 @@ def test_question_event_merges_text_and_claims_media(media_env, monkeypatch):
 
         async def _ensure_resources(self):
             class _Tools:
+                # 生产 ToolRegistry  expose 的接口：审批批次构造要用 context.security
+                # 建沙箱边界，set_*_approval 把协调器挂回去。测试只走构造，不触发审批。
+                context = SimpleNamespace(security=object())
+
                 def get_schema(self):
                     return []
 
@@ -116,6 +122,9 @@ def test_question_event_merges_text_and_claims_media(media_env, monkeypatch):
                     pass
 
                 def set_code_run_approval(self, _batch):
+                    pass
+
+                def set_file_write_approval(self, _batch):
                     pass
 
             return _Tools(), ""
@@ -142,33 +151,40 @@ def test_question_event_merges_text_and_claims_media(media_env, monkeypatch):
     monkeypatch.setattr(store_mod, "get_messages", _get_messages)
 
     # 4) 跑一轮：直接调 client_send_message 太重（要 FastAPI/鉴权全链路），
-    #    改为构造 _run_cdp_conversation_turn + 手动消费 SSE。
+    #    改为构造 _run_cdp_conversation_turn，从 conversation_hub 取回事件序列。
+    #    （发送与订阅分离后：run 返回 JSON、事件走 hub 扇出，测试与真实订阅端同形。）
     loop = asyncio.get_event_loop()
 
     async def _drive():
-        resp = await cdp_chat_service._run_cdp_conversation_turn(
-            conv={"id": "conv-1", "agent_id": 5, "system_prompt": ""},
-            conv_id="conv-1",
-            assistant_msg_id=101,
-            agent={"system_prompt": ""},
-            scene=None,
-            agent_id=5,
-            user_input="hi",
-            mode="interact",
-            goal_config=None,
-            max_turns=2,
-            effective_effort=None,
-            conv_model="",
-            client_id="7",
-        )
-        events = []
-        async for chunk in resp.body_iterator:
-            text = chunk if isinstance(chunk, str) else chunk.decode("utf-8")
-            for line in text.splitlines():
-                if line.startswith("data: "):
-                    import json as _json
-                    events.append(_json.loads(line[6:]))
-        return events
+        from agent import conversation_hub
+
+        queue = conversation_hub.subscribe("conv-1")
+        try:
+            await cdp_chat_service._run_cdp_conversation_turn(
+                conv={"id": "conv-1", "agent_id": 5, "system_prompt": ""},
+                conv_id="conv-1",
+                assistant_msg_id=101,
+                agent={"system_prompt": ""},
+                scene=None,
+                agent_id=5,
+                user_input="hi",
+                mode="interact",
+                goal_config=None,
+                ralph_config=None,
+                max_turns=2,
+                effective_effort=None,
+                conv_model="",
+                client_id="7",
+            )
+            events = []
+            while True:
+                event = await asyncio.wait_for(queue.get(), timeout=10)
+                events.append(event)
+                if event.get("type") == "end":
+                    break
+            return events
+        finally:
+            conversation_hub.unsubscribe("conv-1", queue)
 
     events = loop.run_until_complete(_drive())
 

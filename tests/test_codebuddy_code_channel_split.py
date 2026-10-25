@@ -1,17 +1,22 @@
-"""CodeBuddy 代码渠道国内/国际版拆分契约（specs/codebuddy_code_channel_cn.py / _intl.py）。
+"""CodeBuddy 统一版代码渠道（specs/codebuddy_code_channel.py）· cn 档案深度契约。
 
-拆分自原 CN/Intl 双路由单文件 spec（2026-09-12）。本测试锁住拆分后的行为契约：
+2026-10-20 合并定版：本文件原锁「cn/_intl 两份拆分 spec」的拆分契约；拆分版已删除
+（备份 deleted_backups/codebuddy-specs-consolidated-20261020/），现改锁统一版 cn 档案
+（统一版默认 DEPLOY_REGION="cn"，直接加载即 cn 形态）。原 intl variant 测的是已废弃的
+旧非-v2 `_intl.py` 血统（字段/展示名/「只改一词」脱敏均与统一版不同），随合并删除；
+统一版 intl 档案的覆盖在 test_codebuddy_intl_v2_alignment.py / _billing.py（拧开关加载）。
 
-1. 两份 spec 都能被 code_loader 加载（普通类 + 可识别钩子）；
-2. 接入域名**不写死在代码里**——全部出站路径从渠道配置 p.base_url 拼派，
-   X-Domain 头默认取渠道地址 host，账号 domain 字段可覆盖（文档站
-   code-channel-ai.md 硬性规则 4：域名写死=骗用户，填了不生效）；
+保留的契约（对统一版 cn 档案逐条成立）：
+
+1. spec 能被 code_loader 加载（普通类 + 可识别钩子）；
+2. 接入域名**写死在代码常量里**（运营决策，2026-09-12）——渠道配置 base_url 与协议行
+   path 全不参与出站寻址，X-Domain 默认取写死常量，账号 domain 字段可覆盖；
 3. 设备码流返回形态符合框架扫描器契约：begin 必带 task_type="device_code"
    （admin._invoke_begin_device_flow 缺失直接 500），poll 只认
    {"status": "pending"/"authorized"/"expired"} + account_data；
 4. 11128 风控脱敏核心行为（workbuddy2api 逆向对齐，2026-09-12 实测修复）：
-   SDK 变体身份句（逗号续接）按核心片段改写、键值整段剥离、developer→system、
-   tool_choice any→required、幂等、不污染原对象。
+   SDK 变体身份句整词替换、键值整段剥离、developer→system、tool_choice any→required、
+   幂等、不污染原对象。
 
 specs/ 在 .gitignore 内、由使用者自持，文件不存在时整个模块跳过。
 """
@@ -27,33 +32,26 @@ import pytest
 from providers.code_loader import load_code_provider_class, invalidate_cache
 
 _SPECS_DIR = Path(__file__).resolve().parent.parent / "specs"
+_SPEC_PATH = _SPECS_DIR / "codebuddy_code_channel.py"
 _VARIANTS = {
     "cn": {
-        "path": _SPECS_DIR / "codebuddy_code_channel_cn.py",
+        "path": _SPEC_PATH,
         "channel": "codebuddy-cn-test",
-        "cls_name": "CodeBuddyCNChannel",
-        "display_name": "腾讯 CodeBuddy（国内版）",
-        # 写死常量期望（workbuddy2api 同款分工）：
-        "chat_base": "https://copilot.tencent.com",      # 聊天/授权/刷新/模型
-        "billing_base": "https://www.codebuddy.cn",      # 签到/余额/Origin
-        "x_domain": "www.codebuddy.cn",
-    },
-    "intl": {
-        "path": _SPECS_DIR / "codebuddy_code_channel_intl.py",
-        "channel": "codebuddy-intl-test",
+        # 统一版 cn 档案 = 现网 codebuddy-tencent 形态（类名沿用 CodeBuddyIntlChannel）。
         "cls_name": "CodeBuddyIntlChannel",
-        "display_name": "CodeBuddy / WorkBuddy（国际版）",
-        # 写死常量期望（workbuddy.ai 全家桶单域名）：
-        "chat_base": "https://www.workbuddy.ai",
-        "billing_base": "https://www.workbuddy.ai",
-        "x_domain": "www.workbuddy.ai",
+        "display_name": "CodeBuddy / WorkBuddy（国际版 v2）",
+        # 写死常量期望（现网 CN 单域名全家桶）：
+        "chat_base": "https://www.codebuddy.cn",         # 聊天/授权/刷新/模型/签到/余额
+        "billing_base": "https://www.codebuddy.cn",
+        "x_domain": "www.codebuddy.cn",
     },
 }
 
 _missing = [v["channel"] for v in _VARIANTS.values() if not v["path"].exists()]
 if _missing:
-    pytest.skip(f"specs/codebuddy_code_channel_{{cn,intl}}.py 不存在（使用者自持）: {_missing}", allow_module_level=True)
+    pytest.skip(f"specs/codebuddy_code_channel.py 不存在（使用者自持）: {_missing}", allow_module_level=True)
 
+# 统一版默认 DEPLOY_REGION="cn"，split 锁的就是 cn 档案 → 源码原样加载。
 for _v in _VARIANTS.values():
     _v["source"] = _v["path"].read_text(encoding="utf-8")
 
@@ -161,7 +159,7 @@ def test_spec_loads_with_expected_hooks(channel_cls):
 
 def test_class_flags(channel_cls):
     assert channel_cls.SUPPORTS_MULTI_MESSAGES is True
-    # token 自愈 + 签到挂 init_auth 检测链路 + 每日 10:00 刷新兜底。
+    # token 自愈 + 签到挂 init_auth 检测链路 + 账号动作 refresh_auth 兜底。
     assert channel_cls.SUPPORTS_TOKEN_AUTO_REFRESH is True
     assert channel_cls.SCHEDULED_REFRESH is True
     # 上游按自家 CLI 校验请求头，必须关掉框架伪装头。
@@ -175,10 +173,224 @@ def test_class_flags(channel_cls):
 def test_account_schema_no_region(variant, channel_cls):
     schema = channel_cls.account_schema()
     keys = {f["key"] for f in schema["fields"]}
-    assert keys == {"password", "user_id", "enterprise_id", "domain", "refresh_token"}
+    base_keys = {"password", "user_id", "enterprise_id", "domain", "refresh_token"}
+    if variant["channel"] == "codebuddy-cn-test":
+        # CN 账号信息展示：设备码授权回填 uin/account_type（旧 intl 版未做，保持不动）。
+        assert keys == base_keys | {"uin", "account_type"}
+    else:
+        assert keys == base_keys
     assert schema["display_name"] == variant["display_name"]
     assert schema["auth_start"]["mode"] == "device_code"
     assert "last_checkin" in schema["metadata_badges"]
+    # 签到 / 余额是独立账号动作（不寄生 refresh_auth），各配各的调度与手动按钮。
+    actions = {a["id"]: a for a in schema["account_actions"]}
+    assert set(actions) == {"checkin", "sync_balance"}
+    assert actions["checkin"]["display"]["badge_field"] == "last_checkin"
+    assert actions["sync_balance"]["display"]["value_field"] == "credit_remain"
+    assert "perform_action" in channel_cls._spec_hooks
+
+
+# ==================== 账号信息展示（CN：uin/account_type 落库 + 存量回填）====================
+
+def test_cn_poll_captures_uin_and_account_type(variant):
+    """CN 设备码授权完成时从 login/account 落 uin / account_type（账号信息展示用）。
+
+    仅 CN 版做（旧 intl 版未加，不回归它）。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("账号信息回填仅 CN 版")
+    mod = _module(variant)
+    p = _stub(variant)
+    p._make_session = lambda **kw: _FakeSessionCtx({
+        "/v2/plugin/auth/token": {"code": 0, "msg": "",
+                                  "data": {"accessToken": "tok-x", "refreshToken": "rt-x",
+                                           "domain": "copilot.tencent.com"}},
+        "/v2/plugin/login/account": {"code": 0, "msg": "",
+                                     "data": {"uid": "u-x", "nickname": "nick-x",
+                                              "uin": "450701700171", "type": "personal"}},
+    })
+    r = asyncio.run(getattr(mod, variant["cls_name"]).poll_device_flow(p, {"state": "s"}))
+    ad = r["account_data"]
+    assert ad["uin"] == "450701700171"
+    assert ad["account_type"] == "personal"
+    assert ad["user_id"] == "u-x"
+
+
+def test_cn_fetch_profile_adopts_sole_entry(variant):
+    """_fetch_profile：唯一条目才采纳（防串号），返回非空 uin/account_type/user_id。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("_fetch_profile 仅 CN 版")
+    mod = _module(variant)
+    p = _stub(variant, user_id="")
+    p._make_session = lambda **kw: _FakeSessionCtx({
+        "/v2/plugin/accounts": {"code": 0, "msg": "", "data": {"accounts": [
+            {"uid": "u-only", "uin": "999", "type": "enterprise"}]}}})
+    got = asyncio.run(mod._fetch_profile(p))
+    assert got == {"uin": "999", "account_type": "enterprise", "user_id": "u-only"}
+
+
+def test_cn_fetch_profile_uid_match_over_multiple(variant):
+    """多条条目时按 uid 命中采纳；无命中且多条 → 返回 {}（宁缺勿错）。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("_fetch_profile 仅 CN 版")
+    mod = _module(variant)
+    entries = {"code": 0, "msg": "", "data": {"accounts": [
+        {"uid": "u-other", "uin": "111", "type": "personal"},
+        {"uid": "u-me", "uin": "222", "type": "enterprise"}]}}
+    p = _stub(variant, user_id="u-me")
+    p._make_session = lambda **kw: _FakeSessionCtx({"/v2/plugin/accounts": entries})
+    assert asyncio.run(mod._fetch_profile(p))["uin"] == "222"
+
+    p2 = _stub(variant, user_id="u-nomatch")
+    p2._make_session = lambda **kw: _FakeSessionCtx({"/v2/plugin/accounts": entries})
+    assert asyncio.run(mod._fetch_profile(p2)) == {}
+
+
+def test_cn_init_auth_backfills_profile(variant):
+    """init_auth：当日已签 + 缺 uin → 仍查 plugin/accounts 回填账号信息并持久化。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("账号信息回填仅 CN 版")
+    mod = _module(variant)
+    cls = getattr(mod, variant["cls_name"])
+    p = _stub(variant, api_key="tok", user_id="u-me")
+    # 当日已签（避免触发签到链路），uin 为空 → 走回填。
+    p.last_checkin_status = f"{mod._today_key()}|ok|+100"
+    p.uin = ""
+    persisted: dict = {}
+
+    async def _persist(fields):
+        persisted.update(fields)
+
+    p.persist_account_fields = _persist
+    p._make_session = lambda **kw: _FakeSessionCtx({
+        "/v2/plugin/accounts": {"code": 0, "msg": "", "data": {"accounts": [
+            {"uid": "u-me", "uin": "4507", "type": "personal"}]}}})
+    ok = asyncio.run(cls.init_auth(p, True))
+    assert ok is True
+    assert persisted.get("uin") == "4507"
+    assert persisted.get("account_type") == "personal"
+
+
+# ==================== 模型列表（console 动态目录，仅 CN 版）====================
+
+def test_cn_fetch_models_dynamic_cli_whitelist(variant):
+    """fetch_models 走 console 企业端点：按 agents[cli].models 白名单顺序输出，
+    从 models[] 查字段（max_input_tokens / supports_xxx / reasoning 档位）。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("动态模型列表仅 CN 版（现网 intl_v2 血统）")
+    mod = _module(variant)
+    cls = getattr(mod, variant["cls_name"])
+    p = _stub(variant, api_key="tok")
+    # p.PROVIDER_NAME 是适配器属性，stub 上补一个
+    p.PROVIDER_NAME = "codebuddy-cn-test"
+    p._make_session = lambda **kw: _FakeSessionCtx({
+        "/console/enterprises/personal/models": {
+            "code": 0, "msg": "OK",
+            "data": {
+                "models": [
+                    {"id": "hy3", "name": "hy3", "maxInputTokens": 192000,
+                     "maxOutputTokens": 64000, "supportsImages": False,
+                     "reasoning": {"defaultEffort": "high", "supportedEfforts": ["high"]}},
+                    {"id": "glm-5.3", "name": "GLM-5.3", "maxInputTokens": 1000000,
+                     "maxOutputTokens": 131072, "supportsReasoning": True,
+                     "reasoning": {"defaultEffort": "medium",
+                                   "supportedEfforts": ["low", "medium", "high"]}},
+                    {"id": "nes-x", "name": "embed", "maxInputTokens": 8000,
+                     "maxOutputTokens": 100},          # 非对话（前缀 + tiny 输出）→ 剔
+                    {"id": "img-gen", "name": "img", "tags": ["text-to-image"],
+                     "maxInputTokens": 8000, "maxOutputTokens": 1000},  # 图片生成 → 剔
+                    {"id": "dead-m", "name": "dead", "disabled": True,
+                     "maxInputTokens": 8000, "maxOutputTokens": 1000},  # disabled → 剔
+                ],
+                "agents": [
+                    {"name": "cli", "description": "cli agent",
+                     "models": ["hy3", "glm-5.3", "nes-x", "img-gen", "dead-m", "hy3"]},
+                ],
+            },
+        }})
+    models = asyncio.run(cls.fetch_models(p))
+    ids = [m["id"] for m in models]
+    # 白名单顺序 + 去重 + disabled/非对话剔除
+    assert ids == ["hy3", "glm-5.3"], ids
+    hy3 = models[0]
+    assert hy3["max_input_tokens"] == 192000 and hy3["max_output_tokens"] == 64000
+    assert hy3["default_effort"] == "high" and hy3["supported_efforts"] == ["high"]
+    assert hy3["upstream_id"] == "hy3" and hy3["object"] == "model"
+
+
+def test_cn_fetch_models_failure_sets_error(variant):
+    """HTTP 非 200 / 业务码非 0 → 写 _last_fetch_models_error 返回空（不静态兜底）。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("动态模型列表仅 CN 版")
+    mod = _module(variant)
+    cls = getattr(mod, variant["cls_name"])
+
+    class _BadResp:
+        status = 401
+        async def text(self):
+            return "unauthorized"
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+
+    class _BadSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        def get(self, url, **kw):
+            return _BadResp()
+
+    p = _stub(variant, api_key="tok")
+    p.PROVIDER_NAME = "codebuddy-cn-test"
+    p._make_session = lambda **kw: _BadSession()
+    models = asyncio.run(cls.fetch_models(p))
+    assert models == []
+    assert "401" in p._last_fetch_models_error
+
+    # 业务码非 0
+    p2 = _stub(variant, api_key="tok")
+    p2.PROVIDER_NAME = "codebuddy-cn-test"
+    p2._make_session = lambda **kw: _FakeSessionCtx({
+        "/console/enterprises/personal/models": {"code": 11217, "msg": "no"}})
+    assert asyncio.run(cls.fetch_models(p2)) == []
+    assert "11217" in p2._last_fetch_models_error
+
+
+def test_cn_parse_console_models_fallback_all_models(variant):
+    """无 agents[cli] 声明 → 退回全量 models[]（panel v3 面同口径，不空手而归）。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("动态模型列表仅 CN 版")
+    mod = _module(variant)
+    env = {"code": 0, "data": {"models": [
+        {"id": "hy3", "name": "hy3", "maxInputTokens": 192000, "maxOutputTokens": 64000},
+        {"id": "glm-5.3", "name": "GLM-5.3", "maxInputTokens": 1000000,
+         "maxOutputTokens": 131072},
+    ]}}
+    out = mod._parse_console_models(env, "prov")
+    assert [m["id"] for m in out] == ["hy3", "glm-5.3"]
+
+
+def test_cn_parse_console_models_agents_only_shape(variant):
+    """实测响应形态（2026-09-30 用户提供）：只有 data.agents、agent 无 name 字段
+    （按 description「cli agent」命中）、无 data.models → 按白名单 id 建最小条目。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("动态模型列表仅 CN 版")
+    mod = _module(variant)
+    env = {"code": 0, "msg": "OK", "requestId": "116f5a86", "data": {"agents": [
+        {"commands": ["init", "compact", "statusline", "insights"],
+         "description": "cli agent", "instructions": "cli-agent-prompt",
+         "models": ["auto", "hy4-preview", "hy3", "hy3-x", "deepseek-v4.1-flash",
+                    "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo",
+                    "kimi-k3-1", "kimi-k2.8-preview", "kimi-k2.7", "kimi-k2.6",
+                    "minimax-m3", "deepseek-v4-pro"]}]}}
+    out = mod._parse_console_models(env, "prov")
+    ids = [m["id"] for m in out]
+    assert ids == ["auto", "hy4-preview", "hy3", "hy3-x", "deepseek-v4.1-flash",
+                   "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo",
+                   "kimi-k3-1", "kimi-k2.8-preview", "kimi-k2.7", "kimi-k2.6",
+                   "minimax-m3", "deepseek-v4-pro"], ids
+    assert out[0]["upstream_id"] == "auto" and out[0]["name"] == "auto"
 
 
 # ==================== 接入点写死（无视渠道配置，运营决策 2026-09-12）====================
@@ -199,7 +411,11 @@ def test_x_domain_defaults_to_spec_constant(variant):
     h = getattr(mod, variant["cls_name"]).headers(p, {}, None)
     assert h["X-Domain"] == variant["x_domain"]
     assert h["Origin"] == variant["billing_base"]
-    assert h["User-Agent"] == "CLI/2.63.2 CodeBuddy/2.63.2"
+    # UA 按 variant：CN（现网 intl_v2 血统）三段式带版本；旧 intl 两段式。
+    if variant["channel"] == "codebuddy-cn-test":
+        assert h["User-Agent"] == "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1"
+    else:
+        assert h["User-Agent"] == "CLI/2.63.2 CodeBuddy/2.63.2"
     # 账号 domain 字段仍可覆盖
     p.domain = "my.proxy.example"
     assert mod._billing_headers(p)["X-Domain"] == "my.proxy.example"
@@ -432,14 +648,15 @@ def test_user_info_extraction(variant):
 
 
 def test_sanitize_rewrites_sdk_variant_identity(variant):
-    """身份句改写按核心片段（不带句读）——CLI 句号版与 Agent SDK 逗号续接版都要命中。"""
+    """身份句整词替换——CLI 句号版与 Agent SDK 逗号续接版都命中（09-14 定版策略）。"""
     mod = _module(variant)
     sdk = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
     out = mod._sanitize_outbound_body({"system": sdk})
-    assert "official CLI tool for Claude" in out["system"]
-    assert "You are Claude Code" in out["system"]  # 只改黑名单核心片段，身份语义保留
+    # 统一版（intl_v2 血统）：SDK 整句被第 1 条规则删空（只剩句读），
+    # CLI 句里 Claude Code/Claude 命中即替换成 workbuddy。
+    assert "Claude" not in out["system"] and "Claude Code" not in out["system"]
     cli = "You are Claude Code, Anthropic's official CLI for Claude."
-    assert "official CLI tool for Claude" in mod._sanitize_text(cli)
+    assert mod._sanitize_text(cli) == "You are workbuddy, Anthropic's official CLI for workbuddy."
 
 
 def test_sanitize_rewrites_are_idempotent(variant):
@@ -447,21 +664,21 @@ def test_sanitize_rewrites_are_idempotent(variant):
     mod = _module(variant)
     for old, new in mod._SANITIZE_REWRITES:
         assert old not in new, (old, new)
-    # Codex 句任意变体（CLI 句号版 / 逗号续接版）都改写、且二次过钩子不再变化
+    # 统一版（intl_v2 血统）：09-14 整词替换（Codex→workbuddy）。身份词命中即改，
+    # 二次过钩子幂等（workbuddy 不含 Codex，重入不滚雪球）。
     for sent in ("You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
                  "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. "
                  "Codex CLI is an open source project led by OpenAI."):
         once = mod._sanitize_text(sent)
-        assert once != sent and "inside the Codex CLI" in once, sent
+        assert once != sent and "workbuddy" in once, sent
+        assert "Codex" not in once, once
         twice = mod._sanitize_text(once)
         assert twice == once, (once, twice)
-    # 三连过钩子也不长毛刺
     body = {"messages": [{"role": "user", "content": "You are a coding agent running in the Codex CLI, a terminal-based coding assistant."}]}
     b1 = mod._sanitize_outbound_body(body)
     b2 = mod._sanitize_outbound_body(b1)
     b3 = mod._sanitize_outbound_body(b2)
     assert b3["messages"][0]["content"] == b2["messages"][0]["content"] == b1["messages"][0]["content"]
-    assert "tool tool" not in b3["messages"][0]["content"] and "inside inside" not in b3["messages"][0]["content"]
 
 
 def test_sanitize_strips_kv_and_normalizes(variant):
@@ -543,3 +760,51 @@ def test_ensure_head_system_injected_when_missing(variant):
     for empty in ({"messages": []}, {"messages": None}, {}, {"messages": "x"}):
         oute = mod._sanitize_outbound_body(empty)
         assert "messages" not in oute or oute.get("messages") == empty.get("messages"), empty
+
+
+def test_cn_fetch_models_extracts_desc_and_multiplier(variant):
+    """console 模型项的 descriptionZh/descriptionEn 与 credits（"x0.29"/"x0.00 credits"）
+    要提成行顶层 _model_desc/cost_multiplier（管理端「其他信息」列）；
+    auto 这类无固定倍率的模型 credits 缺失 → 只塞说明。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("动态模型列表仅 CN 版（现网 intl_v2 血统）")
+    mod = _module(variant)
+    cls = getattr(mod, variant["cls_name"])
+    p = _stub(variant, api_key="tok")
+    p.PROVIDER_NAME = "codebuddy-cn-test"
+    p._make_session = lambda **kw: _FakeSessionCtx({
+        "/console/enterprises/personal/models": {
+            "code": 0, "msg": "OK",
+            "data": {
+                "models": [
+                    {"id": "hy4-preview", "name": "Hy4 preview",
+                     "credits": "x0.29", "maxInputTokens": 192000,
+                     "maxOutputTokens": 64000,
+                     "descriptionZh": "混元思考模型，具有增强的推理能力",
+                     "descriptionEn": "Hunyuan's thinking model"},
+                    {"id": "auto", "name": "Auto",
+                     "descriptionZh": "平衡效果与速度。自动为每个任务匹配最优模型",
+                     "reasoning": {"defaultEffort": "high"}},
+                ],
+                "agents": [{"name": "cli", "description": "cli agent",
+                            "models": ["hy4-preview", "auto"]}],
+            },
+        }})
+    models = asyncio.run(cls.fetch_models(p))
+    by_id = {m["id"]: m for m in models}
+    assert by_id["hy4-preview"]["_model_desc"] == "混元思考模型，具有增强的推理能力"
+    assert by_id["hy4-preview"]["cost_multiplier"] == 0.29
+    assert by_id["auto"]["_model_desc"] == "平衡效果与速度。自动为每个任务匹配最优模型"
+    assert "cost_multiplier" not in by_id["auto"]
+
+
+def test_cn_declares_model_info_columns(variant):
+    """account_schema 必须声明说明/倍率两列，管理端模型 tab 才渲染「其他信息」。"""
+    if variant["channel"] != "codebuddy-cn-test":
+        pytest.skip("动态模型列表仅 CN 版")
+    mod = _module(variant)
+    cls = getattr(mod, variant["cls_name"])
+    schema = cls.account_schema()
+    cols = {c["key"]: c for c in schema.get("model_info_columns", [])}
+    assert "_model_desc" in cols
+    assert cols["cost_multiplier"]["format"] == "multiplier"

@@ -376,6 +376,9 @@ def test_mail_query_selected_account_uses_granted_account(monkeypatch):
     ))
     assert called["username"] == "b@x.com"
 
+
+def _projection_ctx(monkeypatch, messages):
+    """构造一个把上游列表直接回给插件的 ctx（正文投影/预算类用例共用）。"""
     class FakeSession:
         async def __aenter__(self): return self
         async def __aexit__(self, *_args): return False
@@ -513,8 +516,97 @@ def test_registrar_allows_same_name_across_capability_kinds():
     with pytest.raises(Exception, match="duplicate action name"):
         reg.action("shared")(handler)
 
-
-
     ctx = PluginContext(plugin_name="mail", resources={"upstream_accounts": []})
     with pytest.raises(ValueError, match="未找到已启用的邮箱配置"):
         asyncio.run(mail_plugin._mail_list({"address": "missing@example.com"}, ctx))
+
+
+def test_mail_plugin_routes_through_proxy_manager_when_account_bound(monkeypatch):
+    """账户绑了代理池条目（proxy_id）：出站会话来自共享 ProxyManager 按 id 路由，
+    而非 ctx.http_session 直连。account_id 按 mail 账户 id 隔离（登录有会话态）。"""
+    calls: dict = {}
+
+    class FakeManagerSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakeManager:
+        def session(self, *, account_id="", proxy_config_id=None, default_timeout=None):
+            calls["account_id"] = account_id
+            calls["proxy_config_id"] = proxy_config_id
+            return FakeManagerSession()
+
+    def fake_get_proxy_manager():
+        return FakeManager()
+
+    import providers.proxy_manager as pm
+    monkeypatch.setattr(pm, "get_proxy_manager", fake_get_proxy_manager)
+
+    async def fake_list_mail(self, session, **kwargs):
+        return [normalize_mail({"subject": "code", "content": "1234"})]
+
+    monkeypatch.setattr(mail_plugin.MailClient, "list_mail", fake_list_mail)
+    ctx = PluginContext(plugin_name="mail", resources={"upstream_accounts": [{
+        "id": 7, "enabled": True, "username": "u@x.com", "password": "p",
+        "base_url": "https://m.x.com", "secret_key": "s",
+        "proxy_id": "proxy_deadbeef1234",
+        "addresses": [{"address": "target@cc.com", "source_address": "src@qq.com"}],
+    }]})
+
+    def poisoned():
+        raise AssertionError("bound account must not fall back to ctx.http_session")
+    ctx.http_session = poisoned  # type: ignore[method-assign]
+
+    result = asyncio.run(mail_plugin._mail_list({"address": "target@cc.com"}, ctx))
+    assert result["messages"][0]["text_content"] == "1234"
+    assert calls["proxy_config_id"] == "proxy_deadbeef1234"
+    assert calls["account_id"] == "mail:7"
+
+
+def test_mail_plugin_direct_when_account_unbound(monkeypatch):
+    """账户未绑代理：仍走 ctx.http_session 直连，ProxyManager 不被触碰。"""
+    import providers.proxy_manager as pm
+
+    def poisoned_factory():
+        raise AssertionError("unbound account must not touch ProxyManager")
+    monkeypatch.setattr(pm, "get_proxy_manager", poisoned_factory)
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_args):
+            return False
+
+    seen = {}
+    async def fake_list_mail(self, session, **kwargs):
+        seen["session"] = session
+        return []
+
+    monkeypatch.setattr(mail_plugin.MailClient, "list_mail", fake_list_mail)
+    ctx = PluginContext(plugin_name="mail", resources={"upstream_accounts": [{
+        "id": 3, "enabled": True, "username": "u@x.com", "password": "p",
+        "base_url": "https://m.x.com", "secret_key": "s",
+        "addresses": [{"address": "target@cc.com", "source_address": "src@qq.com"}],
+    }]})
+    fake = FakeSession()
+    ctx.http_session = lambda: fake  # type: ignore[method-assign]
+
+    result = asyncio.run(mail_plugin._mail_list({"address": "target@cc.com"}, ctx))
+    assert result["messages"] == []
+    assert seen["session"] is fake
+
+
+def test_mail_client_wraps_proxy_tunnel_error_as_mail_client_error():
+    """经 ProxyManager 出站抛非 aiohttp 异常（如 node 模式无 manager）也要收敛成
+    MailClientError，而不是炸出 RuntimeError 破坏调用方口径。"""
+    from mcp_builtin.mail.client import MailClient, MailClientError
+
+    class FakeSession:
+        def request(self, *args, **kwargs):
+            raise RuntimeError("node mode requires NodeConnectManager")
+
+    client = MailClient("u@x.com", "p", "https://m.x.com", "s")
+    with pytest.raises(MailClientError, match="无法连接上游邮件服务"):
+        asyncio.run(client._request(FakeSession(), "GET", "/admin/mails"))

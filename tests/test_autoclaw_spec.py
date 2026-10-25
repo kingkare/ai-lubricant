@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -72,7 +74,7 @@ def test_spec_loads_with_expected_hooks(channel_cls):
     hooks = channel_cls._spec_hooks
     assert {
         "account_schema", "is_init", "init_auth", "check_auth", "health_check",
-        "refresh_auth", "fetch_models", "stream_chat",
+        "refresh_auth", "perform_action", "fetch_models", "stream_chat",
     }.issubset(hooks)
 
 
@@ -330,6 +332,80 @@ def test_endpoint_not_enabled_detection():
     assert mod._is_endpoint_not_enabled(HTTPException(500, "boom")) is False
 
 
+def test_maybe_credit_error_upgrades_llm_failed_when_balance_zero(monkeypatch):
+    """502「LLM request failed」且余额 0 → 402（积分不足）。
+
+    回归（2026-09-30 载体 E2E）：积分耗尽时，上游把任何模型名都报成
+    ``HTTP 502 AutoClaw 会话错误: LLM request failed.``，2~3 秒即返——和真正的上游
+    崩溃共用一条文案。报 502 会让框架反复重试、不冻结账号；402 才对（框架冻结、
+    恢复后自动解冻）。
+    """
+    mod = _module()
+
+    async def fake_points(_p):
+        return 0
+    monkeypatch.setattr(mod, "_fetch_points", fake_points)
+
+    class _P:
+        pass
+
+    upgraded = _run(mod._maybe_credit_error(_P(), HTTPException(
+        502, "AutoClaw 会话错误: LLM request failed.")))
+    assert upgraded.status_code == 402
+    assert "积分不足" in str(upgraded.detail)
+
+
+def test_maybe_credit_error_keeps_502_when_balance_positive(monkeypatch):
+    """余额 > 0 仍报 502（真上游崩，不是积分）——别误冻账号。"""
+    mod = _module()
+
+    async def fake_points(_p):
+        return 400
+    monkeypatch.setattr(mod, "_fetch_points", fake_points)
+
+    class _P:
+        pass
+
+    kept = _run(mod._maybe_credit_error(_P(), HTTPException(
+        502, "AutoClaw 会话错误: LLM request failed.")))
+    assert kept.status_code == 502
+
+
+def test_maybe_credit_error_skips_balance_probe_for_other_errors(monkeypatch):
+    """只在「LLM request failed」这条模糊文案上查余额，其余 502 不动。"""
+    mod = _module()
+
+    called = {"n": 0}
+
+    async def fake_points(_p):
+        called["n"] += 1
+        return 0
+    monkeypatch.setattr(mod, "_fetch_points", fake_points)
+
+    class _P:
+        pass
+
+    kept = _run(mod._maybe_credit_error(_P(), HTTPException(502, "别的东西崩了")))
+    assert kept.status_code == 502
+    assert called["n"] == 0, "非 LLM-failed 文案不应查余额"
+
+
+def test_maybe_credit_error_keeps_502_when_balance_probe_fails(monkeypatch):
+    """查余额本身失败 → 保留原 502，不能把网络抖动误判成积分不足把账号冻了。"""
+    mod = _module()
+
+    async def fake_points(_p):
+        raise RuntimeError("probe net down")
+    monkeypatch.setattr(mod, "_fetch_points", fake_points)
+
+    class _P:
+        pass
+
+    kept = _run(mod._maybe_credit_error(_P(), HTTPException(
+        502, "AutoClaw 会话错误: LLM request failed.")))
+    assert kept.status_code == 502
+
+
 # ==================== relay 事件流转换 ====================
 
 def _sse_frame(event: str, payload: dict) -> str:
@@ -356,6 +432,97 @@ def test_relay_feed_filters_other_runs():
     state = mod._new_relay_state("r1", "aclaw-x")
     assert mod._relay_feed(state, _sse_frame("agent:stream", {
         "runId": "r-other", "type": "text", "delta": "noise"})) == []
+
+
+def test_relay_first_content_window_advances_on_any_run_event():
+    """首字超时看的是「本 run 是否还在推进」，不是「是否已吐字」。
+
+    回归（2026-09-30 载体 E2E）：6700 字符的安装命令在 planning / 工具阶段能静默
+    超过 90s，旧实现只认内容帧 → 三次重试全被判「首字超时」，而同账号短 prompt 秒回。
+    现在归属命中的**任何**本 run 事件（phase / 工具 / 正文）都刷新 last_run_event_at，
+    首字窗口以它为锚滑动；另设绝对上限防推进帧无限续命。
+    """
+    mod = _module()
+    state = mod._new_relay_state("r1", "aclaw-x")
+    assert state["last_run_event_at"] == 0.0, "新建时未收到任何本 run 事件"
+
+    # phase（planning）不产帧，但算推进
+    assert mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "r1", "type": "phase", "phase": "planning"})) == []
+    after_phase = state["last_run_event_at"]
+    assert after_phase > 0.0, "phase 事件应刷新首字时钟"
+
+    # 工具阶段同样算推进（Windows 时钟粒度 ~15ms，故用哨兵值判定，不靠 sleep）
+    state["last_run_event_at"] = 1.0
+    mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "r1", "type": "tool_call", "name": "exec", "input": {"cmd": "wc -c"}}))
+    assert state["last_run_event_at"] > 1.0, "工具阶段应推进首字时钟"
+
+    # 归属未命中的帧**不得**推进（否则别的 run 的事件能把我们的首字窗口续命）
+    before = state["last_run_event_at"]
+    mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "r-other", "type": "phase", "phase": "planning"}))
+    assert state["last_run_event_at"] == before, "非本 run 事件不应刷新首字时钟"
+
+    # 网关心跳（无归属信息）同理
+    mod._relay_feed(state, _sse_frame("gateway:event", {"event": "health", "payload": {"x": 1}}))
+    assert state["last_run_event_at"] == before, "心跳帧不应刷新首字时钟"
+
+    # 绝对上限存在（推进帧不能无限续命）
+    assert mod.RELAY_FIRST_CONTENT_MAX > mod.RELAY_FIRST_CONTENT_TIMEOUT
+
+
+def test_relay_first_content_error_message_tracks_event_window():
+    """首字超时报错文案说「本 run 无任何事件」，与判定口径一致。"""
+    import inspect
+    mod = _module()
+    src = inspect.getsource(mod._stream_via_relay)
+    assert "RELAY_FIRST_CONTENT_MAX" in src
+    assert "本 run 无任何事件" in src
+    # 滑动锚：last_run_event_at 必须参与判定
+    assert "since_evt" in src
+
+
+def test_relay_feed_session_match_wins_even_with_foreign_runid():
+    """回归（用户报「relay 事件流无归属事件」）：
+
+    我方 sessionKey 是 aclaw-{uuid4[:16]}、每次请求唯一——事件里出现它就只有一种解释：
+    这是本次请求的事件。上游若在事件上盖了自己的 runId（≠ send 响应的 runId），
+    不能因此丢弃；session 命中即可归属。旧逻辑要求「且事件没带 runId」，
+    会把我们自己的事件全丢 → 一帧不吐 → 报「无归属事件」。
+    """
+    mod = _module()
+    state = mod._new_relay_state("agent_send_run", "aclaw-abc123")
+    out = mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "agent_mui8ka5x_d79bcj",   # 上游自己的 runId，与 send 响应不同
+        "sessionKey": "agent:main:aclaw-abc123",
+        "type": "text", "delta": "hi"}))
+    assert [f["content"] for f in out] == ["hi"]
+
+    # to 字段同理（部分事件用 to 承载 sessionKey）
+    state2 = mod._new_relay_state("r-send", "aclaw-xyz")
+    out2 = mod._relay_feed(state2, _sse_frame("agent:stream", {
+        "runId": "r-upstream", "to": "agent:main:aclaw-xyz",
+        "type": "text", "delta": "yo"}))
+    assert [f["content"] for f in out2] == ["yo"]
+
+    # 既不带我方 session 也不带我方能认的 runId → 仍必须丢弃（噪音帧）
+    state3 = mod._new_relay_state("r-send", "aclaw-xyz")
+    assert mod._relay_feed(state3, _sse_frame("agent:stream", {
+        "runId": "r-other", "sessionKey": "agent:main:someone-else",
+        "type": "text", "delta": "noise"})) == []
+    # 丢弃时留样本供报错诊断
+    assert state3["dropped"], "归属未命中应留诊断样本"
+
+
+def test_relay_no_attribution_error_includes_diagnostics():
+    """「无归属事件」报错必须带上我方 key + 收到的事件样本，否则无从定位。"""
+    import asyncio
+    import inspect
+    mod = _module()
+    src = inspect.getsource(mod._stream_via_relay)
+    assert "收到的事件" in src and "dropped" in src
+    assert "sessionKey={session_key!r}" in src
 
 
 def test_relay_feed_chat_event_tool_calls_usage_done():
@@ -432,6 +599,88 @@ def test_relay_send_request_backend_model_header(channel_cls):
     # sessionKey 每请求随机
     _, headers2 = mod._relay_send_request(p, "glm-5.2", [{"role": "user", "content": "hi"}], {})
     assert body["args"][0]["sessionKey"] != _relay_send_request_session(mod, p)
+
+
+# ==================== relay 通道客户端工具注入 ====================
+
+def test_relay_send_request_injects_client_tools_into_transcript(channel_cls):
+    """客户端声明了 tools 时，工具说明必须并进 transcript（沙箱 agent 才知道有 get_weather）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="Bearer at-1")
+    tools = [{"type": "function", "function": {
+        "name": "get_weather", "description": "Get weather for a city",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]}}}]
+    body, _ = mod._relay_send_request(p, "glm-5.3-flash", [
+        {"role": "user", "content": "北京天气怎么样"},
+    ], {"tools": tools})
+    msg = body["args"][0]["message"]
+    assert "get_weather" in msg          # 工具名进了 transcript
+    assert "tool_function" in msg        # 围栏约定也进了
+
+
+def test_relay_send_request_flattens_tool_history_when_tools_declared(channel_cls):
+    """历史轮的原生 tool_calls/tool 结果拍成文本（避免触发上游自己的 function-calling）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="Bearer at-1")
+    tools = [{"type": "function", "function": {
+        "name": "get_weather", "description": "Get weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]}}}]
+    body, _ = mod._relay_send_request(p, "glm-5.3-flash", [
+        {"role": "user", "content": "北京天气"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "get_weather", "arguments": "{\"city\":\"北京\"}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "晴 25 度"},
+    ], {"tools": tools})
+    msg = body["args"][0]["message"]
+    assert "晴 25 度" in msg               # 历史工具结果拍进文本
+    assert '"tool_calls"' not in msg      # 原生结构被扁平化
+
+
+def test_relay_tool_use_folded_to_thinking_when_client_declares_tools(channel_cls):
+    """客户端声明了 tools 时，上游的 tool_use（read/exec）折进 thinking，不发给客户端。"""
+    mod = _module()
+    state = mod._new_relay_state("r1", "aclaw-x", client_tools=[{"type":"function","function":{"name":"get_weather"}}])
+    out = mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "r1", "type": "tool_use", "name": "exec", "input": {"command": "ls"},
+        "sessionKey": "aclaw-x"}))
+    assert out and "tool_calls" not in out[0]
+    assert "thinking" in out[0] and "exec" in out[0]["thinking"]
+    assert state["had_tools"] is False   # 没发 tool_calls 给客户端
+
+
+def test_relay_finish_reason_fence_when_tools_declared(channel_cls):
+    """客户端声明了 tools 且正文出现 ```tool_function 围栏 → finish=tool_calls。"""
+    mod = _module()
+    state = mod._new_relay_state("r1", "aclaw-x", client_tools=[{"type":"function","function":{"name":"get_weather"}}])
+    mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "r1", "type": "text",
+        "delta": "```tool_function\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"北京\"}}\n```",
+        "sessionKey": "aclaw-x"}))
+    assert mod._relay_finish_reason(state) == "tool_calls"
+
+
+def test_relay_finish_reason_plain_answer_stops(channel_cls):
+    """没有围栏、也没有 had_tools → finish=stop。"""
+    mod = _module()
+    state = mod._new_relay_state("r1", "aclaw-x", client_tools=None)
+    mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "r1", "type": "text", "delta": "北京今天晴天",
+        "sessionKey": "aclaw-x"}))
+    assert mod._relay_finish_reason(state) == "stop"
+
+
+def test_relay_error_after_content_is_marked(channel_cls):
+    """已吐内容后的错误文案带标记前缀，finish_reason 不谎报 tool_calls。"""
+    mod = _module()
+    state = mod._new_relay_state("r1", "aclaw-x")
+    mod._relay_feed(state, _sse_frame("agent:stream", {"runId":"r1","type":"text","delta":"我查一下"}))
+    out = mod._relay_feed(state, _sse_frame("agent:stream", {"runId":"r1","type":"error","message":"LLM request failed."}))
+    assert "[AutoClaw 上游错误]" in out[0]["content"]
+    assert out[-1]["done"] is True
+    assert out[-1].get("finish_reason") == "stop"
 
 
 def _relay_send_request_session(mod, p):
@@ -555,6 +804,11 @@ class _FakeResp:
     async def iter_any(self):
         yield self._chunks
 
+    async def readany(self):
+        """模拟 aiohttp StreamReader.readany：一次给一块，随后 b""（EOF）。"""
+        chunk, self._chunks = self._chunks, b""
+        return chunk
+
 
 class _FakeCtx:
     def __init__(self, resp):
@@ -635,6 +889,146 @@ def test_stream_chat_falls_back_to_relay_on_not_enabled(channel_cls):
     assert done["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
 
 
+def test_relay_planning_phase_is_not_attributed_content(channel_cls):
+    """回归（用户报「无归属事件」且 14s 就失败）：
+
+    agent 的 planning 阶段先发 type=phase/phase=planning（**无文本增量**），随后才吐字。
+    这类帧必须被认作「归属通过但暂无内容」——不能算 emitted，也不能被当成噪音丢弃，
+    否则流一结束就报「无归属事件」。同时验证真实帧形态（gateway:status + agent:stream）。
+    """
+    mod = _module()
+    state = mod._new_relay_state("agent_muiifrgc_o3ilqg", "aclaw-4fbe33b39d994bd2")
+    # gateway:status 是噪音帧（payload 是字符串，不是 dict）→ 丢弃且不记 dropped
+    assert mod._relay_feed(state, 'data: {"event":"gateway:status","payload":"connected"}\n\n') == []
+    assert state["dropped"] == []
+    # planning 阶段：归属匹配、无内容 → 返回空帧，但**不记 dropped**（它不是"无归属"）
+    out = mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "agent_muiifrgc_o3ilqg", "type": "phase", "phase": "planning",
+        "sessionKey": "aclaw-4fbe33b39d994bd2"}))
+    assert out == []
+    assert state["dropped"] == []
+    assert state["emitted"] is False
+    # 随后真正吐字 → 正常产出
+    out = mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "agent_muiifrgc_o3ilqg", "type": "text", "delta": "hi",
+        "sessionKey": "aclaw-4fbe33b39d994bd2"}))
+    assert [f["content"] for f in out] == ["hi"]
+    assert state["emitted"] is True
+
+
+def test_relay_session_key_matches_without_agent_main_prefix(channel_cls):
+    """回归：真实帧里 sessionKey 是**裸的** aclaw-xxx（不是 agent:main:aclaw-xxx）。
+
+    归属用「我方 key 是事件 sessionKey 的子串」判定，两种形态都要命中。
+    """
+    mod = _module()
+    state = mod._new_relay_state("r-send", "aclaw-4fbe33b39d994bd2")
+    out = mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "agent_muiifrgc_o3ilqg", "type": "text", "delta": "yo",
+        "sessionKey": "aclaw-4fbe33b39d994bd2"}))
+    assert [f["content"] for f in out] == ["yo"]
+
+
+def test_relay_event_stream_never_cancels_reads(channel_cls):
+    """回归（生产「无归属事件」，事件流总在最后一字节后**恰好 10.0s 整**报 EOF）：
+
+    旧实现拿 `wait_for(readany(), timeout=sock_read=10)` 当「单次读静默计时器」，注释
+    以为超时只是 continue。实际上取消一个进行中的读会终结底层异步生成器——
+    ProxyManager 把响应包成 OutboundResponse（readany = 生成器 __anext__），
+    生成器被终结后每次读都 StopAsyncIteration → 恒返回 b"" → 被当成「上游 EOF」。
+    日志铁证：19:56:13.565 tick → 19:56:23.647 EOF、17:26:01.191 planning → 17:26:11.190
+    EOF，都是最后一字节后 10.0s；而 agent 规划静默十几秒是正常的。
+
+    新实现必须：读泵常驻（只在收尾取消）、超时只作用于队列等待、aiohttp 超时只做
+    死连接兜底，静默判定一律用时间差。
+    """
+    mod = _module()
+    import inspect
+    src = inspect.getsource(mod._stream_via_relay)
+    assert "readany(), timeout" not in src, "绝不能取消底层读（会终结生成器）"
+    assert "_pump_events" in src and "queue.get()" in src
+    assert mod.RELAY_FIRST_CONTENT_TIMEOUT >= 30.0
+    assert mod.RELAY_SOCK_READ_TIMEOUT >= 120.0
+    assert mod.RELAY_POLL_SECONDS < mod.RELAY_IDLE_FINISH_SECONDS
+
+
+def test_relay_feed_unwraps_gateway_event_envelope(channel_cls):
+    """gateway:event 是信封帧：真实事件嵌在 payload={event,payload} 里。
+
+    内层若是我们的 agent 事件族，必须照常归属分发（别当噪音丢）；内层是
+    health/tick/presence 这类心跳才记噪音——否则报错会长成
+    「收到的事件：event=gateway:event run=- sess=- to=-」，看着像归属判错。
+    """
+    mod = _module()
+    state = mod._new_relay_state("agent_run_1", "aclaw-abc123")
+    out = mod._relay_feed(state, _sse_frame("gateway:event", {
+        "event": "agent:stream",
+        "payload": {"runId": "agent_run_1", "type": "text", "delta": "hi",
+                    "sessionKey": "agent:main:aclaw-abc123"}}))
+    assert [f["content"] for f in out] == ["hi"]
+    assert state["emitted"] is True
+
+    # 心跳内层（health/tick/presence）→ 记噪音、不产出、不占 dropped
+    hb = mod._new_relay_state("agent_run_1", "aclaw-abc123")
+    assert mod._relay_feed(hb, _sse_frame("gateway:event", {
+        "event": "health", "payload": {"ok": True, "ts": 1790510173260}})) == []
+    assert mod._relay_feed(hb, _sse_frame("gateway:event", {
+        "event": "tick", "payload": {"ts": 1790510173260}})) == []
+    assert hb["dropped"] == []
+    # 噪音按**内层**事件名归类（报错时直接看到 health/tick，而不是外层信封名）
+    assert hb["noise_kinds"] == {"health": 1, "tick": 1}
+
+
+def test_relay_feed_heartbeat_without_attribution_is_noise_not_dropped(channel_cls):
+    """不带任何归属字段的事件（网关广播的心跳/状态）算噪音，不占 dropped 样本——
+    这样「无归属事件」报错里剩下的样本才是真·别人的 run 事件。"""
+    mod = _module()
+    state = mod._new_relay_state("r1", "aclaw-x")
+    assert mod._relay_feed(state, _sse_frame("agent:stream", {
+        "type": "presence", "payload": {"host": "AutoClaw Server Mode"}})) == []
+    assert state["dropped"] == []
+    assert state["noise_kinds"].get("agent:stream") == 1
+    # 带 runId/sessionKey 却没对上 → 才是真「归属未命中」，留样本
+    assert mod._relay_feed(state, _sse_frame("agent:stream", {
+        "runId": "agent_other", "sessionKey": "agent:main:aclaw-other",
+        "type": "text", "delta": "noise"})) == []
+    assert state["dropped"]
+
+
+def test_stream_chat_global_goes_straight_to_relay(channel_cls):
+    """region=global 只走 relay bridge，不试 OpenAI 端点。
+
+    2026-09-19 实测（live 账号 + 官方 bundle 对照）：官方网页/桌面端 bundle 里根本没有
+    /v1/chat/completions 与 /v1/models，沙箱网关对它们稳定 404 {"ok":false,"error":
+    "Not found"}——先试它只会白撞一次 404（用户看到的「notfound」就是它）还拖慢首字。
+    """
+    p = _ready_provider(channel_cls)
+    p.region = "global"
+
+    async def must_not_call(method, url, headers, **kw):
+        raise AssertionError(f"global 不应尝试 OpenAI 端点: {url}")
+        yield  # pragma: no cover
+
+    p.send_sse_request = must_not_call
+
+    events_resp = _FakeResp(status=200, chunks=_RELAY_EVENTS)
+    send_resp = _FakeResp(status=200, json_obj={"ok": True, "data": {"runId": "r1"}})
+    session = _FakeSession(get_resp=events_resp, post_resp=send_resp)
+    p._make_session = lambda timeout=None: session
+
+    async def no_ws(pp, bare):
+        return None
+
+    _patch_namespace(channel_cls, _device_online_ws=no_ws, _wake_sandbox=lambda *a, **k: _noop())
+
+    frames = [f for f in _run(_collect_stream(channel_cls, p)) if isinstance(f, dict)]
+    contents = "".join(f.get("content") or "" for f in frames)
+    assert contents == "Hello world"
+    # relay 通道走通：events GET + agent/send，全程没碰 /v1/chat/completions
+    assert session.get_urls == ["https://gw.example.com/autoclaw-cloud/proxy/sb1/api/events"]
+    assert session.post_calls[0]["url"] == "https://gw.example.com/autoclaw-cloud/proxy/sb1/api/electron/agent/send"
+
+
 def test_stream_chat_propagates_non_fallback_errors(channel_cls):
     """通道 1 非 NotEnabled 错误（如 401）原样上抛，不回退 relay。"""
     p = _ready_provider(channel_cls)
@@ -659,8 +1053,8 @@ def test_stream_chat_requires_credential(channel_cls):
 
 # ==================== refresh_auth 编排 ====================
 
-def test_refresh_auth_orchestrates_token_points_sandbox(channel_cls):
-    """refresh 三件套：token 续期 + 积分写 quota_text + 沙箱缓存归一，字段快照返回。"""
+def test_refresh_auth_orchestrates_composite(channel_cls):
+    """refresh_auth = 复合入口：token + 积分 + 沙箱 + 签到一次做完（与独立动作同实现）。"""
     p = _ready_provider(channel_cls)
     p.expires_at = "0"  # 强制临期 → 触发 refresh
 
@@ -676,10 +1070,16 @@ def test_refresh_auth_orchestrates_token_points_sandbox(channel_cls):
         pp.sandbox_endpoint = "https://gw/autoclaw-cloud/proxy/sb2"
         return "sb2", "https://gw/autoclaw-cloud/proxy/sb2"
 
+    async def fake_checkin_fields(pp):
+        return {"last_checkin": "已签到 +400", "last_checkin_status": "2026-09-28|ok|+400"}
+
     hook = channel_cls._spec_hooks["refresh_auth"]
-    saved = {name: hook.__globals__.get(name) for name in ("_userapi_json", "_ensure_sandbox")}
+    names = ("_userapi_json", "_ensure_sandbox", "_checkin_fields", "_today_checkin_done")
+    saved = {name: hook.__globals__.get(name) for name in names}
     hook.__globals__["_userapi_json"] = fake_userapi_json
     hook.__globals__["_ensure_sandbox"] = fake_ensure_sandbox
+    hook.__globals__["_checkin_fields"] = fake_checkin_fields
+    hook.__globals__["_today_checkin_done"] = lambda pp: False
     try:
         fields = _run(hook(p, {"password": "Bearer at-old"}))
     finally:
@@ -691,10 +1091,11 @@ def test_refresh_auth_orchestrates_token_points_sandbox(channel_cls):
     assert fields["password"] == "Bearer at-new"
     assert fields["quota_text"] == "积分 12,345"
     assert fields["sandbox_id"] == "sb2"
+    assert fields["last_checkin"] == "已签到 +400", "刷新授权是复合入口，顺带签到"
 
 
 def test_refresh_auth_steps_fail_independently(channel_cls):
-    """三件套任一步失败不阻断其余：token 挂了积分照刷。"""
+    """任一步失败不阻断其余：token 挂了积分/沙箱/签到照常跑。"""
     p = _ready_provider(channel_cls)
     p.expires_at = "0"
 
@@ -708,10 +1109,16 @@ def test_refresh_auth_steps_fail_independently(channel_cls):
     async def ok_sandbox(pp):
         return "sb1", "https://gw/autoclaw-cloud/proxy/sb1"
 
+    async def fake_checkin_fields(pp):
+        return {"last_checkin": "已签到", "last_checkin_status": "2026-09-28|already"}
+
     hook = channel_cls._spec_hooks["refresh_auth"]
-    saved = {name: hook.__globals__.get(name) for name in ("_userapi_json", "_ensure_sandbox")}
+    names = ("_userapi_json", "_ensure_sandbox", "_checkin_fields", "_today_checkin_done")
+    saved = {name: hook.__globals__.get(name) for name in names}
     hook.__globals__["_userapi_json"] = failing_refresh
     hook.__globals__["_ensure_sandbox"] = ok_sandbox
+    hook.__globals__["_checkin_fields"] = fake_checkin_fields
+    hook.__globals__["_today_checkin_done"] = lambda pp: False
     try:
         fields = _run(hook(p, {}))
     finally:
@@ -720,6 +1127,467 @@ def test_refresh_auth_steps_fail_independently(channel_cls):
 
     assert fields["quota_text"] == "积分 7"
     assert fields["sandbox_id"] == "sb1"
+    assert fields["last_checkin"] == "已签到"
+
+
+# ==================== 账号动作（perform_action）====================
+
+def test_account_schema_declares_actions(channel_cls):
+    """account_schema 声明两个独立动作：checkin（徽标，仅手动——refresh_auth 已含签到）
+    与 sync_quota（值，默认每 6 小时调度刷新额度）。manual=True（账号行出手动按钮）。"""
+    schema = channel_cls.account_schema()
+    actions = {a["id"]: a for a in schema["account_actions"]}
+    assert set(actions) == {"checkin", "sync_quota"}
+    assert actions["checkin"]["display"]["badge_field"] == "last_checkin"
+    # refresh_auth 是复合入口（含签到，调度默认每天 10:00），
+    # checkin 动作只做「签到」按钮、不单独调度以免重复打上游。
+    assert actions["checkin"]["default"] == {"enabled": False, "frequency_unit": "daily",
+                                             "frequency_value": 1}
+    assert actions["sync_quota"]["display"]["value_field"] == "quota_text"
+    assert actions["sync_quota"]["default"]["frequency_unit"] == "hours"
+    assert actions["sync_quota"]["default"]["frequency_value"] == 6
+    assert actions["checkin"]["manual"] is True
+    assert actions["sync_quota"]["manual"] is True
+    assert "perform_action" in channel_cls._spec_hooks
+
+
+def test_perform_action_sync_quota_only(channel_cls):
+    """sync_quota 动作只拉积分写 quota_text，不碰签到/沙箱。"""
+    p = _ready_provider(channel_cls)
+    g = channel_cls._spec_hooks["perform_action"].__globals__
+
+    async def fake_ensure_token(pp):
+        return True
+
+    async def fake_points(pp):
+        return 12345
+
+    saved = {name: g.get(name) for name in ("_ensure_access_token", "_fetch_points")}
+    g["_ensure_access_token"] = fake_ensure_token
+    g["_fetch_points"] = fake_points
+    try:
+        fields = _run(channel_cls.perform_account_action(p, "sync_quota", {"password": "t"}, None))
+    finally:
+        for name, fn in saved.items():
+            g[name] = fn
+
+    assert fields == {"quota_text": "积分 12,345"}
+    assert "last_checkin" not in fields
+
+
+def test_perform_action_checkin_once_per_day(channel_cls):
+    """checkin 动作当日只跑一次：第二次执行看到 last_checkin_status 就跳过。"""
+    p = _ready_provider(channel_cls)
+    g = channel_cls._spec_hooks["perform_action"].__globals__
+    calls: list[str] = []
+
+    async def fake_ensure_token(pp):
+        return True
+
+    async def fake_checkin_fields(pp):
+        calls.append(pp.username)
+        fields = {"last_checkin": "已签到", "last_checkin_status": f"{g['_today_key']()}|already"}
+        for k, v in fields.items():
+            setattr(pp, k, v)
+        return fields
+
+    saved = {name: g.get(name) for name in ("_ensure_access_token", "_checkin_fields")}
+    g["_ensure_access_token"] = fake_ensure_token
+    g["_checkin_fields"] = fake_checkin_fields
+    try:
+        fields1 = _run(channel_cls.perform_account_action(p, "checkin", {"password": "t"}, None))
+        fields2 = _run(channel_cls.perform_account_action(p, "checkin", {"password": "t"}, None))
+    finally:
+        for name, fn in saved.items():
+            g[name] = fn
+
+    assert len(calls) == 1                       # 当日第二次不再打上游
+    assert fields1["last_checkin"] == "已签到"
+    assert fields2 == {}                         # 跳过时不覆盖（返回空 dict）
+
+
+def test_perform_action_checkin_fail_sets_error(channel_cls):
+    """签到一个都没成：徽标字段照写，但带 _error（admin 记执行失败、不落库该键）。"""
+    p = _ready_provider(channel_cls)
+    g = channel_cls._spec_hooks["perform_action"].__globals__
+
+    async def fake_ensure_token(pp):
+        return True
+
+    async def fake_checkin_fields(pp):
+        return {"last_checkin": "签到失败", "last_checkin_status": f"{g['_today_key']()}|fail"}
+
+    saved = {name: g.get(name) for name in ("_ensure_access_token", "_checkin_fields")}
+    g["_ensure_access_token"] = fake_ensure_token
+    g["_checkin_fields"] = fake_checkin_fields
+    try:
+        fields = _run(channel_cls.perform_account_action(p, "checkin", {"password": "t"}, None))
+    finally:
+        for name, fn in saved.items():
+            g[name] = fn
+
+    assert fields["last_checkin"] == "签到失败"
+    assert "_error" in fields, "失败必须带 _error 让 admin 记执行结果"
+    assert "last_checkin" in fields and "last_checkin_status" in fields
+
+
+def test_perform_action_unknown_id_raises(channel_cls):
+    p = _ready_provider(channel_cls)
+    with pytest.raises(ValueError):
+        _run(channel_cls.perform_account_action(p, "nope", {"password": "t"}, None))
+
+
+# ==================== 每日签到 ====================
+
+def test_checkin_tasks_match_go():
+    """对齐 checkin.go checkinTasks 的 4 个任务（与 autoclaw_proxy.py 同一份）。"""
+    mod = _module()
+    assert mod.CHECKIN_TASKS == (
+        "daily_signin", "daily_inspiration_center",
+        "newbie_cloud_lobster", "newbie_local_lobster",
+    )
+
+
+def test_task_headers_match_checkin_go(channel_cls):
+    """签到/余额用 commonHeaders 一套：小写 authorization、X-Client-Type: pc、X-Lang: en。
+
+    与 userapi 那套（大写 Authorization + Origin/Referer）**不是同一个**——混用会被上游
+    以 500 task user_id required 或 410000 拒。
+    """
+    mod = _module()
+    p = _make_provider(channel_cls, password="Bearer tok-1")
+    headers = mod._task_headers(p)
+    assert headers["authorization"] == "Bearer tok-1"
+    assert "Authorization" not in headers
+    assert headers["X-Client-Type"] == "pc"
+    assert headers["X-Lang"] == "en"
+    assert headers["X-Auth-Sign"] and headers["X-Auth-Appid"] == mod.APP_ID
+    assert "Accept" not in headers          # checkin.go 显式 delete(Accept)
+    assert "Origin" not in headers and "Referer" not in headers
+
+
+def test_do_checkin_counts_code_zero_as_done(channel_cls):
+    """签到判定口径 = 官方 bundle 的 `ok: code===0`：不抛异常就算该任务已受理。
+
+    data 里有没有 success/already_completed 字段都不影响判定——只看 code（_task_json
+    已把 code!=0 转异常）。这正是「显示成功但其实没签上」的修复点。
+    """
+    mod = _module()
+    p = _make_provider(channel_cls, password="t")
+    seen: list[str] = []
+
+    async def fake_task_json(_p, _method, path, *, json_body=None, params=None):
+        assert path == mod.TASK_COMPLETE_PATH
+        task = json_body["task_id"]
+        seen.append(task)
+        if task == "daily_signin":
+            return {"reward_points": 400}              # 只有分数字段
+        if task == "daily_inspiration_center":
+            return {}                                  # 空 data，也应算已受理
+        if task == "newbie_cloud_lobster":
+            raise mod.HTTPException(status_code=502, detail="boom")
+        return {"points": 0}                           # 别名键、无奖励
+
+    saved = mod._task_json
+    mod._task_json = fake_task_json
+    try:
+        result = _run(mod._do_checkin(p))
+    finally:
+        mod._task_json = saved
+
+    assert result["done"] == 3                         # code==0 的三个全算完成
+    assert result["failed"] == 1
+    assert result["reward"] == 400                     # 只累加 reward_points 别名
+    assert set(result["details"]) == set(seen)
+
+
+def test_do_checkin_task_list_drives_ids(channel_cls):
+    """任务 id 优先取上游 task-list（静态表会过期）；count/unlimited 型跳过。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="t")
+
+    async def fake_task_json(_p, _method, path, *, json_body=None, params=None):
+        if path == mod.TASK_LIST_PATH:
+            # _task_json 已剥掉外层信封，这里返回的就是 data 本体
+            return [
+                {"task_id": "daily_signin", "task_type": "daily", "client_triggered": True},
+                {"task_id": "invite_friends", "task_type": "count"},
+                {"task_id": "upgrade_pc_app", "task_type": "unlimited"},
+                {"task_id": "daily_inspiration_center", "task_type": "daily", "client_triggered": True},
+            ]
+        raise AssertionError(path)
+
+    saved = mod._task_json
+    mod._task_json = fake_task_json
+    try:
+        ids = _run(mod._checkin_task_ids(p))
+    finally:
+        mod._task_json = saved
+
+    assert ids == ["daily_signin", "daily_inspiration_center"]
+
+
+def test_checkin_task_ids_falls_back_to_static_on_error(channel_cls):
+    """拉不到 task-list 时回退静态表，不影响签到本身。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="t")
+
+    async def boom(_p, _method, path, **kw):
+        raise mod.HTTPException(status_code=502, detail="task-list 挂了")
+
+    saved = mod._task_json
+    mod._task_json = boom
+    try:
+        ids = _run(mod._checkin_task_ids(p))
+    finally:
+        mod._task_json = saved
+
+    assert ids == list(mod.CHECKIN_TASKS)
+
+
+def test_checkin_fields_write_badge_and_status(channel_cls):
+    """签到字段：last_checkin 徽标 + last_checkin_status 当日幂等标记。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="t")
+
+    async def fake_do_checkin(_p):
+        return {"reward": 400, "done": 2, "failed": 0, "details": {}}
+
+    saved = mod._do_checkin
+    mod._do_checkin = fake_do_checkin
+    try:
+        fields = _run(mod._checkin_fields(p))
+        done = mod._today_checkin_done(p)
+    finally:
+        mod._do_checkin = saved
+
+    assert fields["last_checkin"] == "已签到 +400"
+    assert fields["last_checkin_status"].startswith(mod._today_key() + "|ok|+400")
+    assert done is True          # 签完当日幂等判断即为真 → 不再重签
+
+
+def test_today_checkin_done_rejects_stale_and_failed(channel_cls):
+    """当日幂等判断：昨天的记录 / 今天的失败记录都不算已签。"""
+    mod = _module()
+    g = channel_cls._spec_hooks["refresh_auth"].__globals__
+    today = mod._today_key()
+    p = _make_provider(channel_cls, password="t")
+
+    p.last_checkin_status = "2020-01-01|ok|+400"
+    assert g["_today_checkin_done"](p) is False
+    p.last_checkin_status = f"{today}|fail"
+    assert g["_today_checkin_done"](p) is False
+    p.last_checkin_status = f"{today}|ok|+400"
+    assert g["_today_checkin_done"](p) is True
+    p.last_checkin_status = f"{today}|already"
+    assert g["_today_checkin_done"](p) is True
+
+
+def test_badge_text_variants(channel_cls):
+    mod = _module()
+    g = channel_cls._spec_hooks["refresh_auth"].__globals__
+    assert g["_badge_text"]("ok", 400) == "已签到 +400"
+    assert g["_badge_text"]("already", None) == "已签到"
+    assert g["_badge_text"]("session_dead", None) == "签到失败 (会话)"
+    assert g["_badge_text"]("fail", None) == "签到失败"
+
+
+def test_refresh_auth_checkin_skipped_when_already_done(channel_cls):
+    """refresh_auth 复合入口里签到当日只跑一次：第二次刷新看到 last_checkin_status 就跳过。"""
+    p = _ready_provider(channel_cls)
+    p.expires_at = "0"
+
+    async def fake_userapi_json(pp, method, path, **kw):
+        if path.endswith("/userapi/v1/refresh"):
+            return {"access_token": "Bearer at-new", "refresh_token": "rt-new"}
+        if path.endswith("/agent-assetmgr/api/v2/wallets"):
+            return {"total_balance": "12345"}
+        raise AssertionError(f"unexpected path {path}")
+
+    calls: list[str] = []
+
+    async def fake_task_json(_p, _method, path, *, json_body=None, params=None):
+        calls.append(json_body["task_id"])
+        return {"already_completed": True}
+
+    async def ok_sandbox(pp):
+        return "sb1", "https://gw/autoclaw-cloud/proxy/sb1"
+
+    g = channel_cls._spec_hooks["refresh_auth"].__globals__
+    saved = {n: g.get(n) for n in ("_userapi_json", "_task_json", "_ensure_sandbox")}
+    g["_userapi_json"] = fake_userapi_json
+    g["_task_json"] = fake_task_json
+    g["_ensure_sandbox"] = ok_sandbox
+    try:
+        fields1 = _run(channel_cls._spec_hooks["refresh_auth"](p, {"password": "Bearer at-old"}))
+        first = len(calls)
+        fields2 = _run(channel_cls._spec_hooks["refresh_auth"](p, {"password": "Bearer at-old"}))
+    finally:
+        for n, fn in saved.items():
+            g[n] = fn
+
+    assert first == len(_module().CHECKIN_TASKS)   # 第一轮全跑
+    assert len(calls) == first                      # 第二轮一次都不再打（当日已签）
+    assert fields1["last_checkin"] == "已签到"       # 全部 already → 无得分
+    assert "last_checkin" not in fields2            # 跳过时不覆盖
+
+
+# ==================== 沙箱并发去重（对齐官方 in-flight 去重）====================
+
+def test_relay_proxy_base_of_sandbox_endpoint():
+    """签名辅助：sandbox_endpoint（wss 带 query）→ proxy base。"""
+    mod = _module()
+    assert mod._relay_proxy_base(
+        "wss://gw/autoclaw-cloud/ws?sandbox_id=sb-new", "sb-new"
+    ) == "https://gw/autoclaw-cloud/proxy/sb-new"
+
+
+def test_ensure_sandbox_concurrent_creates_only_one(channel_cls):
+    """缓存未命中时并发调用只 list/apply 一次——否则会建出多个沙箱（各自独立计费资源）。
+
+    官方客户端用 promise 缓存（web bundle 的 he / Ce）防这个；这里用按账号的
+    asyncio.Lock 等价实现（双检锁：等锁期间缓存已被前一个请求填好就直接返回）。
+
+    用 _module() 的**独立命名空间**跑：channel_cls 的共享命名空间会被别的用例
+    （_patch_namespace 只覆盖不还原）污染成 noop。
+    """
+    mod = _module()
+    p = _make_provider(channel_cls, password="t")     # 无 sandbox 缓存 → 走网络路径
+    calls: list[str] = []
+
+    async def fake_userapi_json(pp, method, path, **kw):
+        calls.append(f"{method} {path}")
+        if path.endswith("/sandbox/apply"):
+            await asyncio.sleep(0.05)                  # 放大并发窗口，逼出重复申请
+            return {}
+        if path.endswith("/sandbox/list"):
+            if any("apply" in c for c in calls):
+                return {"sandbox_list": [{
+                    "sandbox_id": "sb-new", "end_timestamp": int(time.time()) + 3600,
+                    "sandbox_endpoint": "wss://gw/autoclaw-cloud/ws?sandbox_id=sb-new"}]}
+            return {"sandbox_list": []}
+        raise AssertionError(path)
+
+    saved = mod._userapi_json
+    mod._userapi_json = fake_userapi_json
+    try:
+        async def run_all():
+            return await asyncio.gather(*[mod._ensure_sandbox(p) for _ in range(5)])
+        results = _run(run_all())
+    finally:
+        mod._userapi_json = saved
+
+    assert all(r == ("sb-new", "https://gw/autoclaw-cloud/proxy/sb-new") for r in results)
+    assert sum(1 for c in calls if "apply" in c) == 1          # 只申请一次
+    # 列表只由第一个请求拉（apply 前后各一次）——其余 4 个等锁后命中缓存直接返回
+    assert sum(1 for c in calls if c.endswith(mod.SANDBOX_LIST_PATH)) == 2
+
+
+def test_ensure_sandbox_applies_official_default_name(channel_cls):
+    """apply 的沙箱名用官方同款（bundle 常量 Ot / 桌面端 Ih，实测建出来就是 "AutoClaw"）。"""
+    mod = _module()
+    assert mod.DEFAULT_SANDBOX_NAME == "AutoClaw"
+
+    p = _make_provider(channel_cls, password="t")
+    bodies: list[dict] = []
+
+    async def fake_userapi_json(pp, method, path, **kw):
+        if path.endswith("/sandbox/apply"):
+            bodies.append(kw.get("json_body") or {})
+            return {}
+        if path.endswith("/sandbox/list"):
+            return {"sandbox_list": [{
+                "sandbox_id": "sb-a", "end_timestamp": int(time.time()) + 3600,
+                "sandbox_endpoint": "wss://gw/autoclaw-cloud/ws?sandbox_id=sb-a"}]} if bodies else {"sandbox_list": []}
+        raise AssertionError(path)
+
+    saved = mod._userapi_json
+    mod._userapi_json = fake_userapi_json
+    try:
+        _run(mod._ensure_sandbox(p))
+    finally:
+        mod._userapi_json = saved
+
+    assert bodies == [{"sandbox_name": "AutoClaw"}]
+    assert p.sandbox_id == "sb-a"
+
+
+def test_wake_sandbox_dedups_within_window(channel_cls):
+    """60 秒窗口内的重复 wake（含同刻并发）只真发一次。
+
+    官方客户端每请求都 wake（保活 10 分钟）；我们做短窗去重——省往返，也避免并发重复
+    wake 撞上游的 apply_business_busy_cooldown（实测放大 403 比例）。
+    """
+    mod = _module()
+    p = _make_provider(channel_cls, password="t")
+    posts: list[dict] = []
+
+    async def fake_relay_json(pp, method, url, **kw):
+        posts.append({"method": method, "url": url, "json": kw.get("json_body")})
+        return {}
+
+    saved = mod._relay_json
+    mod._relay_json = fake_relay_json
+    mod._WAKE_AT.clear()
+    try:
+        async def run_all():
+            await asyncio.gather(*[mod._wake_sandbox(p, "sb1", "https://gw/autoclaw-cloud")
+                                   for _ in range(5)])
+        _run(run_all())
+        assert len(posts) == 1
+        assert posts[0]["url"] == "https://gw/autoclaw-cloud/v1/sandboxes/sb1/wake"
+        # body 是纯控制面参数，不含任何聊天内容
+        assert set(posts[0]["json"]) == {"access_hold_ms", "reason", "apply_business_busy_cooldown"}
+        assert posts[0]["json"]["access_hold_ms"] == mod.WAKE_HOLD_MS
+
+        # 窗口内的后续调用（新事件循环也一样）继续跳过
+        _run(mod._wake_sandbox(p, "sb1", "https://gw/autoclaw-cloud"))
+        assert len(posts) == 1
+    finally:
+        mod._relay_json = saved
+        mod._WAKE_AT.clear()
+
+
+def test_wake_sandbox_sends_again_after_window(channel_cls):
+    """窗口过期后重新真发；wake 失败不占用窗口（下一个请求能重试）。"""
+    mod = _module()
+    p = _make_provider(channel_cls, password="t")
+    posts: list[str] = []
+    fail_next = False
+
+    async def fake_relay_json(pp, method, url, **kw):
+        nonlocal fail_next
+        posts.append(url)
+        if fail_next:
+            fail_next = False
+            raise mod.HTTPException(status_code=502, detail="wake boom")
+        return {}
+
+    saved = mod._relay_json
+    mod._relay_json = fake_relay_json
+    mod._WAKE_AT.clear()
+    try:
+        _run(mod._wake_sandbox(p, "sb1", "https://gw/autoclaw-cloud"))
+        assert len(posts) == 1
+
+        # 失败不记窗口：先清窗口再让 wake 失败 → 下一个请求照常重试
+        mod._WAKE_AT.clear()
+        fail_next = True
+        with pytest.raises(HTTPException):
+            _run(mod._wake_sandbox(p, "sb1", "https://gw/autoclaw-cloud"))
+        assert len(posts) == 2
+        assert mod._WAKE_AT == {}          # 失败没写窗口
+        _run(mod._wake_sandbox(p, "sb1", "https://gw/autoclaw-cloud"))
+        assert len(posts) == 3
+
+        # 把窗口拨到过期 → 允许再发
+        for k in list(mod._WAKE_AT):
+            mod._WAKE_AT[k] -= mod.WAKE_DEDUP_SECONDS + 1
+        _run(mod._wake_sandbox(p, "sb1", "https://gw/autoclaw-cloud"))
+        assert len(posts) == 4
+    finally:
+        mod._relay_json = saved
+        mod._WAKE_AT.clear()
 
 
 # ==================== fetch_models ====================
@@ -817,16 +1685,76 @@ def test_begin_device_flow_global_waits_for_credential_paste(channel_cls):
     assert result["poll_params"]["region"] == "global"
     # 用户要先在官网登录才能拿到 localStorage，现在有完成路径了，返回它不再误导
     assert "autoclaw.z.ai" in result["auth_url"]
-    # 文案必须给可照抄的动作：一句全浏览器可用的 JS（prompt 弹框，不是 copy()）+ 三步指引
+    # 文案必须给可照抄的动作：一句全浏览器可用的 JS + 三步指引
     msg = result["message"]
-    # 真形态：access token 只在 autoclaw.web.loginInfo 这个 JSON 字符串里（**没有**顶层
-    # autoclaw.web.accessToken 键），所以那句 JS 必须解 loginInfo 一起拼，只挑平铺键会漏 token
-    assert "prompt(" in msg
-    assert "loginInfo" in msg
-    assert "autoclaw.web." in msg
-    # copy() 只在 Chrome DevTools 控制台有，Firefox/地址栏/书签里会 ReferenceError，不能用
-    assert "copy(" not in msg
+    # 真形态（对照 2026-09-19 live bundle）：access token 平铺在 autoclaw.web.authToken，
+    # loginInfo/userInfo 是可能缺失/非法的 JSON 字符串，取不到时要能诊断（曾被反馈
+    # 「执行显示的是空」看不出原因）。
+    # 交付方式**不能是 prompt()**：浏览器一旦勾过「阻止此页面创建更多对话框」，prompt 会
+    # 静默失败只返回 undefined（实测症状：console 只有 undefined、什么都不显示）。
+    # 改为浮层 textarea + execCommand('copy') + console.log 三保险。
+    assert "prompt(" not in msg                                 # 不再用会被静默屏蔽的 prompt
+    assert "createElement('textarea')" in msg                   # 浮层文本框交付
+    assert "execCommand('copy')" in msg                         # 自动复制到剪贴板
+    assert "console.log(" in msg                                # console 同步打印（prompt 被屏蔽也能拿到）
+    assert "localStorage" in msg and "sessionStorage" in msg    # 两种存储都扫（token 可能在任一）
+    assert "没找到凭证" in msg                                   # 空状态诊断，而非静默全空
+    assert "origin=" in msg and "localStorage 键：" in msg       # 诊断输出 origin + 全部键名
+    # 裸 copy() 只在 Chrome DevTools 控制台有，Firefox/地址栏/书签里会 ReferenceError，不能用
+    assert "copy()" not in msg
     assert result["replay_hint"] and result["replay_label"] and result["polling_hint"]
+
+
+def test_credential_copy_js_roundtrip(channel_cls):
+    """_CREDENTIAL_COPY_JS 的输出必须是服务端 _credential_doc_from_payload 直接认的形态。
+
+    用 Node 把 spec 里的 JS 真执行一遍（localStorage 按 live bundle 的键名），浮层输出
+    反喂给服务端识别链路：能建号才算闭环。
+    """
+    mod = _module()
+    js = getattr(mod, "_CREDENTIAL_COPY_JS", "")
+    assert js, "spec 未定义 _CREDENTIAL_COPY_JS"
+    # 静态保真：JS 必须是单行（多行会被 admin 前端折成一行，用户复制到的就是断的）
+    assert "\n" not in js
+    node = shutil.which("node") or shutil.which("node.exe")
+    if not node:
+        pytest.skip("无 node：跳过 JS 实执行")
+    store = json.dumps({
+        "autoclaw.web.authToken": "Bearer eyJ.WEB",
+        "autoclaw.web.refreshToken": "eyJ.REF",
+        "autoclaw.web.deviceId": "646d6b4c-96a4",
+        "autoclaw.web.userId": "1487730d",
+        "autoclaw.web.userInfo": json.dumps({"user_id": "1487730d", "user_name": "wu xin"}),
+        "autoclaw.web.loginInfo": json.dumps({
+            "access_token": "Bearer eyJ.LOGIN", "refresh_token": "eyJ.REF",
+            "user_id": "1487730d", "user_name": "wu xin"}),
+        "autoclaw.web.runtimeSandboxId": "sb_23a6",
+    })
+    # 不用 prompt 交付（浏览器一旦勾过「阻止此页面创建更多对话框」，prompt 会静默失败只返回
+    # undefined——实测症状就是 console 只有 undefined）；JS 走浮层 textarea + execCommand('copy')。
+    # document / console 需要桩掉，IIFE 的返回值就是交付内容。
+    script = (
+        "const S=" + store + ";const ks=Object.keys(S);"
+        "const L=new Proxy({length:ks.length,key:i=>ks[i]??null,getItem:k=>S[k]??null},"
+        "{get(t,k){if(k in t)return t[k];return S[k]}});"
+        "const location={origin:'https://autoclaw.z.ai'};"
+        "const localStorage=L;const sessionStorage={length:0,key:()=>null,getItem:()=>null};"
+        "const document={createElement:()=>({value:'',style:{},focus(){},select(){},"
+        "set onkeydown(f){}}),body:{appendChild(){}},execCommand:()=>true};"
+        "const console={log(){}};"
+        "process.stdout.write(String(" + js + "))"
+    )
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True,
+                         encoding="utf-8", timeout=30)
+    assert out.returncode == 0, out.stderr
+    doc = mod._credential_doc_from_payload(out.stdout.strip())
+    # JS 在客户端就定死优先级：accessToken 取 authToken（网页每次 refresh 都刷新、
+    # 网页自己调 userapi 用的就是它），loginInfo.access_token 只是登录那一刻的快照、
+    # 网页 token 刷新过后就陈旧。故两个键都在时，结果必须是 authToken 那个。
+    assert doc["accessToken"] == "Bearer eyJ.WEB"
+    assert doc["refreshToken"] == "eyJ.REF"
+    assert doc["deviceId"] == "646d6b4c-96a4"
+    assert doc["userName"] == "wu xin"
 
 
 def test_begin_device_flow_global_never_sends_sms_even_with_phone(channel_cls):
@@ -1115,6 +2043,10 @@ def test_credential_payload_from_flat_namespaced_keys(channel_cls):
     （``oauthNavigateUri.zai.<JWT>``）。识别必须**合并**各处字段，不能「找到第一个含
     token 的对象就返回」（那样只会拿到 loginInfo、丢掉 deviceId，device_id 被自动重生成
     会导致 refresh 续不上期）。
+
+    另：``authToken``（顶层平铺，网页每次调 userapi 都带它、每次 refresh 都刷新）必须
+    **压过** ``loginInfo.access_token``（只在登录响应里写一次，网页刷新过就陈旧）。
+    用陈旧 token 建号会稳定 401 / code=410000（"This feature is available after logging in"）。
     """
     mod = _module()
     payload = json.dumps({
@@ -1136,8 +2068,9 @@ def test_credential_payload_from_flat_namespaced_keys(channel_cls):
         "autoclaw.web.riskAgreementRead": "1",
     })
     doc = mod._credential_doc_from_payload(payload)
-    # access token 取自 loginInfo（STRICT 档）；authToken 是网页会话 token，不抢首选
-    assert doc["accessToken"] == "Bearer at-LOGIN"
+    # access token 取自 authToken（网页会话 token，实时且网页自己就用它）；
+    # loginInfo.access_token 是登录那一刻的快照，refresh 后陈旧，不抢首选
+    assert doc["accessToken"] == "Bearer auth-WEB"
     # refreshToken/deviceId/userId 取自顶层平铺键（先到先得，平铺键是实时状态）
     assert doc["refreshToken"] == "Bearer rt-FLAT"
     assert doc["deviceId"] == "646d6b4c-96a4-4138-bd5b-3ba159fc836a"
@@ -1151,8 +2084,10 @@ def test_credential_payload_from_flat_namespaced_keys(channel_cls):
     # 端到端：合并出的 doc 真能建号，且 deviceId 用的是 dump 里的（refresh 才续得上期）
     p = _make_provider(channel_cls, password="")
     assert mod._apply_credential_doc(p, doc) is True
-    assert p.password == "Bearer at-LOGIN"
-    assert p.refresh_token == "Bearer rt-FLAT"
+    assert p.password == "Bearer auth-WEB"
+    # refresh_token 落库前统一剥掉 Bearer：上游 refresh 请求要的是裸 token，
+    # 带着前缀会稳定续期失败（dump 里 refreshToken 的写法不统一）
+    assert p.refresh_token == "rt-FLAT"
     assert p.device_id == "646d6b4c-96a4-4138-bd5b-3ba159fc836a"
     assert p.user_name == "wu xin"
 
@@ -1161,7 +2096,7 @@ def test_credential_payload_from_flat_namespaced_keys(channel_cls):
 
 
 def test_credential_payload_auth_token_fallback(channel_cls):
-    """dump 里没有 loginInfo、只有 authToken → 兜底档补位，不至于建不出号。"""
+    """dump 里没有 loginInfo、只有 authToken → 照样建号（authToken 本就是首选）。"""
     mod = _module()
     doc = mod._credential_doc_from_payload(json.dumps({
         "autoclaw.web.authToken": "Bearer auth-ONLY",
@@ -1169,6 +2104,21 @@ def test_credential_payload_auth_token_fallback(channel_cls):
     }))
     assert doc["accessToken"] == "Bearer auth-ONLY"
     assert doc["deviceId"] == "dev-2"
+
+
+def test_credential_payload_auth_token_wins_regardless_of_key_order():
+    """authToken 覆盖 loginInfo 不依赖 JSON 键序（平铺键可能排在任何位置）。
+
+    只靠别名表「先到先得」时，loginInfo 排在 authToken 前面就会赢——而陈旧 token
+    正是 410000 的根因。故必须单独再扫一趟 authToken 并覆盖。
+    """
+    mod = _module()
+    # authToken 排在 loginInfo **之后**（先到先得会把陈旧的 loginInfo 留下）
+    payload = json.dumps({
+        "autoclaw.web.loginInfo": json.dumps({"access_token": "Bearer at-STALE"}),
+        "autoclaw.web.authToken": "Bearer auth-FRESH",
+    })
+    assert mod._credential_doc_from_payload(payload)["accessToken"] == "Bearer auth-FRESH"
 
 
 
@@ -1234,6 +2184,91 @@ def test_loopback_credential_paste_without_session_marker_still_claimed(channel_
     outcome = _run(channel_cls.handle_loopback_callback(p, {}, {}, raw))
     assert outcome["status"] == "authorized"
     assert outcome["account_data"]["password"] == "Bearer at-x"
+
+
+def test_loopback_credential_paste_takes_region_from_session(channel_cls):
+    """凭证块（尤其 localStorage dump）**不含** region 键 → 用会话发起时选的区域补位。
+
+    缺 region 会落到 schema 默认 cn，把海外 token 送到大陆域名 → 稳定 410000。
+    """
+    p = _ready_provider(channel_cls)
+    p.region = "cn"      # 会话未改过区域（schema 默认）
+    raw = json.dumps({"accessToken": "Bearer at-gl", "refreshToken": "rt-gl"})
+    outcome = _run(channel_cls.handle_loopback_callback(
+        p, {}, {"login": "credential", "region": "global"}, raw))
+    assert outcome["status"] == "authorized"
+    assert outcome["account_data"]["region"] == "global"
+
+
+def test_loopback_credential_paste_keeps_region_from_credential(channel_cls):
+    """凭证里明确写了 region → 不被会话值覆盖（凭证是更权威的自我描述）。"""
+    p = _ready_provider(channel_cls)
+    p.region = "global"
+    raw = json.dumps({"accessToken": "Bearer at-cn", "refreshToken": "rt-cn",
+                      "region": "cn"})
+    outcome = _run(channel_cls.handle_loopback_callback(
+        p, {}, {"login": "credential", "region": "global"}, raw))
+    assert outcome["account_data"]["region"] == "cn"
+
+
+def test_loopback_credential_paste_fills_sandbox(channel_cls):
+    """凭证块没有 sandbox_id/endpoint → 补投时拉一次沙箱列表回填，别让账号裸奔。
+
+    没有沙箱的账号聊天会去拼一个空 proxy base，表现为「授权成功但一发消息就报错」。
+    """
+    p = _ready_provider(channel_cls)
+    p.sandbox_id = ""
+    p.sandbox_endpoint = ""
+    p.sandbox_end_ts = ""
+    p.region = "global"
+
+    async def fake_userapi_json(pp, method, path, **kw):
+        assert path.endswith("/agentdr/v2/assistant/sandbox/list")
+        return {"sandbox_list": [{
+            "sandbox_id": "sb-gl", "end_timestamp": int(time.time()) + 3600,
+            "sandbox_endpoint": "wss://gw.example.com/autoclaw-cloud/ws?sandbox_id=sb-gl",
+        }]}
+
+    hook = channel_cls._spec_hooks.get("stream_chat") or channel_cls._spec_hooks.get("refresh_auth")
+    saved = hook.__globals__["_userapi_json"]
+    hook.__globals__["_userapi_json"] = fake_userapi_json
+    try:
+        raw = json.dumps({"accessToken": "Bearer at-gl", "refreshToken": "rt-gl"})
+        outcome = _run(channel_cls.handle_loopback_callback(
+            p, {}, {"login": "credential", "region": "global"}, raw))
+    finally:
+        hook.__globals__["_userapi_json"] = saved
+
+    assert outcome["status"] == "authorized"
+    account = outcome["account_data"]
+    assert account["sandbox_id"] == "sb-gl"
+    assert account["sandbox_endpoint"] == "https://gw.example.com/autoclaw-cloud/proxy/sb-gl"
+
+
+def test_loopback_credential_paste_sandbox_failure_still_authorizes(channel_cls):
+    """沙箱拉取失败不该让整次授权失败——请求路径会再试，账号先建出来。"""
+    p = _ready_provider(channel_cls)
+    p.sandbox_id = ""
+    p.sandbox_endpoint = ""
+    p.sandbox_end_ts = ""
+    p.region = "global"
+
+    async def failing_userapi_json(pp, method, path, **kw):
+        raise HTTPException(502, "沙箱服务抖动")
+
+    hook = channel_cls._spec_hooks.get("stream_chat") or channel_cls._spec_hooks.get("refresh_auth")
+    saved = hook.__globals__["_userapi_json"]
+    hook.__globals__["_userapi_json"] = failing_userapi_json
+    try:
+        raw = json.dumps({"accessToken": "Bearer at-gl", "refreshToken": "rt-gl"})
+        outcome = _run(channel_cls.handle_loopback_callback(
+            p, {}, {"login": "credential", "region": "global"}, raw))
+    finally:
+        hook.__globals__["_userapi_json"] = saved
+
+    assert outcome["status"] == "authorized"
+    assert outcome["account_data"]["password"] == "Bearer at-gl"
+    assert outcome["account_data"]["sandbox_id"] == ""
 
 
 def test_loopback_credential_session_rejects_unrecognized_paste(channel_cls):

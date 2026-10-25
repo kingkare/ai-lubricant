@@ -21,12 +21,27 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from loguru import logger
 
-from agent.context_manager import compress_history, serialize_tool_result, trim_messages
+from agent.config import DEFAULT_MAX_TURNS
+from agent.context_manager import (
+    TRIGGER_MULTIPLIER,
+    _estimate_chars,
+    compress_history,
+    serialize_tool_result,
+    trim_messages_async,
+)
 from agent.hooks import hooks
+from agent.repeat_guard import RepeatGuard
 
 _NETWORK_EXC = (aiohttp.ClientError, asyncio.TimeoutError)
 _RETRY_BACKOFF_BASE_MS = 1000
 _RETRY_BACKOFF_CAP_MS = 8000
+
+# 超限紧急压缩的最大次数（每个 agent 轮次独立计数）。压缩是「缩历史后重发」，
+# 每压一次体积显著变小，1~2 次足够；给 2 次是为了应对「一次压缩仍不够」的极端
+# 长历史，同时硬上限防止压缩无效时无限循环。
+_OVERFLOW_MAX_COMPACTS = 2
+# 为超限压缩重试额外预留的循环次数（每次压缩重发占一个 attempt）。
+_OVERFLOW_RETRY_EXTRA = _OVERFLOW_MAX_COMPACTS
 
 
 def _backoff_delay_ms(attempt: int) -> int:
@@ -36,13 +51,13 @@ def _backoff_delay_ms(attempt: int) -> int:
 # agent 层 429 退避重试：仅这些业务码重试（与 main.py:_RETRYABLE_CODES 对齐，
 # 本地定义避免 import main 形成环）。配置类 no_available_account 不在内 →
 # 不重试（白名单/禁用，重试无意义），直接抛交手动重试。
+# 网关已删 upstream_exception/incomplete_response 两个对外码（上游瞬时故障与空响应
+# 都耗尽后归 retry_exhausted），这里同步移除，保留 retry_exhausted 承接退避重试。
 _RETRYABLE_429_CODES = {
     "rate_limit_exceeded",
     "concurrent_limit_exceeded",
     "service_busy",
     "retry_exhausted",
-    "incomplete_response",
-    "upstream_exception",
     "api_key_rate_limit_exceeded",
     "api_key_concurrent_limit_exceeded",
 }
@@ -82,6 +97,74 @@ def _is_retryable_429(exc: BaseException) -> bool:
     return bool(code) and code in _RETRYABLE_429_CODES
 
 
+# 网关「上下文/输入超限」的对外业务码（与 main.py TERMINAL_ERROR_KEYS 及
+# retry_policy 的 canonical code 对齐）。命中即代表：重发同一个请求必然再超，
+# 唯一有用的动作是压缩历史后重发，而不是退避重试或直接判失败。
+_OVERFLOW_CODES = {
+    "context_too_large",
+    "context_length_exceeded",
+    "prompt_too_long",
+    "input_too_long",
+    "model_context_limit",
+    "max_tokens_exceeded",
+}
+# 无 code 时的文案锚点：网关把上游超限文案归一成固定英文，这些子串（大小写不敏感）
+# 就是触发器。与 retry_policy 的 message 表同源——那张表的文案必须保锚点。
+_OVERFLOW_TEXT_ANCHORS = (
+    "prompt is too long",
+    "input is too long for requested model",
+    "context window",
+    "input length and `max_tokens` exceed context limit",
+    "exceeds the context window",
+    "上下文超限",
+    "输入太长",
+    "对话过长",
+)
+
+
+def _overflow_error_code(exc: BaseException) -> str | None:
+    """错误是否是上下文/输入超限；是则返回其业务 code，否则 None。
+
+    两条路径都认：GatewayLLMBridge 直连 dispatch_entry 抛真 HTTPException（detail 是
+    ``{"error":{...}}`` 信封，code 在 error.code）；HTTP 路径抛 _LLMHttpError（只有
+    status_code + message 文本）。无 code 时退化到文案锚点判定——网关把上游超限文案
+    归一成固定英文，那些子串就是触发器（与 retry_policy 的 message 表同源）。
+    """
+    detail = getattr(exc, "detail", None)
+    message = ""
+    if isinstance(detail, dict):
+        err = detail.get("error")
+        if isinstance(err, dict):
+            code = str(err.get("code") or "").lower()
+            if code in _OVERFLOW_CODES:
+                return code
+            message = str(err.get("message") or "")
+            if err.get("compact") is True or err.get("suggested_action") == "compact":
+                return "context_too_large"
+        else:
+            code = str(detail.get("code") or detail.get("kind") or "").lower()
+            if code in _OVERFLOW_CODES:
+                return code
+            message = str(detail.get("message") or "")
+        # 出口层给的机器可读压缩信号（detail 平铺形态）：比文案更可靠，不依赖语种。
+        if detail.get("compact") is True or detail.get("suggested_action") == "compact":
+            return "context_too_large"
+    else:
+        code = str(getattr(exc, "code", "") or "").lower()
+        if code in _OVERFLOW_CODES:
+            return code
+        message = str(detail) if detail is not None else str(exc)
+
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    lowered = f"{message} {exc}".lower()
+    for anchor in _OVERFLOW_TEXT_ANCHORS:
+        if anchor in lowered:
+            return "context_too_large"
+    return None
+
+
 
 # 工具执行后若未显式给出 next_prompt，用此默认提示把工具结果喂回 LLM，
 # 让其在下一轮基于结果继续或给出最终回答。通用 ToolRegistry 工具不会主动
@@ -93,10 +176,63 @@ _DEFAULT_CONTINUE_PROMPT = (
     "如果任务已经完成，请直接给出最终回答（不要再调用工具）。"
 )
 
-# 连续空响应 / 连续 max_tokens 截断的容忍上限，超过则以 ERROR 收尾而不是
-# 假装任务完成或一直 continue 到 max_turns。
-_MAX_CONSECUTIVE_EMPTY = 3
+# 连续 max_tokens 截断的容忍上限，超过则以 ERROR 收尾而不是一直 continue 到
+# max_turns。（空响应三振已删：平台/网关层已拦空响应，且「只有思考内容」的回复
+# 会被这里判为空而被误杀——思考是真实输出，不能当空响应回收。）
 _MAX_CONSECUTIVE_TRUNCATED = 3
+
+# 轮次额度将尽的提前量（还剩几轮时开始提醒）。到 max_turns 会无预告地强制退出，
+# 长任务在半路被砍掉时模型来不及收口——提前几轮告诉它「总结成果、给出最终回答」，
+# 退出时的最后一条回复才是完整的交付物而不是半截中间态。
+_TURNS_REMAINING_WARNING = 5
+
+# Turn-budget-exhaustion warning folded into next_prompt. In English: agent
+# prompts/SOPs are English (中文只作沟通示例)。
+_TURNS_REMAINING_PROMPT = (
+    "[SYSTEM] Turn budget warning: only {remaining} of {max_turns} turns left. "
+    "Wrap up now: finish or safely pause the current step, then summarize what "
+    "was completed, what remains, and any artifacts produced. Do NOT start new "
+    "multi-turn work; deliver your final answer within the remaining turns."
+)
+
+# Instruction handed to the summarizer client. Kept separate from the per-message
+# transcript built in context_manager so the policy lives next to the loop.
+_SUMMARY_SYSTEM = (
+    "You compress an agent's earlier conversation into a dense factual note so a "
+    "continuing agent keeps the context. Preserve goals, decisions, exact file "
+    "paths, commands and their outcomes, and unresolved blockers. Terse bullets, "
+    "no narration, nothing invented. ~300 words."
+)
+
+
+def _make_summarizer(client):
+    """Bind a one-shot summarizer callback to the active LLM client.
+
+    Uses the same client the loop drives, so a conversation routed across
+    channels summarizes on whatever upstream currently serves it. Returns an
+    async ``transcript -> summary`` callable, or ``None`` when the client has no
+    ``chat`` (some test stubs only expose ``stream_chat``) — ``None`` here just
+    falls through to the plain GA trim.
+    """
+    chat = getattr(client, "chat", None)
+    if chat is None:
+        return None
+
+    async def _summarize(transcript: str) -> str:
+        resp = await chat(
+            [
+                {"role": "system", "content": _SUMMARY_SYSTEM},
+                {"role": "user", "content": transcript},
+            ],
+            tools=None,
+        )
+        content = getattr(resp, "content", "") or ""
+        if not content:
+            raw = getattr(resp, "raw", None)
+            if isinstance(raw, dict):
+                content = str(raw.get("content") or "")
+        return content
+    return _summarize
 
 
 @dataclass
@@ -107,7 +243,7 @@ class StepOutcome:
 
 
 class BaseHandler:
-    def __init__(self, tools_registry, max_turns: int = 40):
+    def __init__(self, tools_registry, max_turns: int = DEFAULT_MAX_TURNS):
         self.max_turns = max_turns
         self.tools_registry = tools_registry
         self.current_turn = 0
@@ -120,9 +256,14 @@ class BaseHandler:
         self.related_files: list[str] = []
         # History info for summary tracking
         self.history_info: list[str] = []
-        # Consecutive empty / truncated response counters (three-strike guards)
-        self._consecutive_empty: int = 0
+        # Consecutive max_tokens-truncated counter (three-strike guard). The
+        # empty-response strike was removed: the platform/gateway already drops
+        # empty completions, and a reasoning-only reply is real output, not empty.
         self._consecutive_truncated: int = 0
+        # Per-run repeat-tool-call counter (dsh repeat-tool-reminder). Lives on
+        # the handler, which is rebuilt per run_task, so a fresh human request
+        # starts from zero without an explicit reset.
+        self.repeat_guard = RepeatGuard()
 
     async def dispatch(
         self,
@@ -325,7 +466,7 @@ async def agent_runner_loop(
     user_input: str,
     handler: BaseHandler,
     tools_schema: list[dict],
-    max_turns: int = 40,
+    max_turns: int = DEFAULT_MAX_TURNS,
     verbose: bool = True,
     yield_info: bool = False,
     initial_user_content: str | None = None,
@@ -333,6 +474,59 @@ async def agent_runner_loop(
     initial_messages: list[dict] | None = None,
     context_window: int = 90000,
     on_tool_batch: Callable[[list[dict]], Awaitable[None]] | None = None,
+    auto_compact: bool = True,
+):
+    """Core agent loop: LLM → tools → repeat.
+
+    Thin wrapper over :func:`_agent_runner_loop_impl` that guarantees background
+    jobs are torn down on every exit path — a normal finish, ``max_turns``, an
+    early ``break`` by the consumer (which closes this generator), or an
+    exception. Without this, a ``code_run(background=true)`` process would
+    silently outlive the run that started it.
+    """
+    try:
+        async for item in _agent_runner_loop_impl(
+            client,
+            system_prompt,
+            user_input,
+            handler,
+            tools_schema,
+            max_turns=max_turns,
+            verbose=verbose,
+            yield_info=yield_info,
+            initial_user_content=initial_user_content,
+            on_event=on_event,
+            initial_messages=initial_messages,
+            context_window=context_window,
+            on_tool_batch=on_tool_batch,
+            auto_compact=auto_compact,
+        ):
+            yield item
+    finally:
+        registry = getattr(handler, "tools_registry", None)
+        jobs = getattr(registry, "jobs", None)
+        if jobs is not None:
+            try:
+                await jobs.close_all()
+            except Exception:  # noqa: BLE001 - teardown must never mask the result
+                logger.debug("[jobs] close_all failed during loop teardown", exc_info=True)
+
+
+async def _agent_runner_loop_impl(
+    client,
+    system_prompt: str,
+    user_input: str,
+    handler: BaseHandler,
+    tools_schema: list[dict],
+    max_turns: int = DEFAULT_MAX_TURNS,
+    verbose: bool = True,
+    yield_info: bool = False,
+    initial_user_content: str | None = None,
+    on_event: Callable[[dict], Awaitable[None]] | None = None,
+    initial_messages: list[dict] | None = None,
+    context_window: int = 90000,
+    on_tool_batch: Callable[[list[dict]], Awaitable[None]] | None = None,
+    auto_compact: bool = True,
 ):
     """Core agent loop: LLM → tools → repeat.
 
@@ -350,6 +544,9 @@ async def agent_runner_loop(
         on_tool_batch: Called with the turn's whole tool_calls list before any
             of them run. Lets a tool family (node_shell_exec) resolve one
             all-or-nothing approval for the set instead of prompting per call.
+        auto_compact: 每轮 LLM 调用前是否自动压缩历史（compress_history +
+            trim_messages_async）。False 则跳过自动压缩（手动 /compact 仍可用）。
+            由 AgentConfig.auto_compact 驱动。
     """
     del verbose
 
@@ -396,6 +593,21 @@ async def agent_runner_loop(
 
     for turn in range(1, max_turns + 1):
         handler.current_turn = turn
+        # 超限紧急压缩预算：**每轮重置**。一轮内最多压 _OVERFLOW_MAX_COMPACTS 次；
+        # 压完仍超（历史压不动）就 raise，交上层落 error。放到轮次循环内是因为压缩后
+        # 体积显著变小，下一轮若再超（历史又长回来了）应重新获得压缩机会。
+        overflow_compacts_left = _OVERFLOW_MAX_COMPACTS
+
+        # 协作式停止闸门：每轮调 AI 前查会话停止标志。abort 端点置位后即使
+        # task.cancel() 被中间层吞掉或卡在 await 里（在途流式/审批等待），这里
+        # 也会停止，不再发下一轮 LLM 请求。raise CancelledError 与 task.cancel
+        # 路径汇入同一个「已中止」收尾（run_agent 的 except CancelledError）。
+        # 必须是真 asyncio.Event 才认——测试桩传 AsyncMock，mock 的 .is_set()
+        # 恒为 truthy 会误杀每一轮。
+        stop_ev = getattr(getattr(handler, "tools_registry", None), "context", None)
+        stop_ev = getattr(stop_ev, "stop_event", None)
+        if isinstance(stop_ev, asyncio.Event) and stop_ev.is_set():
+            raise asyncio.CancelledError("conversation stop requested")
 
         if yield_info:
             yield {"turn": turn}
@@ -408,9 +620,19 @@ async def agent_runner_loop(
                 "turn": turn, "messages": messages, "handler": handler,
             })
 
-        # Context management: compress and trim before LLM call
-        compress_history(messages, keep_recent=10, interval=5)
-        trim_messages(messages, context_window=context_window)
+        # Context management: compress and trim before LLM call. The summarizer
+        # condenses the oldest stretch into one block before it is dropped, so
+        # early intent survives; it is bound to this client and is best-effort —
+        # any failure falls through to the plain GA trim. auto_compact=False
+        # (AgentConfig) skips it: the caller opted out of automatic compaction
+        # and will trigger it manually (a /compact turn or the compact button).
+        if auto_compact:
+            compress_history(messages, keep_recent=10, interval=5)
+            await trim_messages_async(
+                messages,
+                context_window=context_window,
+                summarizer=_make_summarizer(client),
+            )
 
         # Hook: llm_before
         if hooks.has_hooks("llm_before"):
@@ -467,7 +689,56 @@ async def agent_runner_loop(
         # - 其他异常（HTTP 非 200、JSON 解析失败等）在此层重试：仅当本轮尚未
         #   吐过任何 content/tool_call 时重试，否则直接抛（避免重复回答）。
         client_max_retries = int(getattr(client, "max_retries", 0) or 0)
+        # 重试循环边界要给「压缩后重发」留余量：loop_max_retries 只管 429 退避，
+        # 超限压缩重发不消耗它（压缩是动作不是等待），但必须在循环边界内——
+        # 所以 range 上限加 _OVERFLOW_RETRY_EXTRA。次数另由轮级 overflow_compacts_left
+        # 硬上限（压完仍超就 raise，不会无限压）。
         loop_max_retries = max(0, client_max_retries)
+
+        async def _compact_for_overflow(err: Exception) -> None:
+            """上下文/输入超限后的**紧急压缩**：把历史缩到当前体积的一半后重发。
+
+            与每轮的自动压缩不同：常规压缩按**字符预算**判定是否超（没超就跳过），
+            而上游按 **token 卡上下文**——两套计量的错位正是「客户端不自动压缩」的
+            根因（入口估算没超、上游真超了）。这里不做预算判断，强制按当前体积的
+            一半重切，且先把 interval-gated 的旧工具参数截断立刻生效。
+            """
+            nonlocal overflow_compacts_left
+            code = _overflow_error_code(err)
+            if overflow_compacts_left <= 0:
+                raise err
+            overflow_compacts_left -= 1
+            if on_event:
+                await on_event({"type": "compact_status", "status": "started",
+                                "trigger": "overflow", "code": code})
+            try:
+                before = _estimate_chars(messages)
+                # 1) 强制截断旧轮 tool_calls/tool 结果（平时受 interval 节流，这里必须立刻生效）。
+                compress_history(messages, keep_recent=6, force=True)
+                # 2) 以「当前体积一半」为窗口重切：cap=(before/2), target=cap*0.6。
+                after_compress = _estimate_chars(messages)
+                emergency_window = max(1, after_compress // 2 // TRIGGER_MULTIPLIER)
+                await trim_messages_async(
+                    messages,
+                    context_window=emergency_window,
+                    keep_recent=6,
+                    summarizer=_make_summarizer(client),
+                )
+                after = _estimate_chars(messages)
+                logger.warning(
+                    f"[agent_loop] context overflow ({code}) → emergency compact: "
+                    f"{before} → {after} chars, resent"
+                )
+                if on_event:
+                    await on_event({"type": "compact_status", "status": "ended",
+                                    "trigger": "overflow", "code": code,
+                                    "pre_chars": before, "post_chars": after})
+            except Exception:  # noqa: BLE001 - 压缩失败不掩盖原始超限错误
+                logger.warning("[agent_loop] emergency compact failed", exc_info=True)
+                if on_event:
+                    await on_event({"type": "compact_status", "status": "failed",
+                                    "trigger": "overflow", "code": code})
+                raise err
 
         async def _emit_loop_retry(attempt: int, reason: str, delay_ms: int) -> None:
             if not on_event:
@@ -504,7 +775,7 @@ async def agent_runner_loop(
         if _supports_on_retry("chat"):
             chat_kwargs["on_retry"] = stream_kwargs.get("on_retry")
 
-        for attempt in range(loop_max_retries + 1):
+        for attempt in range(loop_max_retries + 1 + _OVERFLOW_RETRY_EXTRA):
             content_parts.clear()
             reasoning_parts.clear()
             tool_calls[:] = []
@@ -520,6 +791,12 @@ async def agent_runner_loop(
                 if isinstance(err, _NETWORK_EXC):
                     # 网络异常由 LLMBridge 负责重试；到这里说明已耗尽，本层不再 fallback/retry。
                     raise err
+                # 上下文/输入超限：重发同一个请求必然再超，唯一有用的动作是压缩历史后重发。
+                # 在 429 判定之前——它不是「等一会再试」，是「先压缩再试」。压缩次数由轮级
+                # overflow_compacts_left 硬上限；耗尽后 _compact_for_overflow 内部 raise。
+                if auto_compact and _overflow_error_code(err) is not None:
+                    await _compact_for_overflow(err)
+                    return True
                 # 非网络异常：只对瞬时 429（可重试业务码）做 agent 层退避重试。
                 # 配置类 429（no_available_account：白名单/禁用）与其余 4xx/5xx/
                 # JSON 解析错误不重试——重试无意义，直接抛，交上层落 error + 前端手动重试。
@@ -569,6 +846,12 @@ async def agent_runner_loop(
                 if _is_retryable_429(stream_err):
                     await _retry_or_raise(stream_err)
                     continue
+                # 上下文/输入超限：非流式 fallback 打的是同一个超长 payload，必然再超——
+                # 跳过 fallback 直接压缩重发（省一次注定失败的 dispatch）。预算耗尽时
+                # _compact_for_overflow 自己 raise。
+                if auto_compact and _overflow_error_code(stream_err) is not None:
+                    await _compact_for_overflow(stream_err)
+                    continue
                 # 还没产出任何内容 → 先退回非流式整段拉取（兼容不支持 stream 的上游）。
                 try:
                     resp = await client.chat(messages=messages, tools=tools_schema, **chat_kwargs)
@@ -613,31 +896,6 @@ async def agent_runner_loop(
 
         # --- no_tool handling ---
         if not tool_calls:
-            # 既没有工具调用又没有正文：上游打嗝。以前这里直接落到下面的
-            # CURRENT_TASK_DONE，把一次空响应当成任务完成上报。改成三振：
-            # 前两次要求模型重新作答，第三次才认定失败并明确报错。
-            if not content.strip():
-                handler._consecutive_empty += 1
-                if handler._consecutive_empty >= _MAX_CONSECUTIVE_EMPTY:
-                    err = (
-                        f"[ERROR] Model returned an empty response "
-                        f"{handler._consecutive_empty} times in a row; aborting instead of "
-                        "reporting the task as complete."
-                    )
-                    if on_event:
-                        await on_event({"type": "error", "error": err})
-                    yield {"result": "ERROR", "data": err}
-                    return
-                messages.append({"role": "assistant", "content": content or ""})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "[SYSTEM] Your last reply was empty. Respond again: either call a "
-                        "tool or give the final answer in text."
-                    ),
-                })
-                continue  # next turn
-
             # max_tokens truncation → inject "continue" prompt
             if _detect_max_tokens_truncation(response):
                 # 截断续跑也要有上限，否则一个总是撞 max_tokens 的模型会一直
@@ -670,11 +928,9 @@ async def agent_runner_loop(
                     "role": "user",
                     "content": "[SYSTEM] Code block detected. Please use code_run to execute it or file_write to save it.",
                 })
-                handler._consecutive_empty = 0
                 continue  # next turn
 
             # Normal text response → exit
-            handler._consecutive_empty = 0
             # turn_end_callback for final turn
             summary, _ = _extract_summary(content, [])
             handler.history_info.append(f"[Agent] {summary}")
@@ -685,10 +941,11 @@ async def agent_runner_loop(
             return
 
         # --- Tool dispatch ---
-        handler._consecutive_empty = 0
         tool_results = []
         should_exit = False
         next_prompt = None
+        # Repeat-call reminders collected this turn; folded into next_prompt below.
+        repeat_reminders: list[str] = []
 
         # Give the batch coordinator the whole set first: a turn that asks for
         # several node commands gets one all-or-nothing approval, and the tools
@@ -697,6 +954,15 @@ async def agent_runner_loop(
             await on_tool_batch(tool_calls)
 
         for index, tool_call in enumerate(tool_calls):
+            # 协作式停止闸门（工具级）：模型已经吐完 tool_calls、用户此刻点了
+            # 停止——不要再启动新的 code_run 脚本/网页抓取。每轮 LLM 前那道闸门
+            # 挡不住「同一轮里模型刚返回工具调用、停止信号随后到达」的窗口。
+            # 只认真 asyncio.Event（见上方注释：测试桩的 Mock 恒 truthy）。
+            stop_ev = getattr(getattr(handler, "tools_registry", None), "context", None)
+            stop_ev = getattr(stop_ev, "stop_event", None)
+            if isinstance(stop_ev, asyncio.Event) and stop_ev.is_set():
+                raise asyncio.CancelledError("conversation stop requested")
+
             function = tool_call.get("function", {})
             tool_name = function.get("name", "")
             raw_args = function.get("arguments") or "{}"
@@ -750,6 +1016,13 @@ async def agent_runner_loop(
                 )
             last_data = outcome.data
 
+            # Advisory repeat-call guard: a denied outcome counts too (hammering a
+            # refused tool is exactly the loop worth breaking), and it never vetoes
+            # the call — it only queues a reminder for this turn's next_prompt.
+            _reminder = handler.repeat_guard.observe(tool_name, args)
+            if _reminder:
+                repeat_reminders.append(_reminder)
+
             # Keep results structured for events/history, but send each result as
             # a standard role=tool message below instead of misclassifying it as
             # user-authored content.
@@ -777,6 +1050,12 @@ async def agent_runner_loop(
         # 用默认续跑提示把结果喂回 LLM，避免第一次工具调用后就误判任务完成而提前结束。
         if not should_exit and not next_prompt:
             next_prompt = _DEFAULT_CONTINUE_PROMPT
+
+        # Fold any repeat-call reminders into next_prompt. A standalone user
+        # message would split the role=tool → user continuation pair providers
+        # expect, so the reminders ride along with the continuation prompt.
+        if repeat_reminders and next_prompt:
+            next_prompt = "\n\n".join([next_prompt, *repeat_reminders])
 
         # --- turn_end_callback ---
         summary, had_summary_tag = _extract_summary(content, tool_calls)
@@ -812,12 +1091,25 @@ async def agent_runner_loop(
                 "direction. No more blind retries."
             )
 
-        # Force exit at 75 turns
-        if turn >= 75:
-            if on_event:
-                await on_event({"type": "done", "usage": dict(total_usage), "model": getattr(client, "model", "") or ""})
-            yield {"result": "MAX_TURNS_EXCEEDED", "data": "75 turn limit reached"}
-            return
+        # Turn-budget-exhaustion warning. Reaching max_turns is a forced hard exit
+        # (loop's `for` bound → MAX_TURNS_EXCEEDED), so once we're within a few
+        # turns the model must know to wrap up — otherwise a long task is cut off
+        # mid-step with no final summary. Fire only while there is still a next
+        # turn to send this prompt into (remaining >= 1); on the final turn the
+        # loop ends without consuming next_prompt, so injecting there is wasted.
+        if next_prompt:
+            _remaining = max_turns - turn
+            if 1 <= _remaining <= _TURNS_REMAINING_WARNING:
+                next_prompt += (
+                    "\n\n" + _TURNS_REMAINING_PROMPT.format(
+                        remaining=_remaining, max_turns=max_turns,
+                    )
+                )
+
+        # 不再有 75 轮硬退：`for turn in range(1, max_turns + 1)` 本身就是轮数上限，
+        # 到 max_turns 自然退出（下方 `for` 循环外的收尾 yield MAX_TURNS_EXCEEDED）。
+        # 旧的 `if turn >= 75` 会静默砍掉配置的 max_turns（默认 80），让「配 80 只跑
+        # 到 75」的会话在半路突停——这正是「运行中突然结束」的根因。
 
         if on_event:
             await on_event({"type": "turn_end", "turn": turn})

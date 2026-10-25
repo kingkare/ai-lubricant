@@ -317,6 +317,7 @@ async def _reject_ws(websocket: WebSocket, code: int, reason: str) -> None:
 async def list_task_terminals(
     task_id: str, user: User = Depends(get_current_user)
 ) -> dict:
+    """列出任务工作区当前可用的终端会话（经控制面隧道查询节点 session 终端）。控制面未配置时返回 503。"""
     node_session_id = await _resolve_task_session(task_id, str(user.id), user.role)
     from . import config
 
@@ -335,6 +336,7 @@ async def delete_task_terminal(
     terminal_id: str,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """关闭并删除任务工作区里的一个终端会话（经控制面隧道转发 DELETE）。控制面未配置时返回 503。"""
     node_session_id = await _resolve_task_session(task_id, str(user.id), user.role)
     from . import config
 

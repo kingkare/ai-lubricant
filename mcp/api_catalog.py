@@ -81,15 +81,6 @@ class UpdateMCPEnvVarsRequest(BaseModel):
     items: list[MCPEnvVar] = []
 
 
-class McpSopFile(BaseModel):
-    name: str
-    content: str
-
-
-class McpSopRequest(BaseModel):
-    files: list[McpSopFile] = []
-
-
 class ResourceMutationRequest(BaseModel):
     value: dict[str, Any]
     expected_revision: int | None = None
@@ -107,6 +98,7 @@ class DeployToNodeRequest(BaseModel):
 
 @router.get("/catalog")
 async def list_catalog() -> list[dict]:
+    """列出市场目录：自带模板 + 系统内置服务。"""
     return await mcp_plugin_store.list_catalog()
 
 
@@ -163,6 +155,7 @@ async def list_service_manifests(authorization: str | None = Header(None)) -> li
 
 @router.get("/services/{service_name}/assets")
 async def list_service_assets(service_name: str) -> dict:
+    """列出指定 MCP 服务 manifest 声明的附件，并补齐下载 URL。"""
     service = await mcp_plugin_store.get_service_by_name(service_name)
     if not service:
         raise HTTPException(404, f"MCP service '{service_name}' not found")
@@ -190,6 +183,10 @@ def _resolve_asset_path(service_name: str, source: str) -> Path:
 
 @router.get("/services/{service_name}/assets/{asset_id}/download")
 async def download_service_asset(service_name: str, asset_id: str):
+    """下载 manifest 附件：文件原样返回，directory_zip 现场打包成 zip。
+
+    source 必须落在该服务 manifest 目录内（越界 400），kind 不认则 400。
+    """
     service = await mcp_plugin_store.get_service_by_name(service_name)
     if not service:
         raise HTTPException(404, f"MCP service '{service_name}' not found")
@@ -223,61 +220,6 @@ async def download_service_asset(service_name: str, asset_id: str):
         return StreamingResponse(io.BytesIO(data), media_type=mime, headers=headers)
 
     raise HTTPException(400, f"Unsupported asset kind: {kind}")
-
-
-# ── SOP：内置服务的 SOP markdown 在线读写（写回源 .md 文件） ──
-
-def _service_sop_dir(service_name: str) -> Path | None:
-    """内置服务的 sop 目录（与 manifest 同级）。"""
-    base = _service_manifest_dir(service_name)
-    if not base:
-        return None
-    return base / "sop"
-
-
-@router.get("/services/{service_name}/sop")
-async def get_service_sop(service_name: str, authorization: str | None = Header(None)) -> dict:
-    """读取内置服务 sop/*.md 文件内容。自定义服务返回空列表。"""
-    await _require_admin(authorization)
-    service = await mcp_plugin_store.get_service_by_name(service_name)
-    if not service:
-        raise HTTPException(404, f"MCP service '{service_name}' not found")
-    sop_dir = _service_sop_dir(service_name)
-    files: list[dict] = []
-    if sop_dir and sop_dir.is_dir():
-        for p in sorted(sop_dir.glob("*.md")):
-            files.append({"name": p.name, "content": p.read_text(encoding="utf-8")})
-    return {"service_name": service_name, "files": files}
-
-
-@router.put("/services/{service_name}/sop")
-async def update_service_sop(service_name: str, payload: McpSopRequest, authorization: str | None = Header(None)) -> dict:
-    """写回 sop/*.md。仅允许覆盖已存在的文件，禁止新建/删除/路径穿越。"""
-    await _require_admin(authorization)
-    service = await mcp_plugin_store.get_service_by_name(service_name)
-    if not service:
-        raise HTTPException(404, f"MCP service '{service_name}' not found")
-    sop_dir = _service_sop_dir(service_name)
-    if not sop_dir or not sop_dir.is_dir():
-        raise HTTPException(400, f"Service '{service_name}' has no SOP directory")
-    updated: list[dict] = []
-    for f in payload.files:
-        name = (f.name or "").strip()
-        # 仅允许文件名：无路径分隔符、无 .. 。
-        if not name or "/" in name or "\\" in name or ".." in name:
-            raise HTTPException(400, f"Invalid SOP file name: {f.name!r}")
-        if not name.endswith(".md"):
-            raise HTTPException(400, f"SOP file must be .md: {name}")
-        target = (sop_dir / name).resolve()
-        sop_dir_resolved = sop_dir.resolve()
-        if not str(target).startswith(str(sop_dir_resolved)):
-            raise HTTPException(400, "Invalid SOP path")
-        if not target.is_file():
-            # 不允许新建文件，避免在仓库里凭空生成 .md。
-            raise HTTPException(404, f"SOP file not found: {name}")
-        target.write_text(f.content, encoding="utf-8")
-        updated.append({"name": name, "bytes": len(f.content.encode("utf-8"))})
-    return {"service_name": service_name, "updated": updated}
 
 
 # ── 配置资源（schema v2 contract）：list/read/create/update/delete/replace + rotate/revoke ──
@@ -330,6 +272,11 @@ def _require_resource_capability(ctx: ResourceContext, adapter: Any, capability:
 
 @router.get("/services/{service_id}/configuration")
 async def get_service_configuration(service_id: int, authorization: str | None = Header(None)) -> dict:
+    """返回服务的 schema v2 配置契约：资源/动作/视图定义 + 引用选项 + 运行状态。
+
+    reference_options 给出所有 enabled 的 MCP 用户与 Agent 列表（可操作用户由
+    资源实例的 user_ids 决定，故不做预筛）。仅管理端；schema<2 返回 409。
+    """
     await _require_admin(authorization)
     service, manifest = await _configuration_context(service_id)
     try:
@@ -360,6 +307,10 @@ async def list_configuration_resource(
     service_id: int, resource_key: str, parent_id: int | None = None,
     authorization: str | None = Header(None),
 ) -> dict:
+    """列出配置资源：singleton 返回单条（走 read），其余按 parent_id 列全部（走 list）。
+
+    meta.capabilities 是 manifest 与 adapter 同时声明支持的能力交集。
+    """
     await _require_admin(authorization)
     ctx, adapter = await _configuration_context(service_id, resource_key)
     try:
@@ -379,6 +330,11 @@ async def replace_configuration_resource(
     service_id: int, resource_key: str, payload: ResourceMutationRequest,
     authorization: str | None = Header(None),
 ) -> dict:
+    """全量替换配置资源的 items（PUT）。要求 adapter 声明 replace 能力。
+
+    payload.value.items 必须是数组且必须带 expected_revision（乐观锁）；保存后按
+    runtime-apply 能力触发重载。仅管理端。
+    """
     await _require_admin(authorization)
     ctx, adapter = await _configuration_context(service_id, resource_key)
     replace = getattr(adapter, "replace", None)
@@ -405,6 +361,11 @@ async def create_configuration_resource(
     service_id: int, resource_key: str, payload: ResourceMutationRequest,
     parent_id: int | None = None, authorization: str | None = Header(None),
 ) -> dict:
+    """新建配置资源实例（POST）。要求 create 能力，值按资源 schema 全量校验。
+
+    parent_id 查询参数会并入实例值；cdp_client 类型响应 meta.token_once=True
+    （token 明文只此一次返回）。保存后按 runtime-apply 能力触发重载。仅管理端。
+    """
     await _require_admin(authorization)
     ctx, adapter = await _configuration_context(service_id, resource_key)
     _require_resource_capability(ctx, adapter, "create")
@@ -428,6 +389,11 @@ async def update_configuration_resource(
     service_id: int, resource_key: str, item_id: str, payload: ResourceMutationRequest,
     parent_id: int | None = None, authorization: str | None = Header(None),
 ) -> dict:
+    """局部更新配置资源实例（PATCH）。要求 update 能力，值按 schema 部分校验。
+
+    带 expected_revision 走乐观锁，冲突返回 409；记录不存在返回 404。
+    保存后按 runtime-apply 能力触发重载。仅管理端。
+    """
     await _require_admin(authorization)
     ctx, adapter = await _configuration_context(service_id, resource_key)
     _require_resource_capability(ctx, adapter, "update")
@@ -454,6 +420,11 @@ async def delete_configuration_resource(
     service_id: int, resource_key: str, item_id: str, parent_id: int | None = None,
     expected_revision: int | None = None, authorization: str | None = Header(None),
 ) -> dict:
+    """删除配置资源实例（DELETE）。要求 delete 能力，带 expected_revision 走乐观锁。
+
+    冲突返回 409，记录不存在（或 parent_id 过滤不命中）返回 404。
+    保存后按 runtime-apply 能力触发重载。仅管理端。
+    """
     await _require_admin(authorization)
     ctx, adapter = await _configuration_context(service_id, resource_key)
     _require_resource_capability(ctx, adapter, "delete")
@@ -476,6 +447,11 @@ async def rotate_configuration_resource_token(
     service_id: int, resource_key: str, item_id: str, response: Response,
     payload: ResourceActionRequest = ResourceActionRequest(), authorization: str | None = Header(None),
 ) -> dict:
+    """重新生成配置资源实例的 token。要求 adapter 实现 rotate_token，否则 405。
+
+    新 token 明文仅本次返回（meta.token_once=True），响应带 no-store 头防缓存；
+    带 expected_revision 走乐观锁，冲突 409、不存在 404。仅管理端。
+    """
     await _require_admin(authorization)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     response.headers["Pragma"] = "no-cache"
@@ -501,6 +477,10 @@ async def revoke_configuration_resource_token(
     service_id: int, resource_key: str, item_id: str, payload: ResourceActionRequest = ResourceActionRequest(),
     authorization: str | None = Header(None),
 ) -> dict:
+    """撤销配置资源实例的 token（连接方立即失效）。要求 adapter 实现 revoke_token。
+
+    带 expected_revision 走乐观锁，冲突 409、不存在 404。仅管理端。
+    """
     await _require_admin(authorization)
     ctx, adapter = await _configuration_context(service_id, resource_key)
     revoke = getattr(adapter, "revoke_token", None)
@@ -524,6 +504,12 @@ async def execute_configuration_action(
     service_id: int, action_key: str, payload: ResourceMutationRequest, response: Response,
     authorization: str | None = Header(None),
 ) -> dict:
+    """执行 manifest 声明的配置动作（POST），payload.value 按 action inputSchema 校验。
+
+    两类分发：rotate-token/revoke 类映射到对应资源的 rotate_token/revoke_token
+    （token_once 动作响应带 no-store 头）；其余经 binding 直达 runtime 插件的
+    call_action 实时执行。仅管理端。
+    """
     await _require_admin(authorization)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     response.headers["Pragma"] = "no-cache"
@@ -567,6 +553,11 @@ async def execute_configuration_action(
 async def query_configuration_view(
     service_id: int, view_key: str, request: Request, authorization: str | None = Header(None),
 ) -> dict:
+    """查询 manifest 声明的配置视图（GET），query 参数按 view querySchema 校验。
+
+    经视图 binding 直达 runtime 插件的 query_view 实时读取（meta.realtime=True）。
+    仅管理端。
+    """
     await _require_admin(authorization)
     _service, manifest = await _configuration_context(service_id)
     view = ((manifest.get("config") or {}).get("views") or {}).get(view_key)
@@ -590,6 +581,11 @@ async def _query_configuration_view(service_id: int, view_key: str, arguments: d
 
 @router.get("/services/{service_id}")
 async def get_service(service_id: int, authorization: str | None = Header(None)) -> dict:
+    """获取单个 MCP 服务详情。
+
+    仅管理端：service 含 headers 明文 token，未鉴权会泄露他人凭据。
+    响应里 headers 的 Authorization 脱敏。
+    """
     # 仅管理端：service 含 headers 明文 token，未鉴权会泄露他人凭据。
     await _require_admin(authorization)
     service = await mcp_plugin_store.get_service(service_id)
@@ -600,6 +596,7 @@ async def get_service(service_id: int, authorization: str | None = Header(None))
 
 @router.get("/services/{service_id}/env-vars")
 async def list_service_env_vars(service_id: int, authorization: str | None = Header(None)) -> list[dict]:
+    """列出服务的环境变量（secret 项脱敏）。仅管理端。"""
     await _require_admin(authorization)
     if not await mcp_plugin_store.get_service(service_id):
         raise HTTPException(404, f"MCP service {service_id} not found")
@@ -608,6 +605,7 @@ async def list_service_env_vars(service_id: int, authorization: str | None = Hea
 
 @router.put("/services/{service_id}/env-vars")
 async def update_service_env_vars(service_id: int, request: UpdateMCPEnvVarsRequest, authorization: str | None = Header(None)) -> list[dict]:
+    """全量替换服务的环境变量并触发热下发（_reload_service，无需重启）。仅管理端。"""
     await _require_admin(authorization)
     if not await mcp_plugin_store.get_service(service_id):
         raise HTTPException(404, f"MCP service {service_id} not found")
@@ -621,6 +619,7 @@ async def update_service_env_vars(service_id: int, request: UpdateMCPEnvVarsRequ
 
 @router.delete("/services/{service_id}/env-vars/{key}")
 async def delete_service_env_var(service_id: int, key: str, authorization: str | None = Header(None)) -> dict:
+    """删除单个环境变量（不存在返回 404）。仅管理端。"""
     await _require_admin(authorization)
     if not await mcp_plugin_store.get_service(service_id):
         raise HTTPException(404, f"MCP service {service_id} not found")
@@ -632,6 +631,12 @@ async def delete_service_env_var(service_id: int, key: str, authorization: str |
 
 @router.post("/services")
 async def create_service(request: CreateMCPServiceRequest, authorization: str | None = Header(None)) -> dict:
+    """创建 MCP 服务。
+
+    按 transport/url 派生 deploy_scope：session 形态（stdio）无安装流程，直接以
+    ready 落库；server 形态随即在后台拉起安装编排（前端轮询 install/status）。
+    名称冲突返回 409，无数据库返回 503。仅管理端。
+    """
     await _require_admin(authorization)
     scope = derive_deploy_scope(request.transport, request.url)
     # session 形态（stdio）没有「安装」动作：它只是让使用者的 MCP 选项里多一个可选项，
@@ -681,6 +686,12 @@ async def create_service(request: CreateMCPServiceRequest, authorization: str | 
 
 @router.patch("/services/{service_id}")
 async def update_service(service_id: int, request: UpdateMCPServiceRequest, authorization: str | None = Header(None)) -> dict:
+    """更新服务元数据（PATCH）。
+
+    按 manifest 的 builtin_rules.editable_fields 收紧可改字段，越界字段返回 403
+    （内置服务不能改启动命令等）；无有效字段返回 400。enabled 变更时触发热下发。
+    仅管理端。
+    """
     await _require_admin(authorization)
 
     # 先取服务行，按 manifest 的 editable_fields 收紧可改字段（内置服务不能改启动命令等）。
@@ -726,6 +737,7 @@ async def update_service(service_id: int, request: UpdateMCPServiceRequest, auth
 
 @router.delete("/services/{service_id}")
 async def delete_service(service_id: int, authorization: str | None = Header(None)) -> dict:
+    """删除 MCP 服务（builtin 不可删，返回 400）。仅管理端。"""
     await _require_admin(authorization)
     try:
         deleted = await mcp_plugin_store.delete_service(service_id)
@@ -740,6 +752,7 @@ async def delete_service(service_id: int, authorization: str | None = Header(Non
 
 @router.post("/services/{service_id}/toggle")
 async def toggle_service(service_id: int, authorization: str | None = Header(None)) -> dict:
+    """切换服务启用状态（enabled 取反）并热下发，返回新状态与 apply 结果。仅管理端。"""
     await _require_admin(authorization)
     row = await mcp_plugin_store.toggle_service_enabled(service_id)
     if not row:

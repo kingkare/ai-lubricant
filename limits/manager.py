@@ -404,8 +404,21 @@ class LimitManager:
                 if dim.is_exhausted():
                     return LimitDecision(False, "provider_quota_exhausted", details={"dimension": dim.name})
 
-        if model_id and not await provider.check_message(model_id, messages):
-            return LimitDecision(False, "provider_message_quota_exceeded")
+        if model_id:
+            # 带 reason 的渠道放行判定：渠道（spec）可在选路阶段复现出站请求体、判定
+            # 「这条请求发到我这儿装不下」并带出原因。reason 为空 → 回退旧
+            # provider_message_quota_exceeded（消息配额语义不变）；渠道带出
+            # context_window_exceeded → 复用现成映射（rate_limiter._REASON_TO_BUSINESS_CODE
+            # → context_too_large/400），客户端不再拿到误导性的 quota_exhausted(429)。
+            # 用 getattr 兜底：不继承 BaseProvider 的 provider（测试桩/第三方）没有新方法时
+            # 退回只认 bool 的 check_message，行为与旧版一致。
+            checker = getattr(provider, "check_message_with_reason", None)
+            if checker is not None:
+                allowed, reason = await checker(model_id, messages)
+            else:
+                allowed, reason = bool(await provider.check_message(model_id, messages)), ""
+            if not allowed:
+                return LimitDecision(False, reason or "provider_message_quota_exceeded")
 
         return LimitDecision(True)
 
@@ -421,9 +434,17 @@ class LimitManager:
         token_estimate: int = 0,
     ) -> LimitReservation:
         now = now or time.time()
-        decision = await cls.account_available_locked(account_client, model_id, messages, now, is_test=is_test)
-        if not decision.allowed:
-            return LimitReservation(None, decision)
+        # is_test 兜底读 account_client._is_test：_try_reserve 在预占期间于账号对象上打标
+        # （set→reserve→finally reset），部分渠道/兼容实现的 reserve_limits_with_decision
+        # 不透传 context 的 is_test 标志，这里统一兜住，避免测试丢失「只占并发」口径。
+        is_test = bool(is_test) or bool(getattr(account_client, "_is_test", False))
+        if not is_test:
+            # 正常请求：reserve 阶段复核硬状态（禁用/冻结/冷却/quota）。
+            # 测试/探测不查——候选收集已按 is_test/is_probe 语义过滤，且被测目标正是
+            # 冻结/异常账号；占位阶段对它们只对「并发」这一种资源负责。
+            decision = await cls.account_available_locked(account_client, model_id, messages, now)
+            if not decision.allowed:
+                return LimitReservation(None, decision)
 
         subject = cls.account_subject(account_client, model_id)
         lease = LimitLease(
@@ -432,6 +453,7 @@ class LimitManager:
             expires_at=now + cls.CONCURRENCY_LEASE_SECONDS,
         )
         lease.reservation_id = lease.lease_id
+        lease.test_probe = is_test
         rpm_limit = int(getattr(account_client, "rpm_limit", 0) or 0)
         rpd_limit = int(getattr(account_client, "rpd_limit", 0) or 0)
         rph_limit = int(getattr(account_client, "rph_limit", 0) or 0)
@@ -440,6 +462,12 @@ class LimitManager:
         tpd_limit = int(getattr(account_client, "tpd_limit", 0) or 0)
         model_tpm_limit = cls._model_tpm_limit(model_id)
         token_amount = max(0, int(token_estimate or 0))
+        if is_test:
+            # 测试/探测只占并发槽位：不写 RPM/RPD/RPH/token 账本（测试不是真实流量，
+            # 计入会把账号额度打满），但并发预占照走同一 Lua 原子占用。
+            rpm_limit = rpd_limit = rph_limit = 0
+            tpm_limit = tph_limit = tpd_limit = model_tpm_limit = 0
+            token_amount = 0
         has_token_limits = tpm_limit > 0 or tph_limit > 0 or tpd_limit > 0 or model_tpm_limit > 0
         has_remote_limits = (
             account_client.concurrent_limit > 0
@@ -487,6 +515,7 @@ class LimitManager:
                     model_tpm_ttl=cls.TOKEN_WINDOW_SECONDS,
                     allow_token_overflow=allow_token_overflow,
                     window_ids=window_ids,
+                    skip_freeze_checks=is_test,
                 ),
                 stage="account_atomic_reserve",
                 timeout=ROUTING_RESERVE_REDIS_TIMEOUT_SECONDS,
@@ -637,6 +666,11 @@ class LimitManager:
         """
         if lease is None or lease.settled or lease.rolled_back:
             return None
+        if lease.test_probe:
+            # 测试/探测预占只占并发槽位：reserve 阶段没写任何 ledger，真实 usage 绝不回写
+            # （回写会让测试消耗账号 TPM/TPD 额度，量大时把被测账号触线冻结）。直接收口。
+            lease.settled = True
+            return None
         reservation_id = lease.reservation_id or lease.lease_id
         if not reservation_id or lease.local_fallback:
             lease.settled = True
@@ -692,6 +726,10 @@ class LimitManager:
         精确匹配、天然幂等，重试不会误删别人的预占。
         """
         if lease is None or lease.rolled_back or lease.settled:
+            return None
+        if lease.test_probe:
+            # 测试/探测预占没写账本、没登记可恢复索引，失败也无需回退。
+            lease.rolled_back = True
             return None
         reservation_id = lease.reservation_id or lease.lease_id
         lease.rolled_back = True

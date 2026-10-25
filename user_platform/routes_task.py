@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import uuid
 
-from typing import Any
-
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
@@ -26,7 +24,6 @@ from .node_client.errors import RPCError
 from .resource_reference_service import (
     normalize_mcp_bindings,
     resolve_prompt_for_user,
-    resolve_reference_specs,
 )
 from .task_service import task_service
 from .task_service import _CLAUDE_RESERVED_MODEL_HINT
@@ -47,12 +44,6 @@ class TaskRepoReq(BaseModel):
 class TaskExtraConfig(BaseModel):
     project_id: str | None = None
     issue_id: str | None = None
-    # 普通项传引用 id 字符串；集合传 {resource_id|reference_id, entries:[子技能名…]}——
-    # resolve_reference_specs 按 entries 过滤，只下发勾选的子技能（缺省=全集合）。
-    # 两者形状一致（_resolve_task_resource_configs 用同一个循环处理），故都必须是
-    # list[Any]：写成 list[str] 会让集合绑定在 pydantic 校验阶段就 422。
-    skill_ids: list[Any] | None = None
-    plugin_ids: list[Any] | None = None
 
 
 class VMResource(BaseModel):
@@ -76,6 +67,12 @@ class CreateTaskReq(BaseModel):
     cli_name: str | None = None
     provider: str | None = None
     models: list[str] | None = None
+    # 模型映射（per-provider 形状，见 task_service._normalize_model_mapping）。
+    # 统一为 {main, slots}：main=主模型（claude 是档名别名如 opus，其余是平台模型）；
+    # slots=编辑器原生用途槽，每槽 {model, fallback_models[]}（claude=四档，codex=目录,
+    # opencode/dsh=模型表，gemini/cursor 无槽）。旧形状 roles/fallback/catalog/models
+    # 读取时经 _migrate_model_mapping 归一。弹框不再传 models/model_id。
+    model_mapping: dict | None = None
     environment: dict[str, str] | None = None
     # Execution-environment isolation tier. "isolated" (default/None) = throwaway
     # per-session home; "shared" = a named persistent home on the node (env_id
@@ -84,14 +81,17 @@ class CreateTaskReq(BaseModel):
     env_mode: str | None = None
     env_id: str | None = None
     env_name: str | None = None
+    # 「创建 worktree」选项（默认是）。只对**新建任务**生效：开=从环境的代码目录
+    # 切一个任务专属 worktree；关=不切——环境有现成目录（导入/fresh）就直接在环境
+    # 目录里跑，没有（托管 clone 环境）就任务自己 clone 一份（历史行为）。
+    # 同步为任务不受影响（它本来就不切）。
+    create_worktree: bool | None = None
     # 共用/系统环境自带资源的激活子集（按环境清单里的名字）：仅激活列出的
     # 技能/插件，其余环境已装项本次任务不启用。空/缺失 = 激活环境全部
     # 已装项。skill 在节点侧真正生效；plugin 协议已下发但节点暂不消费。
     active_skills: list[str] | None = None
     active_plugins: list[str] | None = None
-    skill_config: list[dict] | None = None
     mcp_config: list[dict] | None = None
-    plugin_config: list[dict] | None = None
     resource: VMResource | None = None
     extra: TaskExtraConfig | None = None
     system_prompt: str | None = None
@@ -101,7 +101,6 @@ class CreateTaskReq(BaseModel):
     mode: str | None = None
     mode_label: str | None = None
     reasoning_effort: str | None = None
-    mode_capability_snapshot: dict | None = None
     task_role: str | None = None
     # Canonical Task key lineage. A runnable Task must choose a parent API Key;
     # a ``scope='task'`` child is minted from it and bound to this Task. Codex
@@ -111,11 +110,10 @@ class CreateTaskReq(BaseModel):
     usage_limit: dict | None = None
     expires_at: float | None = None
     # 子 Key 收窄参数，复用既有 api_keys 列（不加新 schema）。省略(None)=继承父级；
-    # model_whitelist 与 models 同源——既写 models_snapshot(运行态菜单)又收窄子 Key
-    # 的 model_whitelist，让这把 Key 真正只允许所选模型。editor_provider_whitelist
+    # models 既写 models_snapshot(运行态菜单)又收窄子 Key 的 model_whitelist
+    # （create_task 内部同源处理，不在请求体里重复声明）。editor_provider_whitelist
     # 由前端「可用编辑器」单选映射而来。rate_limit 不做父子约束（按单 Key 计数）。
     rate_limit: dict | None = None
-    model_whitelist: list[str] | None = None
     editor_provider_whitelist: list[str] | None = None
     selection_strategy: str | None = None
     expected_client_id: str | None = None
@@ -130,12 +128,14 @@ class UpdateTaskReq(BaseModel):
     mode: str | None = None
     mode_label: str | None = None
     reasoning_effort: str | None = None
+    # 模型映射（详情页齿轮弹框整体替换）。形状与 CreateTaskReq.model_mapping 同源，
+    # 校验收口在 task_service.update_task（_normalize_model_mapping）。
+    model_mapping: dict | None = None
     # Resource config hot-update. ``resource_id``-bearing entries are resolved
     # to server-trusted wire specs before persistence; full wire specs from
     # authorized callers pass through. Secrets are never rendered back.
+    # skill_config/plugin_config 已退役：资源归环境，任务不携带。
     mcp_config: list[dict] | None = None
-    skill_config: list[dict] | None = None
-    plugin_config: list[dict] | None = None
 
 
 class TaskAttachmentReq(BaseModel):
@@ -177,182 +177,39 @@ class TaskRestartReq(BaseModel):
     load_session: bool = True
 
 
-def _dedup_by_name(items: list[dict]) -> list[dict]:
-    """Drop duplicate resource entries by ``name`` (first wins; unnamed kept)."""
-    seen: dict[str, dict] = {}
-    unnamed: list[dict] = []
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        if name:
-            seen.setdefault(name, dict(item))
-        else:
-            unnamed.append(dict(item))
-    return unnamed + list(seen.values())
-
-
 async def _resolve_task_resource_configs(
     user: User, req: dict, request: Request
 ) -> dict:
-    """Resolve resource references into server-trusted wire specs.
+    """Resolve the task's MCP bindings into server-trusted service bindings.
 
-    Folds ``extra.skill_ids`` / ``extra.plugin_ids`` into the matching
-    ``*_config`` lists and resolves them alongside any explicit specs. A
-    ``resource_id`` the caller cannot see is rejected (→ 403) before the task
-    row is written. Returns the patch dict of resource keys to persist.
+    只剩 MCP 一段：``mcp_config`` 里的 ``{resource_id}`` 绑定校验授权后转成
+    ``{service_id}`` 形态，供 task_service 写 principal grants（派发时
+    ``_principal_mcp_specs`` 现造安全 spec，密钥不下发节点）。越权 id 在写行
+    之前就被拒（→ 403）。
+
+    skill/plugin 那段已删：弹框不再配技能/插件（它们归环境管理），
+    ``extra.skill_ids`` / ``plugin_ids`` 永远为空——原来每次都白跑一次
+    ``resolve_team_id`` + 空循环，是创建任务的固定浪费。
     """
-    extra = req.get("extra") if isinstance(req.get("extra"), dict) else {}
-    base_url = str(request.base_url).rstrip("/")
-    team_id = await resolve_team_id(str(user.id))
-    patch: dict = {}
-    for ids_key, public_key, resource_type in (
-        ("skill_ids", "skill_config", "skill"),
-        ("plugin_ids", "plugin_config", "plugin"),
-    ):
-        bindings: list[dict] = []
-        for item in (extra.get(ids_key) or []):
-            if isinstance(item, dict):
-                # reference_id = 新表引用（统一资源池）；resource_id = 旧表引用。
-                rid = str(item.get("reference_id") or item.get("resource_id") or "").strip()
-                if not rid:
-                    continue
-                binding = (
-                    {"reference_id": rid} if item.get("reference_id") else {"resource_id": rid}
-                )
-                entries = [str(e).strip() for e in (item.get("entries") or []) if str(e).strip()]
-                if entries:
-                    binding["entries"] = entries
-                bindings.append(binding)
-            else:
-                rid = str(item or "").strip()
-                if rid:
-                    bindings.append({"resource_id": rid})
-        explicit = req.get(public_key)
-        if isinstance(explicit, list):
-            bindings.extend(dict(item) for item in explicit if isinstance(item, dict))
-        if not bindings:
-            continue
-        try:
-            resolved = await resolve_reference_specs(
-                str(user.id), team_id, resource_type, bindings, request_base_url=base_url,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=403, detail=f"资源未授权或配置无效: {exc}") from exc
-        patch[public_key] = _dedup_by_name(resolved)
     mcp_explicit = req.get("mcp_config")
-    if isinstance(mcp_explicit, list) and mcp_explicit:
-        try:
-            # 任务行不落 wire spec——mcp_config 以服务绑定形态进 task_service
-            # （_sync_task_mcp_service_grants → principal service grants），
-            # 派发时 _principal_mcp_specs 现造安全 spec（密钥不下发节点）。
-            patch["mcp_config"] = await normalize_mcp_bindings(
-                str(user.id), team_id, mcp_explicit,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=403, detail=f"资源未授权或配置无效: {exc}") from exc
-    return patch
+    if not isinstance(mcp_explicit, list) or not mcp_explicit:
+        return {}
+    team_id = await resolve_team_id(str(user.id))
+    try:
+        return {"mcp_config": await normalize_mcp_bindings(
+            str(user.id), team_id, mcp_explicit,
+        )}
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=f"资源未授权或配置无效: {exc}") from exc
 
 
 def _audit_resource_counts(req: dict) -> dict:
     """Audit bodies never carry full wire specs — only per-kind counts."""
     out = dict(req)
-    for key in ("mcp_config", "skill_config", "plugin_config"):
+    for key in ("mcp_config",):
         if key in out:
             out[key] = len(out[key] or []) if isinstance(out.get(key), list) else 0
     return out
-
-
-async def _install_missing_env_resources(
-    user: User, payload: dict, request: Request
-) -> list[str]:
-    """「没有就安装」：勾选了环境里还没有的平台资源时，随任务创建真装进去。
-
-    shared → 加进共用环境配置并同步到节点（真安装、跨任务复用，环境维护同款路径）；
-    system → 经系统环境通道装进节点操作者本机（platform_managed，可在系统环境页卸载）。
-    隔离档不走这里（session 私有安装由派发时的 session spec 自带）。best-effort：
-    单条失败记为警告随响应返回，不阻断任务创建——任务照常派发，只是可能暂缺某资源。
-    """
-    env_mode = str(payload.get("env_mode") or "").strip().lower()
-    if env_mode not in ("shared", "system"):
-        return []
-    extra = payload.get("extra") or {}
-    wanted: list[tuple[str, str]] = []
-    for kind, key in (("skill", "skill_ids"), ("plugin", "plugin_ids")):
-        for item in (extra.get(key) or []):
-            # v2 引用绑定是 {reference_id, ...}：走 resolve_reference_specs 的
-            # 新表路径产出 skill_config/plugin_config 随 session payload 下发，
-            # 节点在 session setup 时直接 materialize（git clone / archive fetch）。
-            # 不能交给 add_environment_resource / install_to_system_env——那条路
-            # 验证旧 mc_resource_references 表，v2 引用 UUID 不在其中必报错。
-            if isinstance(item, dict) and item.get("reference_id"):
-                continue
-            # 集合绑定是 {resource_id, entries}：装整个集合进环境（entries 子集由
-            # active_skills 承担，见派发侧）；普通项是 id 字符串。
-            rid = str(item.get("resource_id") or "").strip() if isinstance(item, dict) else str(item or "").strip()
-            if rid:
-                wanted.append((kind, rid))
-    if not wanted:
-        return []
-
-    user_id = str(user.id)
-    team_id = await resolve_team_id(user_id)
-    base_url = str(request.base_url).rstrip("/")
-    warnings: list[str] = []
-    kind_label = {"skill": "技能", "plugin": "插件"}
-
-    if env_mode == "shared":
-        from .environment_service import (
-            EnvironmentError,
-            add_environment_resource,
-            sync_environment,
-        )
-
-        env_id = str(payload.get("env_id") or "").strip()
-        if not env_id:
-            return []
-        added = 0
-        for kind, rid in wanted:
-            try:
-                await add_environment_resource(
-                    user_id, env_id, kind=kind, resource_id=rid, team_id=team_id
-                )
-                added += 1
-            except EnvironmentError as exc:
-                if exc.code == "conflict":
-                    # 已在环境里：勾选页把它当环境自带处理过，无需再装。
-                    continue
-                warnings.append(f"{kind_label[kind]} {rid} 加入环境失败：{exc.message}")
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"资源 {rid} 加入环境失败：{exc}")
-        if added:
-            try:
-                await sync_environment(
-                    user_id, env_id, team_id=team_id, request_base_url=base_url
-                )
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"环境同步失败，新资源待手动同步：{exc}")
-        return warnings
-
-    # system 档：每条走系统环境增量安装（覆盖同名=false，已存在自动跳过不报错）。
-    from .system_env_service import SystemEnvError, install_to_system_env
-
-    node_id = str(payload.get("node_id") or "").strip()
-    if not node_id:
-        return []
-    for kind, rid in wanted:
-        try:
-            await install_to_system_env(
-                user_id, node_id, kind=kind, resource_id=rid,
-                overwrite=False, team_id=team_id, request_base_url=base_url,
-            )
-        except SystemEnvError as exc:
-            warnings.append(f"{kind_label[kind]} {rid} 安装到节点本机失败：{exc.message}")
-        except Exception as exc:  # noqa: BLE001
-            warnings.append(f"资源 {rid} 安装到节点本机失败：{exc}")
-    return warnings
-
-
 @router.get("/legacy-session/{session_id}")
 async def resolve_legacy_task_session(
     session_id: str, user: User = Depends(get_current_user)
@@ -378,6 +235,12 @@ async def list_tasks(
     project_id: str | None = Query(None),
     status: str | None = Query(None),
 ) -> dict:
+    """分页查询当前用户的任务列表。
+
+    支持 ``project_id``（须为合法 UUID）与 ``status``（逗号分隔，取值
+    pending/processing/finished/error）过滤；``size`` 是 ``page_size`` 的别名，
+    同时传时以 ``size`` 为准。返回 total/page/page_size/rows。
+    """
     if project_id is not None:
         project_id = project_id.strip()
         if not project_id:
@@ -414,8 +277,32 @@ async def list_tasks(
     }
 
 
+@router.get("/create-defaults")
+async def get_create_defaults(
+    project_id: str | None = Query(None),
+    provider: str | None = Query(None),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """读「创建任务」的配置缓存（按 用户+项目+编辑器）。没存过则空 dict。"""
+    payload = await task_service.get_create_defaults(str(user.id), project_id, provider or "")
+    return {"defaults": payload}
+
+
+@router.put("/create-defaults")
+async def put_create_defaults(
+    body: dict,
+    project_id: str | None = Query(None),
+    provider: str | None = Query(None),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """写「创建任务」的配置缓存（upsert）。body 就是表单态整包。"""
+    payload = await task_service.save_create_defaults(str(user.id), project_id, provider or "", body)
+    return {"defaults": payload}
+
+
 @router.get("/{task_id}")
 async def get_task(task_id: str, user: User = Depends(get_current_user)) -> dict:
+    """查询单个任务的详情（含运行态、模型映射、资源绑定）；不存在或无权限返回 404。"""
     task = await task_service.get_task(str(user.id), task_id, role=user.role)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -426,6 +313,13 @@ async def get_task(task_id: str, user: User = Depends(get_current_user)) -> dict
 async def create_task(
     body: CreateTaskReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """创建任务并返回持久化的任务记录（派发为异步，节点准备进度以「准备中」暴露）。
+
+    写入前会规范化 reasoning_effort 与分支策略、把资源引用解析为服务端可信的
+    绑定（未授权的资源 id 直接 403）、并把可选项目提示词前缀拼进 content。
+    错误经 ValueError 归一映射为 400/403/409。响应可能含一次性明文 api_key，
+    审计日志会脱敏。
+    """
     payload = body.model_dump(exclude_none=True)
     if "reasoning_effort" in payload:
         effort = str(payload["reasoning_effort"] or "").strip().lower()
@@ -449,13 +343,6 @@ async def create_task(
     # Resolve resource references to trusted wire specs before persistence, so
     # unauthorized ids never reach the row or the node dispatch payload.
     payload.update(await _resolve_task_resource_configs(user, payload, request))
-    # 「没有就安装」：勾选了环境里还没有的平台资源（shared/system 档）时，先真装
-    # 进环境/节点本机再创建派发——任务启动时资源已就位。best-effort：失败记为
-    # 警告随响应返回，不阻断创建（任务照常派发，只是可能暂缺个别资源）。
-    try:
-        env_install_warnings = await _install_missing_env_resources(user, payload, request)
-    except Exception as exc:  # noqa: BLE001 — 安装链路的任何意外都不挡任务创建
-        env_install_warnings = [f"环境资源安装失败：{exc}"]
     # Resolve an optional project prompt. The dispatch session has no prompt
     # slot, so — matching the webhook review path — the granted prompt's content
     # is prepended to the task body. ``prompt_id`` itself is not persisted.
@@ -485,8 +372,13 @@ async def create_task(
             "parent_api_key_required": "运行任务需要选择一个父 API Key",
             "parent_api_key_invalid": "父 API Key 不可用或已停用",
             "model_not_available_for_key": "所选模型不在父 API Key 的可用范围内",
+            "model_mapping_fallback_required": "模型映射需要先选择一个模型",
             "不支持的选择策略": "不支持的 API Key 选择策略",
             "codex_bootstrap_required": "Codex 任务需预注册客户端实例与首条内容",
+            # 私有仓库的 clone 只能经服务端 git proxy 鉴权。这两条是部署配置缺失，
+            # 直说缺什么，而不是让用户面对一个要求手输账号密码的 git。
+            "git_proxy_origin_missing": "私有仓库需要服务端 git 代理，但未配置控制面公网地址（AGENT_COMPOSE_NODE_SERVER_PUBLIC_URL），请联系管理员",
+            "git_proxy_token_missing": "私有仓库需要服务端 git 代理，但未配置控制面共享令牌（NODE_CONTROL_TOKEN），请联系管理员",
         }
         # 子 Key 白名单越权消息是动态的（带越权项列表），消息本身即面向用户，
         # 直接透出。
@@ -503,8 +395,6 @@ async def create_task(
             else 400
         )
         raise HTTPException(status_code=status_code, detail=detail) from exc
-    # 环境资源安装结果（成功无话，失败逐条警告）——前端创建后 toast 提示。
-    result["env_install_warnings"] = env_install_warnings
     # The create response may include a one-time plaintext ``api_key``; the
     # audit log must not retain it. Resource wire specs are also redacted —
     # only per-kind counts are audited.
@@ -524,6 +414,10 @@ async def create_task(
 async def stop_task(
     request: Request, task_id: str = Query(...), user: User = Depends(get_current_user)
 ) -> dict:
+    """停止指定任务（通过 query 参数 ``task_id`` 传入）。任务不存在返回 404。
+
+    注意：本路由必须声明在 ``PUT /{task_id}`` 之前，否则会被路径参数吞掉。
+    """
     ok = await task_service.stop_task(str(user.id), task_id, role=user.role)
     if not ok:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -537,6 +431,10 @@ async def stop_task(
 async def batch_stop_tasks(
     body: TaskBatchReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """批量停止任务（一次最多 100 个，去重后非空）。
+
+    逐条处理，单条失败不影响其余：返回 ``{stopped, failed:[{id,error}]}``。
+    """
     if not body.task_ids:
         raise HTTPException(status_code=400, detail="至少选择一个任务")
     if len(body.task_ids) > 100:
@@ -565,6 +463,10 @@ async def batch_stop_tasks(
 async def batch_delete_tasks(
     body: TaskBatchReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """批量删除任务（软删除，一次最多 100 个，去重后非空）。
+
+    逐条处理，单条失败不影响其余：返回 ``{deleted, failed:[{id,error}]}``。
+    """
     if not body.task_ids:
         raise HTTPException(status_code=400, detail="至少选择一个任务")
     if len(body.task_ids) > 100:
@@ -593,6 +495,11 @@ async def batch_delete_tasks(
 async def update_task(
     task_id: str, body: UpdateTaskReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """更新任务的标题/摘要/模型映射/资源绑定等字段（仅覆盖传入的字段）。
+
+    reasoning_effort 与资源引用解析同创建流程；模型映射校验失败返回 400，
+    任务不存在返回 404。
+    """
     fields = body.model_dump(exclude_none=True)
     if "reasoning_effort" in fields:
         effort = str(fields["reasoning_effort"] or "").strip().lower()
@@ -604,9 +511,19 @@ async def update_task(
     # Hot-update resource configs resolve the same way as create: resource_id
     # refs become trusted specs; unauthorized ids are rejected before persist.
     fields.update(await _resolve_task_resource_configs(user, fields, request))
-    result = await task_service.update_task(
-        str(user.id), task_id, fields, role=user.role
-    )
+    try:
+        result = await task_service.update_task(
+            str(user.id), task_id, fields, role=user.role
+        )
+    except ValueError as exc:
+        # 模型映射校验（形状 / 父 Key 可执行集合 / 兜底必填）与创建同源，错误
+        # 文案也沿用创建那套，别让详情页只看到一句笼统的「更新失败」。
+        reason = str(exc)
+        detail = {
+            "model_not_available_for_key": "所选模型不在父 API Key 的可用范围内",
+            "model_mapping_fallback_required": "模型映射需要先选择一个模型",
+        }.get(reason, "更新任务失败")
+        raise HTTPException(status_code=400, detail=detail) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     await audit_user_action(
@@ -621,6 +538,7 @@ async def update_task(
 async def delete_task(
     task_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除指定任务（软删除，不可恢复；仅限本人名下任务）。任务不存在返回 404。"""
     ok = await task_service.delete_task(str(user.id), task_id, role=user.role)
     if not ok:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -637,6 +555,12 @@ async def send_task_message(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """向任务发送一条用户消息，必要时启动运行时并返回派发结果。
+
+    支持附件与 ``client_message_id``（端到端幂等，重复请求不会重复执行）。
+    ValueError 归一映射为 404/403/422/409/503；控制面 RPC 异常统一 503，
+    客户端可重发。审计记录消息长度与附件数。
+    """
     try:
         result = await task_service.send_task_message(
             str(user.id),
@@ -675,6 +599,10 @@ async def send_task_message(
             "runtime_dispatch_conflict": "任务运行时启动冲突，请刷新后重试",
             "runtime_dispatch_failed": "任务运行时派发失败，请查看任务详情中的派发错误",
             "content_required": "消息不能为空",
+            # 私有仓库的 clone 只能经服务端 git proxy 鉴权；缺配置时直说缺什么，
+            # 而不是让用户面对一个要求手输账号密码的 git。
+            "git_proxy_origin_missing": "私有仓库需要服务端 git 代理，但未配置控制面公网地址（AGENT_COMPOSE_NODE_SERVER_PUBLIC_URL），请联系管理员",
+            "git_proxy_token_missing": "私有仓库需要服务端 git 代理，但未配置控制面共享令牌（NODE_CONTROL_TOKEN），请联系管理员",
         }.get(reason, "消息发送失败")
         raise HTTPException(status_code=status, detail=detail) from exc
     except RPCError as exc:
@@ -704,6 +632,7 @@ async def cancel_task_turn(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """取消任务当前正在进行的这一轮对话（不停止任务本身）。任务不存在返回 404。"""
     try:
         result = await task_service.cancel_task_turn(str(user.id), task_id, role=user.role)
     except ValueError as exc:
@@ -726,6 +655,10 @@ async def switch_task_model(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """切换任务的主模型（claude 档别名会被拦截并给出提示），下一条消息生效。
+
+    目标模型必须在所属 API Key 的可用范围内，否则返回 400；任务不存在返回 404。
+    """
     try:
         result = await task_service.switch_task_model(
             str(user.id), task_id, body.model_id, role=user.role
@@ -764,6 +697,10 @@ async def add_task_models(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """向任务的模型映射追加可用模型（须在该任务 API Key 的可用范围内）。
+
+    至少选择一个模型，模型超范围或被占用时返回 400；任务不存在返回 404。
+    """
     try:
         result = await task_service.add_task_models(
             str(user.id), task_id, body.models, role=user.role
@@ -797,6 +734,11 @@ async def start_task_runtime(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """启动任务运行时（在已绑定节点上派发并启动会话）。
+
+    未绑定节点、节点无权、节点控制面不可用、任务 Key 不可用、运行时冲突等
+    分别映射为 400/403/503/409；任务不存在返回 404。
+    """
     try:
         result = await task_service.start_task_runtime(
             str(user.id), task_id, role=user.role
@@ -834,6 +776,12 @@ async def restart_task_runtime(
     body: TaskRestartReq | None = None,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """重启任务运行时。
+
+    ``load_session=true``（默认）恢复 provider 会话继续对话；false 则丢弃运行
+    时上下文、保留任务工作区与已持久化的资源配置重新开始。任务不存在返回
+    404，无可用运行时返回 409。
+    """
     load_session = body.load_session if body is not None else True
     try:
         result = await task_service.restart_task_runtime(
@@ -861,6 +809,7 @@ async def disable_task_api_key(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """停用任务绑定的 API Key。任务不存在返回 404，任务没有可用 Key 返回 409。"""
     try:
         result = await task_service.disable_task_api_key(str(user.id), task_id, role=user.role)
     except ValueError as exc:
@@ -881,6 +830,11 @@ async def rotate_task_api_key(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """轮换任务的 API Key：签发新 Key 作废旧 Key，需要任务当前有可用运行时。
+
+    任务不存在返回 404、无可用运行时返回 409。返回体含一次性明文 Key，
+    审计日志已脱敏。
+    """
     try:
         result = await task_service.rotate_task_api_key(str(user.id), task_id, role=user.role)
     except ValueError as exc:
@@ -926,37 +880,65 @@ async def list_task_events_history(
 
 @router.get("/{task_id}/events")
 async def stream_task_events(task_id: str, user: User = Depends(get_current_user)):
+    """订阅任务实时事件的 SSE 流（text/event-stream）。
+
+    打开响应前先校验任务归属与运行时（任务不存在返回 404、无可用运行时返回
+    409）。首帧补发持久化历史供回放，之后消费共享 follower 扇进的同一序列，
+    慢消费者被摘（事件积压）时发 error 帧让页面重连拉历史。
+    """
     import json as _json
     from fastapi.responses import StreamingResponse
 
+    from agent import realtime
+    from user_platform.task_service import acquire_task_follower, release_task_follower
+
     # Resolve ownership/runtime before opening the response so invalid tasks get
     # a normal HTTP status instead of a late error inside an SSE stream.
+    # （与 task_events 的开头同两条检查，但这里不驱动生成器——驱动是共享
+    # follower 的职责，本路由只消费它扇进 hub 的同一序列。）
     try:
-        events = task_service.task_events(str(user.id), task_id, role=user.role)
-        first = await events.__anext__()
+        task = await task_service._owned_task_or_raise(str(user.id), task_id, user.role)
+        await task_service._live_node_session_id(task)
     except ValueError as exc:
         reason = str(exc)
         status = 404 if reason == "task_not_found" else 409
         detail = "任务不存在" if status == 404 else "任务当前没有可用运行时"
         raise HTTPException(status_code=status, detail=detail) from exc
-    except StopAsyncIteration:
-        first = None
+
+    # 与统一 WS 共享同一个驱动者（一个任务一条 node 流）：首帧持久化历史
+    # （/events/history 最新页）供回放，之后增量走 hub——与 WS 订阅者同一条
+    # 序列，不再有「谁发起谁看得到」。
+    try:
+        page = await task_service.list_task_events(
+            str(user.id), task_id, limit=200, role=user.role
+        )
+        history = page.get("rows") or []
+    except Exception:  # noqa: BLE001 — 历史读失败不阻断 live 流
+        history = []
+
+    await acquire_task_follower(task_id, str(user.id), user.role)
+    queue = realtime.subscribe("task", task_id)
 
     async def event_generator():
-        yield ": ok\n\n"
         try:
-            if first is not None:
-                kind = first.get("kind")
-                name = "agent_event" if kind == "structured" else kind or "message"
-                yield f"event: {name}\ndata: {_json.dumps(first, ensure_ascii=False)}\n\n"
-            async for event in events:
+            yield ": ok\n\n"
+            for row in history:
+                yield f"event: message\ndata: {_json.dumps(row, ensure_ascii=False)}\n\n"
+            while True:
+                frame = await queue.get()
+                if frame.get("type") == "lagged":
+                    # 慢消费者被摘：让页面自己重连拉历史，不喂半截流。
+                    yield "event: error\ndata: {\"message\": \"事件积压，请刷新页面重试\"}\n\n"
+                    return
+                event = frame.get("event") or {}
                 kind = event.get("kind")
                 name = "agent_event" if kind == "structured" else kind or "message"
                 yield f"event: {name}\ndata: {_json.dumps(event, ensure_ascii=False)}\n\n"
                 if kind == "result":
-                    break
-        except Exception as exc:  # noqa: BLE001
-            yield f"event: error\ndata: {_json.dumps({'message': str(exc)}, ensure_ascii=False)}\n\n"
+                    return
+        finally:
+            realtime.unsubscribe("task", task_id, queue)
+            release_task_follower(task_id)
 
     return StreamingResponse(
         event_generator(),
@@ -967,40 +949,9 @@ async def stream_task_events(task_id: str, user: User = Depends(get_current_user
 
 @router.get("/{task_id}/stats")
 async def task_stats(task_id: str, user: User = Depends(get_current_user)) -> dict:
+    """当前这条会话最新一条消息的 token 用量（不是任务累计）。
+
+    口径与对话区进度圈一致：用户看这个数是想知道「这轮上下文用了多少」，
+    累计值回答不了（跑得越久越大，跟当前这轮无关）。
+    """
     return await task_service.task_stats(str(user.id), task_id, role=user.role)
-
-
-@router.get("/{task_id}/logs")
-async def list_task_request_logs(
-    task_id: str,
-    limit: int = Query(100, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    user: User = Depends(get_current_user),
-) -> dict:
-    try:
-        return await task_service.list_task_request_logs(
-            str(user.id), task_id, limit=limit, offset=offset, role=user.role
-        )
-    except ValueError as exc:
-        if str(exc) == "task_not_found":
-            raise HTTPException(status_code=404, detail="任务不存在")
-        raise
-
-
-@router.get("/{task_id}/logs/{log_id}")
-async def get_task_request_log(
-    task_id: str,
-    log_id: int,
-    user: User = Depends(get_current_user),
-) -> dict:
-    try:
-        log = await task_service.get_task_request_log_detail(
-            str(user.id), task_id, log_id, role=user.role
-        )
-    except ValueError as exc:
-        if str(exc) == "task_not_found":
-            raise HTTPException(status_code=404, detail="任务不存在")
-        raise
-    if log is None:
-        raise HTTPException(status_code=404, detail="日志不存在")
-    return log

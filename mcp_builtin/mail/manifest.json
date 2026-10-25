@@ -79,6 +79,11 @@
               "title": "邮箱后缀",
               "description": "该邮箱服务生成地址时使用的域名后缀，如 example.com；供 mail_info 工具返回给模型。"
             },
+            "proxy_id": {
+              "type": "string",
+              "title": "出站代理",
+              "description": "代理池条目 id（空=直连）。查询邮件时经共享代理池路由，支持 network/url_prefix/direct/node/browser 五模式。"
+            },
             "username": {
               "type": "string",
               "title": "用户名",

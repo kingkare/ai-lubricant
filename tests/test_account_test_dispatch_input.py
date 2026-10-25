@@ -126,7 +126,7 @@ def test_media_branches_keep_operation_and_minimal_body():
 
 
 def test_sim_client_carries_real_client_headers():
-    """模拟客户端时 headers 用 CLIENT_PRESETS 里该客户端的真实头（含 User-Agent）。"""
+    """模拟客户端时 headers 用该客户端的真实头（含 User-Agent + 会话头）。"""
     from providers.custom import CustomProvider
 
     for client_type, preset_key in (
@@ -139,8 +139,12 @@ def test_sim_client_carries_real_client_headers():
         built = _build(client_type=client_type)
         preset_headers = CustomProvider.CLIENT_PRESETS[preset_key]
         assert built["headers"], client_type
-        assert "User-Agent" in built["headers"]
-        # 头 COPY 自 CLIENT_PRESETS，不被原地改坏。
+        assert built["headers"]["User-Agent"] == preset_headers["User-Agent"]
+        # 头 COPY 自 CLIENT_PRESETS（不被原地改坏）；opencode 额外补每请求现造的会话头。
+        if preset_key in ("opencode", "opencode-cli"):
+            assert built["headers"]["x-session-affinity"].startswith("ses_")
+            assert built["headers"]["x-session-id"] == built["headers"]["x-session-affinity"]
+            continue
         assert built["headers"] == preset_headers
 
 

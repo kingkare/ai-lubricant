@@ -34,6 +34,7 @@ from .render import (
     render_marker,
     render_mobile_release,
     render_node_release,
+    render_server_release,
 )
 from .validator import item_path, index_path, safe_item_id
 
@@ -42,6 +43,7 @@ MARKER_PATH = "marketplace.json"
 NODE_RELEASE_PATH = "node-releases/version.json"
 MOBILE_RELEASE_PATH = "mobile-releases/version.json"
 DEVICE_CONTROL_RELEASE_PATH = "device-control-releases/version.json"
+SERVER_RELEASE_PATH = "server-releases/version.json"
 
 _WAKE_POLL_SECONDS = 1.0        # enqueue 唤醒之外的兜底轮询
 _STALE_REQUEUE_SECONDS = 60.0   # stale pushing 检查周期
@@ -371,20 +373,23 @@ async def _publish_module_locked(store, client: MarketplaceGitHub, module: str, 
             except Exception:  # noqa: BLE001 - 缓存写失败不该让发布失败，下轮 sync 会补上
                 pass
     elif module == "server-versions":
-        # 服务端版本线不写仓库文件：没有资产要托管，一版 = 一个 git tag。登记即门槛
-        # ——published 条目才进本进程快照（升级卡片据此显示可升级），draft 不进。
-        # 空 payload 同样要 apply（撤回最新版时把快照清空，否则卡片一直推荐已撤的版本）。
-        from .render import render_server_release
-
+        # 与另三条发行线同构：渲染 server-releases/version.json 写进市场仓，
+        # 部署实例轮询这份文件比对版本。草稿不进（draft = 发了但不推给用户）。
         manifests = await store.list_manifests(module, include_hidden=True)
         payload, errors = render_server_release(manifests)
         if errors:
-            raise RuntimeError("服务端版本投影失败: " + "; ".join(errors))
-        try:
-            import server_release_catalog
-            await server_release_catalog.apply_release(payload)
-        except Exception:  # noqa: BLE001 - 缓存写失败不该让发布失败，下轮 sync 会补上
-            pass
+            raise RuntimeError("server version.json 渲染失败: " + "; ".join(errors))
+        await client.write_json(
+            SERVER_RELEASE_PATH, payload,
+            f"market(server-versions): version.json -> {payload.get('version') or 'empty'}",
+        )
+        # 本进程快照立即生效（与另三条线同款 apply）。
+        if payload.get("version"):
+            try:
+                import server_release_catalog
+                await server_release_catalog.apply_release(payload)
+            except Exception:  # noqa: BLE001 - 缓存写失败不该让发布失败，下轮 sync 会补上
+                pass
 
     # ⑤ 本进程消费缓存失效：写完立即可读（外部部署读仓库 raw 有 CDN 传播延迟，
     # 由各自 TTL 收敛，语义不变）。

@@ -105,7 +105,10 @@ async def _dispatch_renew(
         role = "user"
 
     body = WdaJobRequest(
-        device_id=resource.get("data", {}).get("device_id", "") or "",
+        # list_resources 返回扁平化 DTO（无 "data" 层）——此前读 resource["data"]
+        # 恒为 {}，device_id 恒空 → renew_wda 400「设备缺少节点绑定信息」，
+        # 自动续签每次都派发失败。直接读顶层。
+        device_id=resource.get("device_id", "") or "",
         action="renew",
         signing_profile_id=signing_profile_id,
     )
@@ -135,6 +138,78 @@ async def _dispatch_renew(
             exc_info=True,
         )
     return job_id
+
+
+#: 设备在线时允许「插上即续」的状态：到期窗口 + 已过期。过期后插线也该自动救
+#: 回来，不等 6h 扫描、更不该只发通知让用户手动点（用户的诉求就是「每次连接
+#: 自动签名」）。
+_CONNECT_RENEW_STATES = ("renewal_due", "expired")
+
+
+def _short_wda_state(value: object) -> str:
+    """proto 全名 "IOS_WDA_STATE_READY" / 短名 "ready" → 小写短名。"""
+    raw = str(value or "").strip()
+    if raw.startswith("IOS_WDA_STATE_"):
+        raw = raw[len("IOS_WDA_STATE_"):]
+    return raw.lower()
+
+
+async def renew_on_connect(
+    resource: dict, ios_info: dict, *, now: datetime | None = None
+) -> bool:
+    """设备在线且签名到期/已过期 → 立即派发续签。返回是否派发成功。
+
+    由对账循环（每 30s）在设备 present 时调用——手机一插上就把续签跑掉，不
+    等 6h 扫描器。与扫描器共享同一道 12h 防风暴闸（``last_auto_renew_at``），
+    两条路径不会重复派发。
+
+    **预占闸**：先写 ``last_auto_renew_at`` 再派发。派发失败（会话过期/网络抖动/
+    Apple 限流）时不会每 30s 重投——否则失败会变成对 Apple 的高频轰炸，正撞
+    风控（-80045）。失败留给下一轮 12h 后或 6h 扫描器兜底。
+    """
+    import builtin_tool_store
+
+    now = now or datetime.now(timezone.utc)
+    if ios_info.get("auto_renew") is False:
+        return False
+    signing_profile_id = ios_info.get("signing_profile_id")
+    if not signing_profile_id:
+        return False
+    if ios_info.get("present") is not True:
+        return False
+    if _short_wda_state(ios_info.get("wda_state")) not in _CONNECT_RENEW_STATES:
+        return False
+    last_at = _parse_iso(ios_info.get("last_auto_renew_at") or "")
+    if last_at is not None and (now - last_at).total_seconds() < RENEW_GUARD_SECONDS:
+        return False
+    try:
+        resource_id = int(resource.get("id") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not resource_id:
+        return False
+
+    payload = dict(ios_info)
+    payload["last_auto_renew_at"] = now.isoformat()
+    try:
+        await builtin_tool_store.update_resource(resource_id, {"ios": payload})
+    except Exception:  # noqa: BLE001 — 预占闸写失败就不派发（防风暴优先）
+        logger.warning(
+            "[ios-auto-renew] connect pre-claim write failed resource=%s",
+            resource_id,
+            exc_info=True,
+        )
+        return False
+
+    job_id = await _dispatch_renew(
+        resource, payload, signing_profile_id=int(signing_profile_id)
+    )
+    if job_id:
+        logger.info(
+            "[ios-auto-renew] connect-triggered renew job=%s resource=%s udid=%s state=%s",
+            job_id, resource_id, ios_info.get("udid"), _short_wda_state(ios_info.get("wda_state")),
+        )
+    return bool(job_id)
 
 
 async def _notify_failure(
@@ -217,16 +292,47 @@ async def _scan_once(client: NodeClient) -> int:
         if not isinstance(ios_info, dict):
             continue
         signing_profile_id = ios_info.get("signing_profile_id")
-        expires_at = ios_info.get("wda_profile_expires_at") or ios_info.get("profile_expires_at") or ""
-        if not signing_profile_id or not expires_at:
+        # signing_profile_id 是唯一的硬前置（续期要用哪套配置）。到期时间**不**在这里
+        # 当门禁——prepare 从不落 profile_expires_at，把它当硬前置会让扫描器对每台
+        # 设备第一行就 continue，自动续签永不触发（线上现象：「续签不自动进行」）。
+        # 到期时间改从节点 inventory 现读（见下），读到再判定 + 回写。
+        if not signing_profile_id:
             continue
         if ios_info.get("auto_renew") is False:
             continue
         renew_before_days = int(ios_info.get("renew_before_days") or DEFAULT_RENEW_BEFORE_DAYS)
 
-        # 先把上一轮 renew 完成的 profile_expires_at 回写（顺带做）
+        node_id = (ios_info.get("node_id") or "").strip()
+        udid = (ios_info.get("udid") or "").strip()
+        if not node_id or not udid:
+            continue
+
+        # 节点 inventory 是 wda_state / profile_expires_at 的**真相源**（设备自报、
+        # 持久）。先读它，既拿在线/状态，也拿到到期时间。
+        inv = await _device_inventory_state(client, node_id, udid)
+        if inv is None:
+            # 节点离线/不可达，本轮跳过（不通知——下一轮节点回来再说）
+            continue
+
+        # 到期时间：inventory 现读优先；落库的 wda_profile_expires_at 兜底。读到
+        # 就回写（前端徽章 + 下一轮判定都靠它）——这正是此前缺失的一环。
+        inv_exp = str(inv.get("profile_expires_at") or "").strip()
+        expires_at = inv_exp or ios_info.get("wda_profile_expires_at") or ""
+        if inv_exp and inv_exp != (ios_info.get("wda_profile_expires_at") or ""):
+            payload = dict(ios_info)
+            payload["wda_profile_expires_at"] = inv_exp
+            try:
+                await builtin_tool_store.update_resource(int(res["id"]), {"ios": payload})
+                ios_info = payload
+            except Exception:  # noqa: BLE001 — 回写失败不影响本轮判定
+                pass
+
+        # 上一轮 renew 完成的 profile_expires_at 顺带回写（snapshot 路径）。
         await _sync_completed_result(client, res, ios_info)
 
+        if not expires_at:
+            # 设备还没上报描述文件到期（刚装/刚认领），本轮跳过。
+            continue
         if not _needs_renew(expires_at, renew_before_days, now):
             continue
         # 防风暴：12h 内派过跳过
@@ -234,14 +340,14 @@ async def _scan_once(client: NodeClient) -> int:
         if last_at is not None and (now - last_at).total_seconds() < RENEW_GUARD_SECONDS:
             continue
 
-        node_id = (ios_info.get("node_id") or "").strip()
-        udid = (ios_info.get("udid") or "").strip()
-        if not node_id or not udid:
-            continue
-
-        inv = await _device_inventory_state(client, node_id, udid)
-        if inv is None:
-            # 节点离线/不可达，本轮跳过（不通知——下一轮节点回来再说）
+        # 设备不在线（手机被拔/枚举不到）：本轮跳过，不派发。续期和初始化一样
+        # 需要手机插着；离线时 renew_wda 的在线门禁也会 409，这里先跳过省一次
+        # 必然失败的往返。插回来之后下一轮自然接上。
+        if not inv.get("present"):
+            logger.debug(
+                "[ios-auto-renew] device offline, skipping resource=%s udid=%s",
+                res.get("id"), udid,
+            )
             continue
         wda_state = (inv.get("wda_state") or "").lower()
         # 只在 ready/renewal_due 自动续；expired 走失败通知不自动重试

@@ -6,7 +6,7 @@ Prepare the browser automation environment before first use of the `web` tool's 
 
 ## Check availability
 
-Browser operations (`web` with `operation=execute`, `tabs`, `screenshot`, or `scan` with a `tab`) require a browser-class MCP service bound to the Agent. The system detects such services dynamically — never assume a service name. If none is bound, the tool returns `browser_mcp_not_configured`.
+Browser operations (`web` with any `operation` other than a plain-HTTP `read_page`) require a browser-class MCP service bound to the Agent. The system detects such services dynamically — never assume a service name. If none is bound, the tool returns `browser_mcp_not_configured`.
 
 ## Bind a browser MCP
 
@@ -14,9 +14,9 @@ Browser operations (`web` with `operation=execute`, `tabs`, `screenshot`, or `sc
 2. Reopen the conversation; the `[Available Capabilities]` index should list the service with a `browser` capability label.
 3. Verify by calling `web(operation="tabs")`; a valid response means the binding works.
 
-## First scan/execute
+## First read_page/execute
 
-- Start with `web(operation="scan", url="...")` for static public content.
+- Start with `web(operation="read_page", url="...")` for static public content.
 - Use `web(operation="execute", script="document.title")` to confirm the live session responds.
 - Record the working browser procedure with `start_long_term_update` after it is verified.
 

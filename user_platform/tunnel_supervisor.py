@@ -56,14 +56,23 @@ class LocalTunnelSupervisor:
         revision: int,
     ) -> None:
         from . import tunnel_binaries
-        from .tunnel_node_dispatch import _frpc_group_toml, _npc_conf
+        from .tunnel_node_dispatch import (
+            _chmlfrp_frpc_ini, _frpc_group_toml, _npc_conf,
+        )
 
         key = str(runtime.id)
         await self.stop_runtime(key)
         binary = await tunnel_binaries.ensure_binary(scheme.kind, scheme.config or {})
         env: dict[str, str] = {}
 
-        if scheme.kind == "frpc":
+        if scheme.kind == "chmlfrp":
+            # Panel-issued ini (created once via the panel, cached on the runtime).
+            path = self._conf_path(f"runtime-{runtime.id}-r{revision}.ini")
+            path.write_text(
+                await _chmlfrp_frpc_ini(runtime, scheme, bindings), encoding="utf-8"
+            )
+            args = ["-c", str(path)]
+        elif scheme.kind == "frpc":
             path = self._conf_path(f"runtime-{runtime.id}-r{revision}.toml")
             path.write_text(_frpc_group_toml(bindings, scheme), encoding="utf-8")
             args = ["-c", str(path)]

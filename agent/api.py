@@ -15,11 +15,12 @@ from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from agent.config import AgentConfig
-from agent.context_manager import rebuild_history_messages, attach_tool_result, _collect_attachment_media
+from agent.config import AgentConfig, DEFAULT_MAX_TURNS
+from agent.context_manager import rebuild_history_messages
+from agent.turn_writer import ConversationTurnWriter
 from agent.memory import MemorySystem
 from agent.tools import ToolContext, ToolRegistry
-from agent import conversation_store, scene_context
+from agent import conversation_hub, conversation_state, conversation_store, realtime, scene_context, run_state
 # 审批超时中止本轮的信号异常（仅 stdlib 依赖，模块级导入无循环风险）。
 from user_platform.node_client.approvals import ApprovalDenied, ApprovalTimeout
 
@@ -235,6 +236,19 @@ _TASKS: dict[str, AgentTaskResponse] = {}
 _TASK_HANDLES: dict[str, asyncio.Task] = {}
 _AGENT_CONFIG = AgentConfig()
 
+# supervisor 模式的常驻红线（api.py 与 cdp_chat_service.py 两个注入点共用同一份，
+# 防止两处文案漂移）。只内联红线关键句 + SOP 路径——SOP 正文（5KB）不进 prompt，
+# 让模型 file_read；本仓库 agent 侧无 prompt cache，正文常驻是纯开销。
+_SUPERVISOR_HINT = (
+    "\n\n[Supervisor Mode] You supervise; you do NOT do the work. Never perform the "
+    "task yourself — no file_write/file_patch, no side-effect code_run, no browser "
+    "actions. Only read-only probing is allowed (file_read, web read_page, read-only "
+    "inspect). Your loop: decompose the user's goal → spawn_subagent (role: "
+    "explore|verify|build, self-contained task brief) → verify its evidence → rework "
+    "via a new spawn if it fails. Delegation is your default action, not a last "
+    "resort. Read memory/sop/supervisor_sop.md first for the full SOP."
+)
+
 
 def _build_tool_registry(agent_id: int | None = None, owner_user_id: str | None = None) -> ToolRegistry:
     """Build the fixed GA tool registry (GA atomic tools + capability_call).
@@ -247,6 +261,10 @@ def _build_tool_registry(agent_id: int | None = None, owner_user_id: str | None 
 
 @router.post("/task", response_model=AgentTaskResponse)
 async def create_task(request: AgentTaskRequest) -> AgentTaskResponse:
+    """创建一次性 Agent 任务：立即返回 task_id（status=queued），后台异步执行。
+
+    任务不经对话/事件流，结果只落在 GET /task/{task_id} 轮询的进程内任务表。
+    """
     task_id = uuid.uuid4().hex
     task_state = AgentTaskResponse(task_id=task_id, status="queued")
     _TASKS[task_id] = task_state
@@ -256,6 +274,7 @@ async def create_task(request: AgentTaskRequest) -> AgentTaskResponse:
 
 @router.get("/task/{task_id}", response_model=AgentTaskResponse)
 async def get_task(task_id: str) -> AgentTaskResponse:
+    """查询一次性任务状态；task_id 未找到 → 404。"""
     task_state = _TASKS.get(task_id)
     if task_state is None:
         raise HTTPException(status_code=404, detail="task not found")
@@ -264,6 +283,7 @@ async def get_task(task_id: str) -> AgentTaskResponse:
 
 @router.post("/task/{task_id}/abort", response_model=AgentTaskResponse)
 async def abort_task(task_id: str) -> AgentTaskResponse:
+    """中止一次性任务：cancel 后台协程，queued/running 翻成 aborted（已结束的不改）。"""
     task_state = _TASKS.get(task_id)
     if task_state is None:
         raise HTTPException(status_code=404, detail="task not found")
@@ -281,6 +301,7 @@ async def abort_task(task_id: str) -> AgentTaskResponse:
 
 @router.get("/status", response_model=AgentStatusResponse)
 async def get_status() -> AgentStatusResponse:
+    """汇总本进程内一次性任务的计数（total/queued/running/active/completed/failed/aborted）。"""
     counts = {status: 0 for status in ("queued", "running", "completed", "failed", "aborted")}
     for task in _TASKS.values():
         counts[task.status] += 1
@@ -300,11 +321,13 @@ async def get_status() -> AgentStatusResponse:
 
 @router.get("/tools/schema", response_model=ToolsSchemaResponse)
 async def get_tools_schema() -> ToolsSchemaResponse:
+    """返回 Agent 工具注册表全量 schema（GA 原子工具 + capability_call）。"""
     return ToolsSchemaResponse(tools=_build_tool_registry().get_schema())
 
 
 @router.get("/sops")
 async def list_sops(caller: str | None = Depends(get_agent_caller)) -> dict:
+    """列出 SOP 资源目录（含停用条目）并附每条正文；写操作仅管理员。"""
     from agent.sop_service import get_content, list_catalog
 
     rows = await list_catalog(include_disabled=True)
@@ -318,6 +341,7 @@ async def list_sops(caller: str | None = Depends(get_agent_caller)) -> dict:
 
 @router.post("/sops")
 async def create_sop(request: SopCreateRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """新建 SOP 资源。仅管理员可用（带 caller 的用户调用 → 403）。"""
     if caller is not None:
         raise HTTPException(403, "SOP 资源管理仅管理员可用")
     from agent.sop_service import create_sop as create
@@ -327,6 +351,7 @@ async def create_sop(request: SopCreateRequest, caller: str | None = Depends(get
 
 @router.patch("/sops/{sop_id}")
 async def update_sop(sop_id: str, request: SopUpdateRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """更新 SOP（revision 乐观锁，冲突 409；内容校验失败 400）。仅管理员可用。"""
     if caller is not None:
         raise HTTPException(403, "SOP 资源管理仅管理员可用")
     from agent.sop_service import update_sop as update
@@ -341,6 +366,7 @@ async def update_sop(sop_id: str, request: SopUpdateRequest, caller: str | None 
 
 @router.delete("/sops/{sop_id}")
 async def delete_sop(sop_id: str, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """删除 SOP 资源；仅管理员可用，未找到 → 404。"""
     if caller is not None:
         raise HTTPException(403, "SOP 资源管理仅管理员可用")
     from agent.sop_service import delete_sop as remove
@@ -376,15 +402,22 @@ async def get_memory(limit: int = 50) -> MemoryResponse:
 
 @router.get("/config")
 async def get_config() -> dict[str, Any]:
+    """读取 Agent 主配置快照（内存态 AgentConfig）。"""
     return _AGENT_CONFIG.to_dict()
 
 
 @router.post("/config")
 async def update_config(config_update: dict[str, Any]) -> dict[str, Any]:
+    """合并更新 Agent 主配置（仅覆盖传入键）。
+
+    调度总开关已下线：调度意图只来自 per-agent 开关与任务创建/启用。
+    """
     global _AGENT_CONFIG
     merged = _AGENT_CONFIG.to_dict()
     merged.update(config_update)
     _AGENT_CONFIG = AgentConfig.from_dict(merged)
+    # 调度闸门不再有主配置总开关（agent.scheduler_enabled 已删）：调度意图只来自
+    # per-agent 开关（/agents CRUD 里 _ensure_scheduler_running）和任务创建/启用。
     return _AGENT_CONFIG.to_dict()
 
 
@@ -397,7 +430,7 @@ class CreateAgentRequest(BaseModel):
     display_name: str | None = None
     description: str = ""
     system_prompt: str = ""
-    max_turns: int = 80
+    max_turns: int = DEFAULT_MAX_TURNS
     enabled: bool = True
     memory_enabled: bool = True
     skill_auto_learn: bool = True
@@ -416,6 +449,10 @@ class CreateAgentRequest(BaseModel):
     llm_retry_429: int = 2
     # 需确认工具挂起等人裁决的上限（秒）；0=不过期。见 AgentConfig.approval_timeout_seconds。
     approval_timeout_seconds: int = 24 * 60 * 60
+    # 上下文压缩：auto_compact 开着则每轮自动压缩历史；compact_threshold 是前端
+    # token 卡占比达到该值时弹框提醒压缩的阈值（0~1）。见 AgentConfig.auto_compact。
+    auto_compact: bool = True
+    compact_threshold: float = 0.8
     # 浏览器（CDP 网页对话）能否执行 code_run。默认关：CDP 路径不挂审批协调器，
     # code_run 直接 denied 并提示开启本配置。用户端聊天页不受影响（照旧走审批）。
     browser_code_run_enabled: bool = False
@@ -425,6 +462,9 @@ class CreateAgentRequest(BaseModel):
     main_model: str = ""
     subagent_api_key_id: int | None = None
     subagent_model: str = ""
+    # 子 Agent 岗位/难度 → 模型映射（{"roles":{...},"categories":{...}}，值是网关
+    # 模型 id）。空 = 未配 → 运行时逐层回落，行为与改动前一致。
+    subagent_model_map: dict = {}
     # 定时任务默认 key/模型：无人值守跑批常要换个更便宜/更稳的模型，且不该借用
     # subagent_*（那是「主 agent 派生的并行子任务」）。留空则回退主 Agent。
     scheduled_api_key_id: int | None = None
@@ -453,11 +493,14 @@ class UpdateAgentRequest(BaseModel):
     reasoning_effort: str | None = None
     llm_retry_429: int | None = None
     approval_timeout_seconds: int | None = None
+    auto_compact: bool | None = None
+    compact_threshold: float | None = None
     browser_code_run_enabled: bool | None = None
     main_api_key_id: int | None = None
     main_model: str | None = None
     subagent_api_key_id: int | None = None
     subagent_model: str | None = None
+    subagent_model_map: dict | None = None
     scheduled_api_key_id: int | None = None
     scheduled_model: str | None = None
     mcp_user_id: int | None = None
@@ -562,6 +605,16 @@ async def reconcile_agent_mcp_principals() -> dict[str, int]:
 
 @router.post("/agents")
 async def create_agent(request: CreateAgentRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """创建 Agent（敏感写操作，多重校验与副作用）。
+
+    - 必填网关 key + 模型（main_api_key_id/main_model），形成计费/限流/归属闭环；
+      子 Agent/定时 key 可选，写库前按 owner 校验 key 可用性。
+    - 自动创建 usage_type=agent 的 MCP principal 并绑定（失败 500）；落库失败回滚
+      该 principal 避免孤儿。
+    - owner 恒为真实 uid；团队共享由 is_team_shared+team_id 表达。
+    - 附带初始化 Agent 私有记忆文件，并签发 MCP 身份 token（明文只随本次响应返回，
+      token 表只存哈希）。
+    """
     from db import PostgresClient
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -576,6 +629,20 @@ async def create_agent(request: CreateAgentRequest, caller: str | None = Depends
     if request.scheduled_api_key_id:
         await _validate_agent_gateway_key(request.scheduled_api_key_id, caller)
     _validate_approval_timeout(request.approval_timeout_seconds)
+    # 岗位/难度 → 模型映射归一 + 校验：空 map = 未配 → 存 '{}'（运行时逐层回落）。
+    # 非空时每个模型值必须落在被使用 key 的可执行集合内（子 key 已绑用子 key，否则
+    # 主 key——与运行时 fork/专用 key 分支同源）；非法值直接抛错，不静默丢。
+    from agent.agent_main import _normalize_subagent_model_map
+    normalized_map = _normalize_subagent_model_map(request.subagent_model_map)
+    _map_values = [v for block in normalized_map.values() for v in block.values() if v]
+    if _map_values:
+        from user_platform.task_service import _validate_models_for_key
+        await _validate_models_for_key(
+            request.subagent_api_key_id or request.main_api_key_id,
+            _map_values,
+            active_model=_map_values[0],
+        )
+    subagent_model_map_json = json.dumps(normalized_map, ensure_ascii=False)
     # mcp_user_id 创建时由后端自动建一个 usage_type=agent 的 principal 并绑定，
     # 不再接受请求传入（用户在 Agent 详情页配置该 principal 的权限）。
     # 平台 Agent（caller=None）建平台级 principal（owner=NULL）。
@@ -603,9 +670,11 @@ async def create_agent(request: CreateAgentRequest, caller: str | None = Depends
                     guardian_enabled, guardian_interval, autonomous_enabled,
                     thinking_enabled, reasoning_effort, llm_retry_429, mcp_user_id, user_id,
                     main_api_key_id, main_model, subagent_api_key_id, subagent_model,
+                    subagent_model_map,
                     approval_timeout_seconds, team_id, is_team_shared,
-                    scheduled_api_key_id, scheduled_model, browser_code_run_enabled
-                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
+                    scheduled_api_key_id, scheduled_model, browser_code_run_enabled,
+                    auto_compact, compact_threshold
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb,$27,$28,$29,$30,$31,$32,$33,$34,$35)
                 RETURNING *
                 """,
                 request.name, request.display_name or request.name, request.description,
@@ -618,10 +687,12 @@ async def create_agent(request: CreateAgentRequest, caller: str | None = Depends
                 auto_principal_id, owner_uid,
                 request.main_api_key_id, request.main_model,
                 request.subagent_api_key_id, request.subagent_model or "",
+                subagent_model_map_json,
                 request.approval_timeout_seconds,
                 team_id, request.is_team_shared,
                 request.scheduled_api_key_id, request.scheduled_model or "",
                 request.browser_code_run_enabled,
+                request.auto_compact, request.compact_threshold,
             )
         except Exception as e:
             # Agent 落库失败：回滚刚建的 principal，避免孤儿 principal。
@@ -652,11 +723,13 @@ async def create_agent(request: CreateAgentRequest, caller: str | None = Depends
         result["mcp_token"] = mcp_token
     except Exception as exc:  # noqa: BLE001
         logger.warning("[mcp] issue agent token failed agent=%s: %s", agent_id, exc)
+    _ensure_scheduler_running(request.scheduler_enabled)
     return result
 
 
 @router.get("/agents")
 async def list_agents(caller: str | None = Depends(get_agent_caller)) -> list[dict]:
+    """列出当前调用者可见的 Agent：管理员看全部；用户看自己创建的 + 团队共享的。"""
     from db import PostgresClient
     if not PostgresClient.pool:
         return []
@@ -668,6 +741,10 @@ async def list_agents(caller: str | None = Depends(get_agent_caller)) -> list[di
 
 @router.get("/agents/{agent_id}")
 async def get_agent(agent_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """查询单个 Agent 详情（含会话/技能/SOP 统计）。
+
+    可见性：自己创建的 + 团队共享；看不到别人的私有 Agent（404）。
+    """
     from db import PostgresClient
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -693,9 +770,7 @@ async def get_agent(agent_id: int, caller: str | None = Depends(get_agent_caller
             "skills": await conn.fetchval(
                 "SELECT COUNT(*) FROM agent_skills WHERE agent_id=$1", agent_id
             ) or 0,
-            "scheduled_tasks": await conn.fetchval(
-                "SELECT COUNT(*) FROM agent_scheduled_tasks WHERE agent_id=$1", agent_id
-            ) or 0,
+            # scheduled_tasks 计数已删（定时任务面下线，cron 统一走工作流）。
         }
     try:
         from agent.sop_service import list_for_agent
@@ -708,8 +783,32 @@ async def get_agent(agent_id: int, caller: str | None = Depends(get_agent_caller
 
 @router.get("/agents/{agent_id}/skills")
 async def get_agent_skills(agent_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
-    """Deprecated: the platform Skill catalog was removed; agents use SOPs."""
-    return {"skills": []}
+    """技能目录（对话输入框 `/` 弹层用）：运行时聚合 SOP 目录 + 生效 MCP 服务。
+
+    只回名字/描述，不回正文——正文由模型在命中技能时按需 file_read（见
+    skill_slash.collect_activated_skills，只注入基础信息到当前消息，不内联全文）。
+    鉴权与 GET /agent/agents/{id}/sops 同口径（owner 或平台 agent）。
+    """
+    from db import PostgresClient
+    from agent.skill_slash import build_catalog
+
+    row = await PostgresClient.get_agent(agent_id)
+    if not row:
+        raise HTTPException(404, f"Agent {agent_id} not found")
+    owner = row.get("user_id")
+    if caller is not None and owner is not None and str(owner) != str(caller):
+        raise HTTPException(404, f"Agent {agent_id} not found")
+    catalog = await build_catalog(agent_id, mcp_user_id=row.get("mcp_user_id"))
+    return {"skills": [
+        {
+            "kind": it.kind,
+            "name": it.name,
+            "display_name": it.display_name or it.name,
+            "description": it.description,
+            "enabled": it.enabled,
+        }
+        for it in catalog.items
+    ]}
 
 
 @router.get("/agents/{agent_id}/sops")
@@ -862,6 +961,11 @@ async def get_agent_mcp_diagnostics(agent_id: int, caller: str | None = Depends(
 
 @router.patch("/agents/{agent_id}")
 async def update_agent(agent_id: int, request: UpdateAgentRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """部分更新 Agent 配置（仅更新传入字段）。
+
+    权限：仅 owner 可改（管理员除外）。网关 key 绑定显式传入才更新（允许 null 解绑）；
+    subagent_model_map 非空时按生效子 key 校验模型可执行集合；mcp_user_id 不支持改绑。
+    """
     from db import PostgresClient
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -901,6 +1005,7 @@ async def update_agent(agent_id: int, request: UpdateAgentRequest, caller: str |
         "guardian_interval": int, "autonomous_enabled": bool,
         "thinking_enabled": bool, "reasoning_effort": str, "llm_retry_429": int,
         "approval_timeout_seconds": int, "browser_code_run_enabled": bool,
+        "auto_compact": bool, "compact_threshold": float,
         "main_model": str, "subagent_model": str, "scheduled_model": str,
     }
     for field_name, field_type in field_map.items():
@@ -916,6 +1021,29 @@ async def update_agent(agent_id: int, request: UpdateAgentRequest, caller: str |
             updates.append(f"{key_field}=${param_idx}")
             params.append(getattr(request, key_field))
             param_idx += 1
+
+    # 岗位/难度 → 模型映射：显式出现才更新（允许传 {} 清空回退旧行为）。非空时校验
+    # 每个模型值落在「生效的子 key」可执行集合内——key 可能本次没改，故现读一行解析
+    # 生效 key（子 key 已绑用子 key，否则主 key），与运行时同源。
+    if "subagent_model_map" in request.model_fields_set:
+        from agent.agent_main import _normalize_subagent_model_map
+        normalized_map = _normalize_subagent_model_map(request.subagent_model_map)
+        _map_values = [v for block in normalized_map.values() for v in block.values() if v]
+        if _map_values:
+            from user_platform.task_service import _validate_models_for_key
+            async with PostgresClient.pool.acquire() as conn:
+                cur = await conn.fetchrow(
+                    "SELECT main_api_key_id, subagent_api_key_id FROM agents WHERE id=$1",
+                    agent_id,
+                )
+            eff_sub = request.subagent_api_key_id if "subagent_api_key_id" in request.model_fields_set else (cur["subagent_api_key_id"] if cur else None)
+            eff_main = request.main_api_key_id if "main_api_key_id" in request.model_fields_set else (cur["main_api_key_id"] if cur else None)
+            await _validate_models_for_key(
+                eff_sub or eff_main, _map_values, active_model=_map_values[0],
+            )
+        updates.append(f"subagent_model_map=${param_idx}::jsonb")
+        params.append(json.dumps(normalized_map, ensure_ascii=False))
+        param_idx += 1
 
     # 团队共享开关：仅 owner 可切换（owner 校验已在上面通过）。
     if request.is_team_shared is not None:
@@ -936,11 +1064,13 @@ async def update_agent(agent_id: int, request: UpdateAgentRequest, caller: str |
         )
     if not row:
         raise HTTPException(404, f"Agent {agent_id} not found")
+    _ensure_scheduler_running(request.scheduler_enabled)
     return await _agent_row_to_dict(row)
 
 
 @router.delete("/agents/{agent_id}")
 async def delete_agent(agent_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """删除 Agent（级联清理 SOP 绑定等派生数据）。用户模式只能删自己创建的。"""
     from db import PostgresClient
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -963,6 +1093,7 @@ async def delete_agent(agent_id: int, caller: str | None = Depends(get_agent_cal
 
 @router.post("/agents/{agent_id}/toggle")
 async def toggle_agent(agent_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """切换 Agent 启用/停用。用户模式只能切换自己创建的 Agent。"""
     from db import PostgresClient
     if not PostgresClient.pool:
         raise HTTPException(503, "Database not available")
@@ -983,6 +1114,10 @@ async def toggle_agent(agent_id: int, caller: str | None = Depends(get_agent_cal
 async def get_agent_memory(
     agent_id: int, limit: int = 50, caller: str | None = Depends(get_agent_caller)
 ) -> MemoryResponse:
+    """读取 Agent 私有记忆（L1 洞察 / L2 事实 / L4 归档）。
+
+    记忆是 Agent 私有数据：仅 owner 或同团队共享成员可读。
+    """
     from db import PostgresClient
     # 记忆是 Agent 私有数据：仅 owner（或同团队共享 agent 的成员）可读。
     if not PostgresClient.pool:
@@ -1022,6 +1157,10 @@ async def _agent_row_to_dict(row) -> dict:
     d["main_model"] = d.get("main_model") or d.get("model") or ""
     d["subagent_api_key_id"] = d.get("subagent_api_key_id")
     d["subagent_model"] = d.get("subagent_model") or ""
+    # 岗位/难度 → 模型映射回显：asyncpg 把 JSONB 返回为 JSON 文本，归一成 dict 防
+    # 前端拿到 str。空 map = 未配，前端按 {} 渲染。
+    from agent.agent_main import _normalize_subagent_model_map as _norm_map
+    d["subagent_model_map"] = _norm_map(d.get("subagent_model_map"))
     # 定时任务默认绑定回显（空 = 跟随主 Agent）。
     d["scheduled_api_key_id"] = d.get("scheduled_api_key_id")
     d["scheduled_model"] = d.get("scheduled_model") or ""
@@ -1058,6 +1197,10 @@ async def _run_agent_task(task_id: str, request: AgentTaskRequest) -> None:
 # ── 对话管理 ─────────────────────────────────────────────────────────
 
 _CONV_TASKS: dict[str, asyncio.Task] = {}
+# 协作式停止信号：abort 端点先置位 → agent_loop 每轮调 AI 前/code_run 等子进程时
+# 检查它 → 命中即杀子进程树并 raise。与 _CONV_TASKS 同生命周期（_on_turn_done 清理）。
+# cancel() 仍作为兜底：置位管「查得到就停」，cancel 管「卡在 await 里的那次」。
+_CONV_STOPS: dict[str, asyncio.Event] = {}
 
 
 async def _reconcile_orphaned_streaming(conv_id: str) -> None:
@@ -1069,6 +1212,12 @@ async def _reconcile_orphaned_streaming(conv_id: str) -> None:
     元数据时对账：只要本进程没有该会话的活任务，就把残留 streaming 标记为
     已中断，前端回灌时不再无限转圈，也不会卡住新一轮发送的 409 检查。
     """
+    # 本进程仍有该会话的活任务 → 那条 streaming 是**真的**在跑，绝不能翻成 error
+    # （否则刷新一次就把正在执行的回复标记成失败）。docstring 的「没有活任务」前提
+    # 必须显式守住。
+    live = _CONV_TASKS.get(conv_id)
+    if live is not None and not live.done():
+        return
     try:
         messages = await conversation_store.get_messages(conv_id)
     except Exception:  # noqa: BLE001 — 对账失败不能阻断主流程
@@ -1107,6 +1256,8 @@ class UpdateConversationRequest(BaseModel):
     model: str | None = None
     llm_model_id: int | None = None
     reasoning_effort: str | None = None
+    # mode 是会话状态：一改即生效（后续轮/重试都沿用），不是单次请求参数。
+    mode: str | None = None
 
 
 class BatchDeleteConversationsRequest(BaseModel):
@@ -1135,6 +1286,12 @@ class GoalConfig(BaseModel):
     max_turns: int | None = Field(default=None, ge=1)
 
 
+class RalphConfig(BaseModel):
+    """Optional configuration for ralph mode (fresh child per round)."""
+    objective: str = Field(..., min_length=1)
+    max_rounds: int = Field(default=16, ge=1, le=64)
+
+
 class SendMessageRequest(BaseModel):
     content: str = Field(..., min_length=1)
     max_turns: int | None = Field(default=None, ge=1)
@@ -1143,49 +1300,63 @@ class SendMessageRequest(BaseModel):
     # GA chapter6 execution modes. interact = one-shot Q&A (default).
     # plan = complex-task planning (plan_sop, plan.md). goal = open objective +
     # time budget driven by Guardian until budget/turns exhausted.
-    # auto = 与 interact 同样的执行流程，只是审批门槛放宽：命中该执行节点
-    # 管理员维护的免审名单（auto_allow_keys）的只读命令不再弹卡。code_run 在
-    # auto 下仍然必审（服务端执行代码，没有分级风险判定之前不放行）。
-    mode: Literal["interact", "plan", "goal", "auto"] = "interact"
+    # ralph = open objective driven round by round; each round is a FRESH bounded
+    # agent loop carrying only the objective + the previous round's structured
+    # report, until the report says complete/blocked or the round cap is hit.
+    # auto = 与 interact 同样的执行流程，但审批全部自动放行：node_shell_exec /
+    # code_run / 越界 file_write 三类审批卡都不弹，直接执行（审计仍记录）。
+    # 等价于 Claude Code 的 bypassPermissions / Codex 的 danger-full-access，
+    # 是用户显式选择的高权限模式。
+    # supervisor = 监督模式：主 agent 不下场干活，只拆解 → 派子 agent → 按证据验收
+    # → 返工（红线内联见 _SUPERVISOR_HINT，全文见 memory/sop/supervisor_sop.md）。
+    # 等价于 GA 的 Conductor 模式 / 角色强制：委派是唯一合法动作。
+    mode: Literal["interact", "plan", "goal", "ralph", "auto", "supervisor"] = "interact"
     goal_config: GoalConfig | None = None
+    ralph_config: RalphConfig | None = None
 
 
-class CreateScheduledTaskRequest(BaseModel):
-    name: str = Field(..., min_length=1)
-    cron_expression: str = Field(..., min_length=1)
-    task_prompt: str | None = None
-    skill_id: int | None = None
-    enabled: bool = True
-    # 任务归属的 Agent：决定到点用哪个 Agent 的配置跑（prompt 模式）/ 哪个沙箱边界执行脚本。
-    agent_id: int | None = None
-    # 脚本型任务 + 定时背景 + 报错自愈（task_kind='script' 时生效）
-    task_kind: str = "prompt"
-    script_code: str | None = None
-    script_type: str = "python"
-    script_timeout: int = 300
-    background: str | None = None
-    on_error: str = "diagnose"
-    allow_ai_script_fix: bool = False
-    # 任务级模型覆盖（prompt 模式）。留空 → Agent 的 scheduled_* → 主 Agent。
-    # 同一个 Agent 的不同定时任务可以各用一个模型。
-    api_key_id: int | None = None
-    model: str | None = None
+class WorkflowDefRequest(BaseModel):
+    """Workflow definition create/update. ``definition`` is the declarative graph
+    (see agent/workflow.py); it is statically validated on save.
+
+    ``name`` is the machine id (unique per owner); ``label`` is the Chinese
+    display name the UI shows everywhere (required — the frontend gates it, and
+    the store persists it as given). A workflow is an independent artifact
+    owned by the caller — no agent binding."""
+    name: str = Field(..., min_length=1, max_length=200)
+    label: str = Field(default="", max_length=200)
+    description: str = ""
+    definition: dict[str, Any]
+    # 服务重启时在跑的 run：默认重跑一遍（新的 run 记录，旧记录标 interrupted）。
+    # 非幂等工作流（重复写文件/调接口）可显式关掉。
+    retry_on_reboot: bool = True
 
 
-class UpdateScheduledTaskRequest(BaseModel):
-    name: str | None = None
-    cron_expression: str | None = None
-    task_prompt: str | None = None
-    enabled: bool | None = None
-    background: str | None = None
-    on_error: str | None = None
-    allow_ai_script_fix: bool | None = None
-    # 改 script_code 会让 approved_hash 失配 → 下次执行被哈希锁拦下，需重新 approve-script。
-    script_code: str | None = None
-    script_type: str | None = None
-    script_timeout: int | None = None
-    api_key_id: int | None = None
-    model: str | None = None
+class WorkflowUpdateRequest(BaseModel):
+    definition: dict[str, Any]
+    label: str | None = None
+    description: str | None = None
+    retry_on_reboot: bool | None = None
+
+
+class WorkflowRunRequest(BaseModel):
+    """Manual run: launch args exposed to the graph as $args.*.
+
+    ``trigger_id`` 命名定义里声明的一个启动方式（triggers）：其 args 打底，
+    这里显式给的 args 逐键覆盖。不传 = 默认 manual（无打底）。
+
+    ``single_account_only``（运行弹框「只跑一个账号测试」）：account_list 扇出
+    路径只跑**第一个**账号，$input.accounts = 单个账号对象（与定时逐账号扇出的
+    单跑格式一致）——给用户测试定时调用、不用真跑 N 遍。
+
+    ``pick_accounts``（运行弹框「选具体账号」）：account_list 按 username 白名单
+    过滤解析出的账号——扇出只跑选中的账号，整体一次 $input.accounts = 选中数组。
+    """
+    args: dict[str, Any] = Field(default_factory=dict)
+    version: int | None = None
+    trigger_id: str | None = None
+    single_account_only: bool = False
+    pick_accounts: list[str] | None = None
 
 
 def _stream_headers() -> dict[str, str]:
@@ -1229,6 +1400,13 @@ async def _provision_marketplace_mcp(agent_id: int, caller: str | None) -> None:
 
 @router.post("/conversations")
 async def create_conversation(request: CreateConversationRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """创建 Agent 对话（落库 + 注册进会话注册表）。
+
+    - 节点对话必须选 Agent，且调用者须持有该节点绑定（403）。
+    - 用户模式只能用自己的/团队共享的 Agent 开对话；市场管理对话会预置市场 MCP。
+    - system_prompt/model 缺省跟随 Agent 主配置；场景预置（scene_context）一次性
+      写进 system_prompt 并持久化 chat_settings。
+    """
     _require_ch()
     from db import PostgresClient
 
@@ -1271,7 +1449,13 @@ async def create_conversation(request: CreateConversationRequest, caller: str | 
     # 场景预置统一走 scene_context：按入口入参（node_id / context）归一出场景，
     # 稳定身份键 + 场景规则一次性写进对话 system_prompt，后续轮次不再重复追加。
     # 易变的每轮事实（终端 cwd/最近输出）不在这里，见 send_message 的 terminal_context。
-    scene = scene_context.normalize(node_id=request.node_id, context=request.context)
+    # node 场景顺带解析宿主 shell（POSIX/PowerShell），让场景规则告知模型命令语法。
+    node_flavor = ""
+    if request.node_id:
+        node_flavor = await _node_shell_flavor(request.node_id)
+    scene = scene_context.normalize(
+        node_id=request.node_id, context=request.context, node_shell_flavor=node_flavor or None,
+    )
     system_prompt = scene_context.append_prompt(system_prompt, scene)
 
     chat_settings: dict[str, Any] = scene_context.persist(scene)
@@ -1286,6 +1470,8 @@ async def create_conversation(request: CreateConversationRequest, caller: str | 
         user_id=caller,
         chat_settings=chat_settings or None,
     )
+    # 建会话即入列注册表（= 实例添加的显式时机）。
+    conversation_state.register(conv)
     return conv
 
 
@@ -1299,6 +1485,11 @@ async def list_conversations(
     paged: bool = False,
     caller: str | None = Depends(get_agent_caller),
 ) -> Any:
+    """列出当前调用者的 Agent 对话（kind='agent'）。
+
+    paged=false 简单列表；paged=true 游标分页，支持 agent_id/node_id/search 过滤
+    （游标非法 → 400）。
+    """
     _require_ch()
     if not paged:
         return await conversation_store.list_conversations_for_caller(caller, limit=limit, kind="agent")
@@ -1313,6 +1504,11 @@ async def list_conversations(
 
 @router.get("/conversations/{conv_id}/meta")
 async def get_conversation_meta(conv_id: str, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """读取对话元数据（刷新页面恢复会话用）。
+
+    顺手对账残留 streaming 占位（翻成 error），并归一 run_state 供前端恢复
+    「上次在重试/报错」的显示。
+    """
     _require_ch()
     conv = await conversation_store.get_conversation_owned(caller, conv_id)
     if not conv:
@@ -1320,6 +1516,9 @@ async def get_conversation_meta(conv_id: str, caller: str | None = Depends(get_a
     # 刷新页面读会话元数据时顺手对账残留 streaming：进程重启/断线后留下的
     # 永久 streaming 占位消息会被翻成 error，前端回灌不再无限转圈。
     await _reconcile_orphaned_streaming(conv_id)
+    # 会话运行状态：库内存的是 JSON 串，这里归一成对象再透出（None = 上一轮已
+    # 正常完结），前端据此恢复「上次在重试/报错」的显示，而不是只有一个转圈。
+    conv["run_state"] = run_state.restore(conv)
     return conv
 
 
@@ -1330,35 +1529,48 @@ async def list_conversation_messages(
     cursor: int | None = None,
     caller: str | None = Depends(get_agent_caller),
 ) -> dict:
+    """按用户轮取对话消息分页（timeline 视图，游标翻页）。"""
     _require_ch()
     if await conversation_store.get_conversation_owned(caller, conv_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
-    return await conversation_store.get_messages_page_by_user_turns(conv_id, limit=limit, cursor=cursor)
+    return await conversation_store.get_messages_page_by_user_turns(conv_id, limit=limit, cursor=cursor, timeline=True)
 
 
 @router.get("/conversations/{conv_id}")
 async def get_conversation(conv_id: str, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """取一条对话的完整快照（元数据 + 全量消息历史）。"""
     _require_ch()
     conv = await conversation_store.get_conversation_owned(caller, conv_id)
     if not conv:
         raise HTTPException(status_code=404, detail="conversation not found")
-    messages = await conversation_store.get_messages(conv_id)
+    messages = await conversation_store.get_messages(conv_id, timeline=True)
     return {"conversation": conv, "messages": messages}
 
 
 @router.delete("/conversations/{conv_id}")
 async def delete_conversation(conv_id: str, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """删除对话（破坏性操作）。
+
+    归属校验后删除；运行中的会话任务先协作式停止再 cancel；回收会话注册表实例。
+    """
     _require_ch()
     # 归属校验：用户只能删自己的对话
     if await conversation_store.get_conversation_owned(caller, conv_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
-    # 如果有正在运行的任务，先取消
+    # 如果有正在运行的任务，先取消（协作式停止 + cancel，与 abort 端点同口径）
     task = _CONV_TASKS.pop(conv_id, None)
     if task and not task.done():
+        ev = _CONV_STOPS.pop(conv_id, None)
+        if ev is not None:
+            ev.set()
         task.cancel()
+    else:
+        _CONV_STOPS.pop(conv_id, None)
     deleted = await conversation_store.delete_conversation(conv_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="conversation not found")
+    # 回收会话注册表实例（与删除同生命周期点，否则内存泄漏）。
+    conversation_state.evict(conv_id)
     return {"deleted": True}
 
 
@@ -1375,9 +1587,15 @@ async def _batch_delete_conversations(conv_ids: list[str], caller: str | None) -
             continue
         task = _CONV_TASKS.pop(conv_id, None)
         if task and not task.done():
+            ev = _CONV_STOPS.pop(conv_id, None)
+            if ev is not None:
+                ev.set()
             task.cancel()
+        else:
+            _CONV_STOPS.pop(conv_id, None)
         if await conversation_store.delete_conversation(conv_id):
             deleted += 1
+            conversation_state.evict(conv_id)
         else:
             not_found.append(conv_id)
     return {"deleted": deleted, "not_found": not_found}
@@ -1387,28 +1605,89 @@ async def _batch_delete_conversations(conv_ids: list[str], caller: str | None) -
 async def batch_delete_conversations(
     request: BatchDeleteConversationsRequest, caller: str | None = Depends(get_agent_caller)
 ) -> dict:
+    """批量删除 Agent 对话：未找到/无权的 id 一律归入 not_found（不区分两者）。"""
     _require_ch()
     return await _batch_delete_conversations(request.ids, caller)
 
 
 @router.patch("/conversations/{conv_id}")
 async def update_conversation(conv_id: str, request: UpdateConversationRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """部分更新对话。
+
+    title/system_prompt 等内容字段走 store；mode/reasoning_effort/model 等运行时
+    状态经会话注册表统一写（内存 → 写穿 → 广播，当轮立即生效）。切到 auto 会把
+    本会话在途 pending 审批一次性放行并广播 approval_resolved。
+    """
     _require_ch()
     current = await conversation_store.get_conversation_owned(caller, conv_id)
     if current is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     fields = {k: v for k, v in request.model_dump(exclude_none=True).items()}
+    from agent import conversation_state
+    # 运行时状态（mode/reasoning_effort/model）经会话注册表统一写（内存 → 写穿 →
+    # 广播，切 auto 同轮立即生效）；title/system_prompt 等内容字段仍走 store。
+    runtime_patch: dict[str, Any] = {}
     if "reasoning_effort" in fields:
-        effort = _normalize_reasoning_effort(fields.pop("reasoning_effort"))
-        settings = dict(current.get("chat_settings") or {})
-        settings["reasoning_effort"] = effort
-        fields["chat_settings"] = settings
-    if not fields:
+        runtime_patch["reasoning_effort"] = _normalize_reasoning_effort(fields.pop("reasoning_effort"))
+    if "mode" in fields:
+        mode = str(fields.pop("mode") or "").strip().lower()
+        if mode:
+            runtime_patch["mode"] = mode
+    if "model" in fields:
+        runtime_patch["model"] = fields.pop("model")
+    if not fields and not runtime_patch:
         raise HTTPException(status_code=400, detail="no fields to update")
-    conv = await conversation_store.update_conversation(conv_id, **fields)
-    if not conv:
-        raise HTTPException(status_code=404, detail="conversation not found")
+    conv: dict | None = None
+    if fields:
+        conv = await conversation_store.update_conversation(conv_id, **fields)
+        if not conv:
+            raise HTTPException(status_code=404, detail="conversation not found")
+    if runtime_patch:
+        st = await conversation_state.update(conv_id, **runtime_patch)
+        # 回填最新运行时值进返回体：PATCH 后前端即读即显，不能拿 store 的旧行。
+        if conv is None:
+            conv = await conversation_store.get_conversation(conv_id)
+        if conv is not None and st is not None:
+            conv = dict(conv)
+            conv["model"] = st.model
+            cs = conv.get("chat_settings")
+            cs = dict(cs) if isinstance(cs, dict) else {}
+            cs["mode"] = st.mode
+            if st.reasoning_effort is None:
+                cs.pop("reasoning_effort", None)
+            else:
+                cs["reasoning_effort"] = st.reasoning_effort
+            conv["chat_settings"] = cs
+    # 切到 auto：把本会话在途 pending 审批一次性放行（立即生效，不等下一轮）。
+    # 逐条广播 approval_resolved，让已挂卡的各端把旧卡翻成「已允许」。
+    if runtime_patch.get("mode") == "auto":
+        from user_platform.node_client.approvals import (
+            approval_registry, publish_approval_resolved,
+        )
+        for action in approval_registry.allow_pending(conv_id):
+            await publish_approval_resolved(
+                conv_id, action.confirmation_id, "allow", tool_name=action.tool_name,
+            )
     return conv
+
+
+@router.post("/conversations/{conv_id}/compact")
+async def compact_conversation(
+    conv_id: str, caller: str | None = Depends(get_agent_caller)
+) -> dict:
+    """手动压缩上下文：LLM 摘要历史 → 落一条 <history_summary> 标记消息。
+
+    供 web Agent/聊天页 token 卡的「压缩」按钮与 /compact 调用。压缩产物落库，
+    后续轮次 rebuild 历史时以最后一条摘要为 cutoff（见 context_manager），
+    让压缩跨轮生效。鉴权走会话归属（get_conversation_owned）。
+    """
+    _require_ch()
+    conv = await conversation_store.get_conversation_owned(caller, conv_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    from agent.compact_service import compact_conversation as _compact
+
+    return await _compact(conv_id, agent_id=conv.get("agent_id") or 0)
 
 
 @router.post("/conversations/{conv_id}/attachments")
@@ -1459,7 +1738,7 @@ async def upload_chat_conversation_attachment(
     filename: str = Query(..., min_length=1, max_length=255),
     caller: str | None = Depends(get_agent_caller),
 ) -> dict:
-    """把一个文件落到 temp 目录，并按类型给出可直接发给 LLM 的形态。
+    """把一个文件落到非 Agent 会话的兜底工作区，并按类型给出可直接发给 LLM 的形态。
 
     聊天没有 Agent 工作区也没有文件工具，所以内容必须随消息一起进模型：
     图片回 ``data_url``（OpenAI ``image_url`` content part），文本类回 ``text``，
@@ -1471,7 +1750,7 @@ async def upload_chat_conversation_attachment(
         raise HTTPException(status_code=404, detail="conversation not found")
 
     raw = await _read_attachment_body(request)
-    relative, target = _attachment_target("agent/temp", conv_id, filename)
+    relative, target = _attachment_target("agent/workspace", conv_id, filename)
     target.write_bytes(raw)
 
     mime = (
@@ -1491,7 +1770,16 @@ async def upload_chat_conversation_attachment(
     return result
 
 
-async def _stream_conversation_turn(
+def _apply_subagent_event(subagents: list[dict[str, Any]], etype: str, event: dict) -> None:
+    """子 agent 事件聚合——已统一到 ``agent.turn_writer``，本模块不再使用。
+
+    保留为 shim 以兼容可能的外部引用（测试 monkeypatch 等）；直接转发。
+    """
+    from agent.turn_writer import _apply_subagent_event as _impl
+    _impl(subagents, etype, event)
+
+
+async def _start_conversation_turn(
     *,
     conv: dict,
     conv_id: str,
@@ -1500,104 +1788,56 @@ async def _stream_conversation_turn(
     caller: str | None,
     mode: str | None,
     goal_config: Any,
+    ralph_config: Any = None,
     terminal_context: Any,
     max_turns: int | None,
     turn_reasoning_effort: str | None,
-) -> StreamingResponse:
-    """运行一次 agent 对话轮并把事件以 SSE 流回投。
+    resume_from: dict | None = None,
+) -> dict[str, Any]:
+    """异步启动一轮 agent 运行，事件走 conversation_hub 广播，立即返回占位结果。
 
     send_message 与 retry_message 共用本函数：前者新建 user+assistant 占位后调用，
-    后者复用既有失败 assistant 消息（reset 为 streaming）后调用。assistant_msg_id
-    决定本轮写回的目标消息；history 由 get_messages 读取并排除 assistant_msg_id，
-    两种入口的上下文构建因此同形。mode/goal_config/terminal_context/max_turns
-    由调用方按入口语义传入（retry 固定 interact / 无 goal / 无 terminal_context）。
+    后者复用既有失败 assistant 消息（reset 为 streaming）后调用。事件消费改由
+    GET /conversations/{id}/events（或外部中继）接管，三端同一条序列。
+
+    ``resume_from``（重试续跑）：传入被重试 assistant 消息的**未清空**行。续跑把
+    它已完成的工具调用与结果原样保留——既作为模型上下文（模型看到自己做到哪了，
+    不会把一堆工具调用从头重跑），也作为 ``ConversationTurnWriter`` 的种子（收尾
+    落库时旧进度 + 新进度一起写回）。非续跑路径行为不变。
     """
     from db import PostgresClient
 
-    queue: asyncio.Queue = asyncio.Queue()
-    collected_tool_calls: list[dict[str, Any]] = []
-    collected_tool_results: list[Any] = []
-    collected_media: list[dict[str, Any]] = []
-    collected_usage: dict[str, Any] | None = None
-    collected_reasoning = ""
-    collected_content = ""  # 流式正文增量累积，供中途落库；run_agent 结尾仍以 final_content 为准。
-    _last_persist_ts = 0.0  # 节流：正文/思考高频到达时最多每 1.5s 落一次中间态。
-
-    async def _persist_progress() -> None:
-        """把当前已累积的正文/思考/工具调用/结果/媒体渐进写回 assistant 消息，status 仍留 streaming。
-
-        目的：审批挂起 / 进程重启 / 连接中断时，用户刷新页面仍能看到本轮已经
-        产生的内容与工具调用，而不是一条空壳。正常结束时结尾的 update_message
-        (status="done") 会覆盖成最终态，渐进写不会造成错乱。
-        """
-        nonlocal _last_persist_ts
-        try:
-            await conversation_store.update_message(
-                assistant_msg_id,
-                content=collected_content,
-                tool_calls=collected_tool_calls or None,
-                tool_results=collected_tool_results or None,
-                media=collected_media or None,
-                status="streaming",
-                reasoning=collected_reasoning,
-            )
-            _last_persist_ts = time.monotonic()
-        except Exception:  # noqa: BLE001 — 中途落库失败不能中断主流程
-            pass
+    # 一个 turn 的事件流 → 投影 + 事件日志的唯一实现。原先 api 与 cdp 各抄一份
+    # collected_* 累积逻辑并已漂移（CDP 漏 subagent 聚合、checkpoint 漏 subagents），
+    # 现统一到 ConversationTurnWriter；本地 collected_* 一律取消，引用改 writer.*。
+    writer = ConversationTurnWriter(
+        conversation_id=conv_id,
+        assistant_msg_id=assistant_msg_id,
+        resume_from=resume_from,
+        attachment_owner=caller,
+        turn_number=0,
+    )
+    # 本回合的协作式停止信号：注入 tools.context 后由 agent_loop 每轮检查、
+    # code_run 等子进程时赛跑。abort 端点置位它 + task.cancel() 双保险。
+    stop_event = asyncio.Event()
+    _CONV_STOPS[conv_id] = stop_event
+    # （resume_from 的种子已并入 ConversationTurnWriter 构造函数。）
 
     async def on_event(event: dict):
-        nonlocal collected_usage, collected_reasoning, collected_content, _last_persist_ts
-        # 主 agent 工具调用落库，供历史回放显示；子 agent 事件只实时展示，不混入主轮次。
-        etype = event.get("type")
-        if etype == "tool_call":
-            collected_tool_calls.append({
-                # id 是 assistant.tool_calls 与 role=tool 的唯一相关性键。agent_loop
-                # 已为每次调用生成好并随事件下发，这里必须一起落库：历史回放要靠它
-                # 还原成 OpenAI 线协议形状，缺了就只能丢弃整条调用。
-                "id": event.get("id"),
-                "name": event.get("name"),
-                "args": event.get("args"),
-                "status": "running",
-            })
-            # 工具调用是天然检查点：立即落库，保证刷新后看得到「说了什么、做了哪步」。
-            await _persist_progress()
-        elif etype == "reasoning":
-            # 思考增量按顺序累积，随 assistant 消息落库供历史回放；子 agent 的
-            # subagent_reasoning 不在此收集（前缀不同），只实时展示。
-            collected_reasoning += str(event.get("text") or "")
-            # 高频事件：节流落库，1.5s 一次，保证审批挂起前已流出的思考不丢。
-            if time.monotonic() - _last_persist_ts > 1.5:
-                await _persist_progress()
-        elif etype == "content":
-            collected_content += str(event.get("text") or "")
-            if time.monotonic() - _last_persist_ts > 1.5:
-                await _persist_progress()
-        elif etype == "tool_result":
-            # agent_loop 的 index 是「本轮第几个」，跨轮重置；按 id(tool_call_id)
-            # 匹配，否则第二轮的 result 会错配到第一轮的 call，让真正在跑的那个
-            # 永远停在 running（历史回放就显示永久转圈）。与 cdp_chat_service 同口径。
-            attach_tool_result(
-                collected_tool_calls, collected_tool_results,
-                call_id=event.get("id"),
-                index=event.get("index"),
-                result=event.get("data"),
-            )
-            # 附件工具结果 → 抽成 media part 并认领归属（仅 owner=NULL 时生效，防越权抢占）。
-            await _collect_attachment_media(event, collected_media, caller, conv_id)
-            await _persist_progress()
-        elif etype == "question":
-            # ask_user 把问题并入正文展示，同时作为检查点立即落库。
-            data = event.get("data") if isinstance(event.get("data"), dict) else {}
-            q = str(data.get("question") or event.get("message") or "")
-            if q:
-                collected_content = f"{collected_content}\n\n{q}".strip("\n")
-            # ask_user 的 media 与工具结果同一套形状驱动收集 + 认领；否则刷新后历史
-            # 回放看不到图。question 事件的 media 挂在 data.media 里。
-            await _collect_attachment_media(event, collected_media, caller, conv_id)
-            await _persist_progress()
-        elif etype == "done" and isinstance(event.get("usage"), dict):
-            collected_usage = event["usage"]
-        await queue.put(event)
+        """一轮事件 → 累积/记帧/落库统一交给 writer，这里只做广播与运行状态翻译。
+
+        ``writer.handle`` 返回已富化（message_id + offset）的帧，发起方与旁观方
+        消费同一条序列；内容累积、事件日志记帧、投影节流落库都在 writer 内。
+        """
+        out = await writer.handle(event)
+        await conversation_hub.publish(conv_id, out)
+        # 会话运行状态：翻译成状态枚举并更新 ConversationState（改内存 → 写穿
+        # run_status/run_status_info → 推 conversation_state 事件），与 cdp 同口径。
+        try:
+            from agent import run_state as _run_state
+            await _run_state.apply(conv_id, out)
+        except Exception as exc:  # noqa: BLE001 — 状态显示失败绝不影响对话
+            logger.debug("[run_state] failed conv=%s: %s", conv_id, exc)
 
     async def run_agent():
         agent = None
@@ -1610,25 +1850,36 @@ async def _stream_conversation_turn(
             # 会让 _ensure_config 提前返回、跳过 DB 加载，导致网关列/owner 缺失。
             agent_id = conv.get("agent_id")
             agent_system_prompt = ""
-            agent_max_turns = 80
+            agent_row = None
             if agent_id:
                 agent_row = await PostgresClient.get_agent(agent_id)
                 if agent_row:
                     agent_system_prompt = agent_row.get("system_prompt") or ""
-                    agent_max_turns = agent_row.get("max_turns") or 80
             # system_prompt：对话级覆盖优先，否则用 Agent 当前配置
             effective_system_prompt = conv.get("system_prompt") or agent_system_prompt or ""
 
-            # 构建历史消息上下文（排除本轮那条 streaming assistant）。
+            # 构建历史消息上下文。
             # rebuild_history_messages 把落库的展示态 tool_calls 归一成 OpenAI 线
             # 形状并补出配对的 role=tool，与在途轮次同形；旧的非标准 tool_results
             # 字段在那里被消费掉，不再上行。
             history = await conversation_store.get_messages(conv_id)
-            initial_messages = rebuild_history_messages(
-                history,
-                skip_msg_id=assistant_msg_id,
-                system_prompt=effective_system_prompt,
-            )
+            if resume_from is not None:
+                # 续跑：不跳过被重试的那条 assistant——它已完成的 tool_calls/结果
+                # 要作为上下文回带给模型（否则模型看不到自己做到哪了，从头重跑）。
+                # 末尾补一条 user「继续」指令——agent_runner_loop 在给了
+                # initial_messages 时不会再自动追加 user_input，这条必须显式加。
+                initial_messages = rebuild_history_messages(
+                    history,
+                    skip_msg_id=None,
+                    system_prompt=effective_system_prompt,
+                )
+                initial_messages.append({"role": "user", "content": user_input})
+            else:
+                initial_messages = rebuild_history_messages(
+                    history,
+                    skip_msg_id=assistant_msg_id,
+                    system_prompt=effective_system_prompt,
+                )
 
             # 终端上下文作为本轮 system 上下文注入（不污染持久 system_prompt）：
             # 让 AI 感知管理员当前所在目录与最近终端输出，回答更贴合现场。仅本轮生效，
@@ -1654,11 +1905,50 @@ async def _stream_conversation_turn(
                 tools=_build_tool_registry(agent_id, owner_user_id=caller),
                 run_as_caller=caller,
                 scene=scene,
+                conversation_id=conv_id,
+                # 配置注入（Phase 2.1）：agent_row 已读过，传进去跳过 _ensure_config
+                # 的重复 SELECT。行缺列（旧库未迁移）时 _apply_agent_row 按 dict.get
+                # 兜底，与 DB 懒加载路径同一实现。
+                agent_row=agent_row,
             )
             # 配置先解析：审批超时是 per-Agent 配置，下面建 node shell / code_run 两个
             # 审批批次时都要用。_ensure_config 幂等（已解析则直接返回缓存）。
             config = await agent._ensure_config()
+            # 轮数上限的唯一真相源：请求级 max_turns（本次覆盖）> Agent 行 max_turns
+            #（config 已解析：行没配 → DEFAULT_MAX_TURNS）> 固定默认。handler 与 loop
+            # 都用这个变量，杜绝历史上「两处 or 链表达式不同、值可能不一致」的 bug。
+            eff_max_turns = max_turns or config.max_turns
+            # 技能激活（/名字 标记）：只看**当前这条消息**（不扫历史），命中后把技能
+            # 的基础信息（名字、说明、正文位置）追加到这条用户消息本身——用了才
+            # 生效、下一条不提就自然结束；不进 system prompt、不逐轮注入。
+            # initial_messages 里最后一条 user 就是本轮输入（send_message 已先落库，
+            # rebuild 时跳过了 assistant 占位）。失败只降级为无技能，绝不阻断发送。
+            try:
+                from agent.skill_slash import (
+                    append_to_last_user,
+                    build_skill_message_suffix,
+                    collect_activated_skills,
+                )
+
+                activated = await collect_activated_skills(
+                    agent_id=agent_id,
+                    mcp_user_id=getattr(config, "mcp_user_id", None),
+                    current_text=user_input,
+                )
+                append_to_last_user(initial_messages, build_skill_message_suffix(activated))
+            except Exception as exc:  # noqa: BLE001 — 技能推导失败不影响本轮发送
+                logger.warning("[skill] activation failed agent=%s: %s", agent_id, exc)
             approval_timeout = int(getattr(config, "approval_timeout_seconds", 0) or 0)
+            # auto 执行模式：会话运行时状态的派生属性。审批批次传**取值回调**而非快照
+            # bool —— 回合中途用户切 auto，同回合后续审批立即走 auto（历史 bug 是这里
+            # 收 bool，切档只影响下一回合）。ConversationState 在 send/retry 前 load。
+            from agent import conversation_state
+            _cstate = await conversation_state.load(conv_id, conv)
+            if (mode or "").strip().lower() and (mode or "").strip().lower() != _cstate.mode:
+                await conversation_state.update(conv_id, mode=mode)
+                _cstate = conversation_state.peek(conv_id) or _cstate
+            auto_approve = _cstate.auto_approve
+            is_auto = lambda: bool((conversation_state.peek(conv_id) or _cstate).auto_approve)
             node_id = ((conv.get("chat_settings") or {}).get("node_id") or "").strip()
             node_shell_batch = None
             if node_id:
@@ -1690,6 +1980,7 @@ async def _stream_conversation_turn(
                     shell_flavor=shell_flavor,
                     auto_allow_keys=auto_allow_keys,
                     timeout_seconds=approval_timeout,
+                    auto_approve=is_auto,
                 )
             # 注入事件出口：子 agent spawn 时把 subagent_* 事件透传回主对话 SSE 流。
             agent.set_event_sink(on_event)
@@ -1706,8 +1997,15 @@ async def _stream_conversation_turn(
                 )
             # 本轮实际生效的模型，随 assistant 消息落库供历史回放标注
             effective_model = getattr(llm, "model", "") or ""
-            tools, skill_index = await agent._ensure_resources()
+            tools, resource_block = await agent._ensure_resources()
+            # 协作式停止信号注入：必须在这里（_ensure_resources 之后）——它会经
+            # _ensure_tools 新建 ToolRegistry/ToolContext，早设会被那次重建抹掉。
+            # 之后到 loop 结束再无 context 重建点。
+            tools.context.stop_event = stop_event
+            tools.context.conversation_id = conv_id
             from agent.code_run_approval import CodeRunApprovalBatch
+            from agent.file_write_approval import FileWriteApprovalBatch
+            from agent.workflow_approval import WorkflowApprovalBatch
 
             code_run_batch = CodeRunApprovalBatch(
                 conversation_id=conv_id,
@@ -1715,10 +2013,36 @@ async def _stream_conversation_turn(
                 caller=caller,
                 emit=on_event,
                 timeout_seconds=approval_timeout,
+                auto_approve=is_auto,
             )
             tools.set_code_run_approval(code_run_batch)
-            if skill_index:
-                effective_system_prompt = f"{effective_system_prompt}\n\n{skill_index}".strip()
+            # 越界写入审批：file_write/file_patch 撞 allowed_roots / denied_patterns
+            # 时弹一张卡（工作区内写入不经过它，行为不变）。与 code_run 同一批预扫，
+            # 合并进 _prepare_tool_batch；无人值守入口不挂它 → fail closed。
+            file_write_batch = FileWriteApprovalBatch(
+                conversation_id=conv_id,
+                agent_id=int(agent_id or 0),
+                caller=caller,
+                emit=on_event,
+                security=tools.context.security,
+                timeout_seconds=approval_timeout,
+                auto_approve=is_auto,
+            )
+            tools.set_file_write_approval(file_write_batch)
+            # 工作流定义写审批：create/update/delete 弹一张卡（图能执行 code_run/
+            # 写文件/驱动浏览器）。读与运行态（list/get/run/runs/run_status/cancel）
+            # 不进卡。无人值守入口不挂它 → fail closed。
+            workflow_batch = WorkflowApprovalBatch(
+                conversation_id=conv_id,
+                agent_id=int(agent_id or 0),
+                caller=caller,
+                emit=on_event,
+                timeout_seconds=approval_timeout,
+                auto_approve=is_auto,
+            )
+            tools.set_workflow_approval(workflow_batch)
+            if resource_block:
+                effective_system_prompt = f"{effective_system_prompt}\n\n{resource_block}".strip()
             # The history was assembled before resource initialization. Refresh or
             # insert its system message so the first LLM call sees the Skill index.
             if effective_system_prompt:
@@ -1727,7 +2051,7 @@ async def _stream_conversation_turn(
                 else:
                     initial_messages.insert(0, {"role": "system", "content": effective_system_prompt})
             # show_file merged into ask_user; no longer a standalone tool.
-            handler = _BH(tools_registry=tools, max_turns=max_turns or config.max_turns or agent_max_turns)
+            handler = _BH(tools_registry=tools, max_turns=eff_max_turns)
 
             # GA chapter6 execution modes.
             mode_eff = (mode or "interact").lower()
@@ -1763,7 +2087,9 @@ async def _stream_conversation_turn(
                 await guardian.start_goal_mode(
                     objective=goal.objective,
                     budget_seconds=goal.budget_seconds,
-                    max_turns=goal.max_turns or max_turns or config.max_turns or 50,
+                    # goal 模式的阶段上限与内层轮数上限：请求级 goal.max_turns 优先，
+                    # 否则沿用本轮统一值（请求级 > Agent 行 > 固定默认）。
+                    max_turns=goal.max_turns or eff_max_turns,
                 )
                 goal_hint = (
                     f"\n\n[Goal Mode] Objective: {goal.objective}. Budget: "
@@ -1779,8 +2105,46 @@ async def _stream_conversation_turn(
                     initial_messages.insert(0, {"role": "system", "content": effective_system_prompt})
                 goal_state_file = "temp/goal_state.json"
 
+            elif mode_eff == "ralph":
+                ralph = ralph_config
+                if ralph is None:
+                    raise HTTPException(400, "ralph mode requires ralph_config")
+                from agent.guardian import Guardian as _Guardian
+                guardian = _Guardian(agent_id=int(agent_id or 0))
+                await guardian.start_ralph_mode(
+                    objective=ralph.objective,
+                    max_rounds=ralph.max_rounds,
+                )
+                ralph_hint = (
+                    f"\n\n[Ralph Mode] Objective: {ralph.objective}. Round cap: "
+                    f"{ralph.max_rounds}. You are driven round-by-round as a fresh "
+                    f"worker; each round carries only the objective and the previous "
+                    f"round's structured handoff. End every round with the strict JSON "
+                    f"report described in your round prompt (continue/complete/blocked). "
+                    f"The workspace is the source of truth — confirm any handoff "
+                    f"against it before acting."
+                )
+                effective_system_prompt = (effective_system_prompt or "") + ralph_hint
+                if initial_messages and initial_messages[0].get("role") == "system":
+                    initial_messages[0]["content"] = effective_system_prompt
+                else:
+                    initial_messages.insert(0, {"role": "system", "content": effective_system_prompt})
+                goal_state_file = "temp/ralph_state.json"
+
+            elif mode_eff == "supervisor":
+                # 监督模式：只注入红线（_SUPERVISOR_HINT 常量与 cdp 链路共用，防漂移），
+                # 不加 Guardian、不加驱动循环——spawn_subagent 是前台一次性，模型按
+                # 红线自己拆解/派子/验收即可；循环等暴露了需求再做（Phase 2）。
+                effective_system_prompt = (effective_system_prompt or "") + _SUPERVISOR_HINT
+                if initial_messages and initial_messages[0].get("role") == "system":
+                    initial_messages[0]["content"] = effective_system_prompt
+                else:
+                    initial_messages.insert(0, {"role": "system", "content": effective_system_prompt})
+
             async def _prepare_tool_batch(tool_calls: list[dict]) -> None:
                 await code_run_batch.prepare(tool_calls)
+                await file_write_batch.prepare(tool_calls)
+                await workflow_batch.prepare(tool_calls)
                 if node_shell_batch is not None:
                     await node_shell_batch.prepare(tool_calls)
 
@@ -1791,10 +2155,11 @@ async def _stream_conversation_turn(
                 user_input=user_input,
                 handler=handler,
                 tools_schema=tools.get_schema(),
-                max_turns=max_turns or config.max_turns,
+                max_turns=eff_max_turns,
                 on_event=on_event,
                 initial_messages=initial_messages if initial_messages else None,
                 on_tool_batch=_prepare_tool_batch,
+                auto_compact=config.auto_compact,
             ):
                 final_content = item.get("data", final_content)
 
@@ -1816,14 +2181,39 @@ async def _stream_conversation_turn(
                         user_input=cont,
                         handler=handler,
                         tools_schema=tools.get_schema(),
-                        max_turns=max_turns or config.max_turns,
+                        max_turns=eff_max_turns,
                         on_event=on_event,
                         initial_messages=None,
                         on_tool_batch=_prepare_tool_batch,
+                        auto_compact=config.auto_compact,
                     ):
                         final_content = item.get("data", final_content)
                     if wrapped_up:
                         break
+                # Independent verification before marking done: a fresh agent (no
+                # inherited context) re-checks the wrap-up's claims and attempts to
+                # refute them. Refuted → the verifier's problems are appended to the
+                # final message so the user sees the goal was not independently
+                # confirmed; failure to verify → not verified (never silently done).
+                try:
+                    from agent.ralph import verify_goal_completion
+                    ver = await verify_goal_completion(
+                        agent, goal.objective, [str(final_content or "")],
+                    )
+                    if ver.get("verified"):
+                        final_content = (final_content or "") + (
+                            "\n\n[Goal verification] Verified by an independent agent."
+                        )
+                    else:
+                        problems = (ver.get("report") or {}).get("problems") or []
+                        if not problems and ver.get("error"):
+                            problems = [ver["error"]]
+                        detail = " ".join(problems[:5]) or "the independent verifier could not confirm the claims."
+                        final_content = (final_content or "") + (
+                            "\n\n[Goal verification] NOT verified by an independent agent: " + detail
+                        )
+                except Exception:  # noqa: BLE001 - verification must never block goal completion
+                    pass
                 try:
                     await guardian.mark_goal_done(budget_exhausted=wrapped_up)
                     # Mirror the final state after status transition.
@@ -1837,30 +2227,114 @@ async def _stream_conversation_turn(
                 except Exception:  # noqa: BLE001
                     pass
 
+            # Ralph mode: drive FRESH rounds from Guardian until the round cap is
+            # hit (next_ralph_round returns None) or the report says complete or
+            # blocked. Each round is its own bounded agent loop with a FRESH
+            # handler — no inherited context, only objective + previous handoff
+            # (ralph's defining trait vs goal, which reuses one handler).
+            if mode_eff == "ralph":
+                from agent.guardian import Guardian as _Guardian
+                ralph_guard = _Guardian(agent_id=int(agent_id or 0))
+                ralph_rounds = 0
+                ralph_report: dict | None = None
+                ralph_outcome = "max_rounds"
+                while True:
+                    step = await ralph_guard.next_ralph_round()
+                    if step is None:
+                        break
+                    ralph_rounds = step["round"]
+                    # Fresh handler per round — ralph's whole point: a child that
+                    # inherits no prior context, only objective + structured handoff.
+                    round_handler = _BH(
+                        tools_registry=tools,
+                        max_turns=eff_max_turns,
+                    )
+                    round_text = ""
+                    async for item in agent_runner_loop(
+                        llm,
+                        system_prompt=effective_system_prompt,
+                        user_input=step["prompt"],
+                        handler=round_handler,
+                        tools_schema=tools.get_schema(),
+                        max_turns=eff_max_turns,
+                        on_event=on_event,
+                        initial_messages=None,
+                        on_tool_batch=_prepare_tool_batch,
+                        auto_compact=config.auto_compact,
+                    ):
+                        round_text = item.get("data", round_text)
+                    # Parse + validate the strict report; a bad one ends the loop
+                    # loudly rather than inventing a status.
+                    try:
+                        from agent.ralph import parse_round_report
+                        ralph_report = parse_round_report(str(round_text or ""))
+                    except ValueError as exc:
+                        ralph_outcome = "round_failed"
+                        ralph_report = None
+                        final_content = (
+                            (final_content or "")
+                            + f"\n\n[Ralph] Round {step['round']} failed to produce a valid report: {exc}"
+                        )
+                        break
+                    await ralph_guard.record_ralph_report(ralph_report)
+                    if ralph_report["status"] in ("complete", "blocked"):
+                        ralph_outcome = ralph_report["status"]
+                        break
+                # Terminal outcome summary appended to the final message.
+                try:
+                    from agent.ralph import format_round_outcome
+                    final_content = (
+                        (final_content or "") + "\n\n"
+                        + format_round_outcome(ralph_outcome, ralph_rounds, ralph_report)
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await ralph_guard.mark_ralph_done(outcome=ralph_outcome)
+                    from agent.file_memory import agent_root
+                    import json as _json
+                    state = await ralph_guard.get_ralph_state()
+                    if state:
+                        gpath = agent_root(int(agent_id)) / "temp" / "ralph_state.json"
+                        gpath.parent.mkdir(parents=True, exist_ok=True)
+                        gpath.write_text(_json.dumps(state, ensure_ascii=False, default=str), encoding="utf-8")
+                except Exception:  # noqa: BLE001
+                    pass
+
             # 更新 assistant 消息为完成状态，并持久化工具调用供历史回放。
-            # content 用累积全文（collected_content）而非只取末轮 final_content：
+            # content 用累积全文（writer.content）而非只取末轮 final_content：
             # 多轮工具调用中模型的中间叙述也是用户要看的历史，末轮只有最终回答。
             await conversation_store.update_message(
                 assistant_msg_id,
-                content=collected_content or final_content,
-                tool_calls=collected_tool_calls or None,
-                tool_results=collected_tool_results or None,
-                media=collected_media or None,
+                content=writer.content or final_content,
+                tool_calls=writer.tool_calls or None,
+                tool_results=writer.tool_results or None,
+                media=writer.media or None,
                 status="done",
                 model=effective_model,
-                usage=collected_usage or None,
-                reasoning=collected_reasoning,
+                usage=writer.usage or None,
+                reasoning=writer.reasoning,
+                subagents=writer.subagents or None,
             )
-            await queue.put({"type": "end"})
+            await conversation_hub.publish(conv_id, {"type": "end"})
         except asyncio.CancelledError:
             await conversation_store.update_message(
                 assistant_msg_id,
-                media=collected_media or None,
+                media=writer.media or None,
                 status="error",
                 error="已中止",
-                reasoning=collected_reasoning,
+                reasoning=writer.reasoning,
+                subagents=writer.subagents or None,
             )
-            await queue.put({"type": "end"})
+            # 事件走 on_event 同一条链路（publish + run_state.apply）：aborted 映射
+            # STATUS_ABORTED，随后的 end 收敛到 WAITING_INPUT——直接 publish 裸事件
+            # 会绕过 run_state，状态徽章停在「处理中」。CancelledError 重入时收尾
+            # 是尽力而为，不阻断 abort 流程。
+            try:
+                await on_event({"type": "aborted", "message": "已中止"})
+                await on_event({"type": "end"})
+            except Exception:  # noqa: BLE001 — 收尾失败不能盖掉中止本身
+                pass
         except ApprovalDenied:
             # 用户主动拒绝不是故障：正常结束本轮，不发 error 事件，也绝不把 denied
             # 工具结果喂回模型继续跑。审批卡已由 resolveApproval 翻成「已拒绝」。
@@ -1868,43 +2342,46 @@ async def _stream_conversation_turn(
             # 已流出的前置正文仍完整落库。
             await conversation_store.update_message(
                 assistant_msg_id,
-                content=collected_content,
-                tool_calls=collected_tool_calls or None,
-                tool_results=collected_tool_results or None,
-                media=collected_media or None,
+                content=writer.content,
+                tool_calls=writer.tool_calls or None,
+                tool_results=writer.tool_results or None,
+                media=writer.media or None,
                 status="done",
                 model=effective_model,
-                usage=collected_usage or None,
-                reasoning=collected_reasoning,
+                usage=writer.usage or None,
+                reasoning=writer.reasoning,
+                subagents=writer.subagents or None,
             )
-            await queue.put({"type": "end"})
+            await conversation_hub.publish(conv_id, {"type": "end"})
         except ApprovalTimeout as timeout_exc:
             # 审批超时：本轮就此结束，不把「被拒绝」喂回模型跑下一轮。已流出的正文/
-            # 工具调用由 _persist_progress 落过库，刷新后能看到停在哪一步。
+            # 工具调用由 writer 的检查点落过库，刷新后能看到停在哪一步。
             error_text = str(timeout_exc)
             await conversation_store.update_message(
                 assistant_msg_id,
-                content=collected_content,
-                tool_calls=collected_tool_calls or None,
-                tool_results=collected_tool_results or None,
-                media=collected_media or None,
+                content=writer.content,
+                tool_calls=writer.tool_calls or None,
+                tool_results=writer.tool_results or None,
+                media=writer.media or None,
                 status="error",
                 error=error_text,
-                reasoning=collected_reasoning,
+                reasoning=writer.reasoning,
+                subagents=writer.subagents or None,
             )
-            await queue.put({"type": "error", "message": error_text})
-            await queue.put({"type": "end"})
+            await conversation_hub.publish(conv_id, {"type": "error", "message": error_text})
+            await conversation_hub.publish(conv_id, {"type": "end"})
         except Exception as e:
             error_text = "".join(traceback.format_exception_only(type(e), e)).strip()
             await conversation_store.update_message(
                 assistant_msg_id,
-                media=collected_media or None,
+                media=writer.media or None,
                 status="error",
                 error=error_text,
-                reasoning=collected_reasoning,
+                reasoning=writer.reasoning,
+                subagents=writer.subagents or None,
             )
-            await queue.put({"type": "error", "message": error_text})
-            await queue.put({"type": "end"})
+            await conversation_hub.publish(conv_id, {"type": "error", "message": error_text})
+            await conversation_hub.publish(conv_id, {"type": "end"})
         finally:
             try:
                 manager = getattr(agent, "_mcp_manager", None)
@@ -1915,22 +2392,81 @@ async def _stream_conversation_turn(
 
     task = asyncio.create_task(run_agent())
     _CONV_TASKS[conv_id] = task
+    # busy 标记：回合进行中禁止空闲 sweep 回收实例（turn 内审批读活状态依赖它）。
+    conversation_state.set_busy(conv_id, True)
+    # 旧实现里 _CONV_TASKS 由 SSE event_generator 的 finally 摘除；现在事件改走
+    # conversation_hub 扇出、POST 不再持有连接，摘除必须跟着任务生命周期走。
+    task.add_done_callback(
+        lambda t, cid=conv_id: _on_turn_done(cid, t)
+    )
+    return {"assistant_message_id": assistant_msg_id, "status": "streaming"}
 
-    async def event_generator():
+
+def _on_turn_done(conv_id: str, t: asyncio.Task) -> None:
+    """回合任务结束：摘除 _CONV_TASKS（本任务仍是当前任务时才摘）+ 清 busy 标记。"""
+    if _CONV_TASKS.get(conv_id) is t:
+        _CONV_TASKS.pop(conv_id, None)
+    # 停止信号与任务同生命周期回收，避免 _CONV_STOPS 随会话数增长泄漏。
+    _CONV_STOPS.pop(conv_id, None)
+    conversation_state.set_busy(conv_id, False)
+
+
+def _conversation_events_response(conv_id: str) -> StreamingResponse:
+    """对话事件订阅流：首帧权威快照，其后实时增量，终态自动收口。
+
+    - 首帧 ``snapshot``：``get_messages`` 的全量权威状态（快照即权威，客户端渲染
+      以它为基底）。
+    - 之后逐帧转发 conversation_hub 广播的实时事件（content/reasoning 带 offset，
+      工具卡按 id 幂等）。
+    - 终态帧（done/error）之后补一帧 ``end`` 并收口——客户端据此重订阅拿下一轮。
+      连接的存续、重连、历史补拉全部是客户端的职责，服务端不记任何订阅状态。
+
+    快照在**订阅之后**读取：快照已含的增量靠 offset 去重（前缀性质），快照没含的
+    在环形缓冲里一定还有……不，本模块刻意不缓存事件——缺的段由客户端整页重拉。
+    """
+
+    async def event_stream():
+        queue = conversation_hub.subscribe(conv_id)
         try:
+            messages = await conversation_store.get_messages(conv_id, timeline=True)
+            # 首帧快照：连接此刻的权威状态。订阅在读取之前完成，两者之间到达的增量
+            # 靠 offset 与快照前缀对齐，不会出现「订阅到了但快照里没有」的缺口。
+            yield f"data: {json.dumps({'type': 'snapshot', 'messages': messages}, ensure_ascii=False)}\n\n"
             while True:
                 event = await queue.get()
                 if event.get("type") == "end":
+                    # 一轮收口：关连接。发起方的读循环就此退出（loading 落定）；
+                    # 旁观方重订阅拿下一轮（快照先给全量，无状态可丢）。
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                     break
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         finally:
-            _CONV_TASKS.pop(conv_id, None)
+            conversation_hub.unsubscribe(conv_id, queue)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=_stream_headers())
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_stream_headers())
+
+
+@router.get("/conversations/{conv_id}/events")
+async def stream_conversation_events(
+    conv_id: str,
+    caller: str | None = Depends(get_agent_caller),
+) -> StreamingResponse:
+    """订阅一条对话的实时事件流（多订阅者：发起方与旁观方同一条序列）。"""
+    _require_ch()
+    conv = await conversation_store.get_conversation_owned(caller, conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return _conversation_events_response(conv_id)
 
 
 @router.post("/conversations/{conv_id}/messages")
 async def send_message(conv_id: str, request: SendMessageRequest, caller: str | None = Depends(get_agent_caller)):
+    """发送一条用户消息并启动一轮 agent 运行（立即返回，事件走 SSE 订阅）。
+
+    落 user 消息 + streaming assistant 占位后异步执行；已有运行中任务 → 409；
+    对账残留 streaming 占位。mode/reasoning_effort 是会话状态，发送时落进会话
+    注册表，重试/后续轮沿用。首条消息自动用输入截断做标题。
+    """
     _require_ch()
     from db import PostgresClient
 
@@ -1939,20 +2475,24 @@ async def send_message(conv_id: str, request: SendMessageRequest, caller: str | 
     if not conv:
         raise HTTPException(status_code=404, detail="conversation not found")
     node_id = ((conv.get("chat_settings") or {}).get("node_id") or "").strip()
+    # 运行时状态（mode/reasoning_effort）统一经会话注册表写：改内存 + 写穿 DB + 广播，
+    # 单一写入口（不再直改 chat_settings——绕过内存态正是「切 auto 要等下一轮才生效」
+    # 的根因）。本轮显式给了 reasoning_effort 就落库，否则沿用会话已存值。
+    from agent import conversation_state
+    _cstate = await conversation_state.load(conv_id, conv)
     if request.reasoning_effort is not None:
-        effort = _normalize_reasoning_effort(request.reasoning_effort)
-        settings = dict(conv.get("chat_settings") or {})
-        settings["reasoning_effort"] = effort
-        await conversation_store.update_conversation(conv_id, chat_settings=settings)
-        conv["chat_settings"] = settings
-        turn_reasoning_effort = effort
-    conversation_effort = (conv.get("chat_settings") or {}).get("reasoning_effort")
-    if request.reasoning_effort is None:
+        turn_reasoning_effort = _normalize_reasoning_effort(request.reasoning_effort)
+        await conversation_state.update(conv_id, reasoning_effort=turn_reasoning_effort)
+    else:
         turn_reasoning_effort = (
-            _normalize_reasoning_effort(conversation_effort)
-            if conversation_effort is not None
+            _normalize_reasoning_effort(_cstate.reasoning_effort)
+            if _cstate.reasoning_effort is not None
             else None
         )
+    # mode 是会话状态：发送时把本轮 mode 落进注册表，重试/后续轮沿用。否则前端即使
+    # PATCH 了、这里又被 request.mode 默认值 interact 覆盖回去。
+    if request.mode and request.mode != _cstate.mode:
+        await conversation_state.update(conv_id, mode=request.mode)
     if node_id and not await _caller_authorized_for_node(caller, node_id):
         raise HTTPException(status_code=403, detail="无权操作该节点")
 
@@ -1979,7 +2519,7 @@ async def send_message(conv_id: str, request: SendMessageRequest, caller: str | 
         title = request.content[:30] + ("..." if len(request.content) > 30 else "")
         await conversation_store.update_conversation(conv_id, title=title)
 
-    return await _stream_conversation_turn(
+    return await _start_conversation_turn(
         conv=conv,
         conv_id=conv_id,
         assistant_msg_id=assistant_msg_id,
@@ -1987,6 +2527,7 @@ async def send_message(conv_id: str, request: SendMessageRequest, caller: str | 
         caller=caller,
         mode=request.mode,
         goal_config=request.goal_config,
+        ralph_config=request.ralph_config,
         terminal_context=request.terminal_context,
         max_turns=request.max_turns,
         turn_reasoning_effort=turn_reasoning_effort,
@@ -2038,50 +2579,49 @@ async def retry_message(
     if last_assistant_id != int(message_id):
         raise HTTPException(status_code=400, detail="只能重试最后一条 assistant 消息")
 
-    # 取前一条 user 消息作为本轮输入
-    user_input = ""
+    # 取前一条 user 消息，拼成续跑指令文本（旧的「上一条 user」不清空已做的工作）。
+    prior_user = ""
     for msg in history:
         if msg["id"] == int(message_id):
             break
         if msg.get("role") == "user":
-            user_input = msg.get("content") or ""
-    if not user_input.strip():
+            prior_user = msg.get("content") or ""
+    if not prior_user.strip():
         raise HTTPException(status_code=400, detail="无法重试：上一条用户消息为空")
+    user_input = "请从刚才中断的地方继续完成任务（前面的工具调用与结果仍在上下文中）。"
 
-    # 复位同一条 assistant 消息（保留 id，前端可原地更新）
+    # 复位同一条 assistant 消息为 streaming，但**保留**已完成的正文/工具调用/结果，
+    # 让续跑不从头再来。model/usage/reasoning 由本轮重跑覆盖。
     await conversation_store.update_message(
         int(message_id),
-        content="",
-        tool_calls=None,
-        tool_results=None,
-        media=None,
         status="streaming",
         error=None,
-        model=None,
-        usage=None,
-        reasoning="",
     )
     await conversation_store.touch_conversation(conv_id)
 
-    # 重试沿用会话已存的 reasoning_effort；mode=interact，无 goal/terminal_context。
-    conversation_effort = (conv.get("chat_settings") or {}).get("reasoning_effort")
+    # 重试沿用会话已存的 reasoning_effort / mode（mode 是会话状态，切了 auto 就该
+    # 在重试时生效，而不是硬编码 interact 把用户又拽回审批）。从会话注册表读活状态。
+    from agent import conversation_state
+    _cstate = await conversation_state.load(conv_id, conv)
     turn_reasoning_effort = (
-        _normalize_reasoning_effort(conversation_effort)
-        if conversation_effort is not None
+        _normalize_reasoning_effort(_cstate.reasoning_effort)
+        if _cstate.reasoning_effort is not None
         else None
     )
+    resume_mode = _cstate.mode or "interact"
 
-    return await _stream_conversation_turn(
+    return await _start_conversation_turn(
         conv=conv,
         conv_id=conv_id,
         assistant_msg_id=int(message_id),
         user_input=user_input,
         caller=caller,
-        mode="interact",
+        mode=resume_mode,
         goal_config=None,
         terminal_context=None,
         max_turns=None,
         turn_reasoning_effort=turn_reasoning_effort,
+        resume_from=target,
     )
 
 
@@ -2147,6 +2687,12 @@ async def resolve_approval(
     body: ApprovalRequest,
     caller: str | None = Depends(get_agent_caller),
 ) -> dict:
+    """裁决一条一次性审批（allow/deny）。
+
+    会话归属 + command_hash 比对（防止批准到被改写的命令）双闸门；已裁决/过期 →
+    409。节点审批还需调用者仍持有节点绑定、节点在线且支持终端。裁决后广播给本
+    会话全部订阅者，让其他端挂着的同一张卡跟着翻状态。
+    """
     _require_ch()
     from user_platform.node_client.approvals import approval_registry
 
@@ -2159,6 +2705,9 @@ async def resolve_approval(
         raise HTTPException(status_code=404, detail="confirmation not found")
     if action.resolved is not None:
         raise HTTPException(status_code=409, detail=f"confirmation already {action.resolved}")
+    # 过期（尚未被 reap）的审批不能被放行：晚到的一次点击不该把已过期审批批下来。
+    if action.is_expired():
+        raise HTTPException(status_code=409, detail="confirmation already expired")
 
     # Re-validate the caller is still authorized for this node (a binding may
     # have been revoked since the conversation started) and that the command the
@@ -2186,6 +2735,11 @@ async def resolve_approval(
         # Lost a race with a concurrent resolve / timeout between the get() and
         # resolve() above.
         raise HTTPException(status_code=409, detail="confirmation already resolved")
+    # 广播给本会话全部订阅者，让别的端挂着的同一张卡跟着翻状态。
+    from user_platform.node_client.approvals import publish_approval_resolved
+    await publish_approval_resolved(
+        conv_id, confirmation_id, result, tool_name=resolved.tool_name,
+    )
     return {"ok": True, "confirmation_id": confirmation_id, "result": result}
 
 
@@ -2207,13 +2761,25 @@ async def list_approvals(
 
 @router.post("/conversations/{conv_id}/abort")
 async def abort_conversation(conv_id: str, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """中止对话正在运行的一轮 agent（协作式停止 + cancel 双保险）。
+
+    无活任务时对账残留 streaming 占位，返回 aborted=false。
+    """
     _require_ch()
     if await conversation_store.get_conversation_owned(caller, conv_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     task = _CONV_TASKS.get(conv_id)
     if task and not task.done():
+        # 协作式停止先于 cancel：置位后，正在跑的 code_run 子进程会立刻被杀树、
+        # agent_loop 下一轮不再调 AI；cancel 兜底打断卡在 await 里的那次。
+        ev = _CONV_STOPS.get(conv_id)
+        if ev is not None:
+            ev.set()
         task.cancel()
         return {"aborted": True}
+    # 本进程没有活任务却可能残留一条 streaming 占位消息（进程重启/任务句柄
+    # 丢失）。点暂停时对账掉它，前端那个「思考中」气泡才不会永远转圈。
+    await _reconcile_orphaned_streaming(conv_id)
     return {"aborted": False, "detail": "no running task"}
 
 
@@ -2255,6 +2821,7 @@ async def _get_chat_conversation_or_404(conv_id: str, caller: str | None) -> dic
 
 @router.post("/chat/conversations")
 async def create_chat_conversation(request: CreateChatConversationRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """新建操练场/聊天对话（kind='chat'，与 Agent 会话隔离，仅持久化）。"""
     _require_ch()
     return await conversation_store.create_conversation(
         title=request.title,
@@ -2273,6 +2840,7 @@ async def list_chat_conversations(
     paged: bool = False,
     caller: str | None = Depends(get_agent_caller),
 ) -> Any:
+    """列出当前调用者的聊天对话（kind='chat'）。paged=true 时走游标分页。"""
     _require_ch()
     if not paged:
         return await conversation_store.list_conversations_for_caller(caller, limit=limit, kind="chat")
@@ -2286,6 +2854,7 @@ async def list_chat_conversations(
 
 @router.get("/chat/conversations/{conv_id}/meta")
 async def get_chat_conversation_meta(conv_id: str, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """读取聊天对话元数据（kind='chat'，归属只校验调用者）。"""
     _require_ch()
     return await _get_chat_conversation_or_404(conv_id, caller)
 
@@ -2297,26 +2866,30 @@ async def list_chat_conversation_messages(
     cursor: int | None = None,
     caller: str | None = Depends(get_agent_caller),
 ) -> dict:
+    """按用户轮取聊天对话消息分页（timeline 视图，游标翻页）。"""
     _require_ch()
     await _get_chat_conversation_or_404(conv_id, caller)
-    return await conversation_store.get_messages_page_by_user_turns(conv_id, limit=limit, cursor=cursor)
+    return await conversation_store.get_messages_page_by_user_turns(conv_id, limit=limit, cursor=cursor, timeline=True)
 
 
 @router.get("/chat/conversations/{conv_id}")
 async def get_chat_conversation(conv_id: str, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """取一条聊天对话的完整快照（元数据 + 全量消息历史）。"""
     _require_ch()
     conv = await _get_chat_conversation_or_404(conv_id, caller)
-    messages = await conversation_store.get_messages(conv_id)
+    messages = await conversation_store.get_messages(conv_id, timeline=True)
     return {"conversation": conv, "messages": messages}
 
 
 @router.delete("/chat/conversations/{conv_id}")
 async def delete_chat_conversation(conv_id: str, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """删除聊天对话并回收其会话注册表实例。"""
     _require_ch()
     await _get_chat_conversation_or_404(conv_id, caller)
     deleted = await conversation_store.delete_conversation(conv_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="conversation not found")
+    conversation_state.evict(conv_id)
     return {"deleted": True}
 
 
@@ -2324,12 +2897,14 @@ async def delete_chat_conversation(conv_id: str, caller: str | None = Depends(ge
 async def batch_delete_chat_conversations(
     request: BatchDeleteConversationsRequest, caller: str | None = Depends(get_agent_caller)
 ) -> dict:
+    """批量删除聊天对话：未找到/无权的 id 一律归入 not_found（不区分两者）。"""
     _require_ch()
     return await _batch_delete_conversations(request.ids, caller)
 
 
 @router.patch("/chat/conversations/{conv_id}")
 async def update_chat_conversation(conv_id: str, request: UpdateChatConversationRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """部分更新聊天对话（标题/系统提示词/模型/chat_settings）。"""
     _require_ch()
     await _get_chat_conversation_or_404(conv_id, caller)
     fields = {k: v for k, v in request.model_dump(exclude_none=True).items()}
@@ -2343,6 +2918,11 @@ async def update_chat_conversation(conv_id: str, request: UpdateChatConversation
 
 @router.post("/chat/conversations/{conv_id}/messages")
 async def append_chat_message(conv_id: str, request: AppendChatMessageRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """追加一条聊天消息（前端驱动发送的落库入口）。
+
+    首条用户消息自动取输入截断做标题；聊天会话无会话级流，实时信号就是
+    「消息变了」——广播 message_appended 让旁观端重拉历史。
+    """
     conv = await _get_chat_conversation_or_404(conv_id, caller)
     msg = await conversation_store.add_message(
         conv_id, request.role, request.content, status=request.status, error=request.error,
@@ -2353,6 +2933,9 @@ async def append_chat_message(conv_id: str, request: AppendChatMessageRequest, c
     if conv.get("title") == "新对话" and request.role == "user" and request.content:
         title = request.content[:30] + ("..." if len(request.content) > 30 else "")
         await conversation_store.update_conversation(conv_id, title=title)
+    # 聊天会话没有会话级流（/chat/send 是无状态 POST-SSE，不绑 conv_id），所以
+    # 这里的实时信号就是「消息变了」：旁观端收到后重拉历史即可，形态与快照对齐。
+    await realtime.publish("chat", conv_id, {"type": "message_appended", "message": msg})
     return msg
 
 
@@ -2365,6 +2948,7 @@ async def delete_chat_message(conv_id: str, message_id: int, caller: str | None 
     deleted = await conversation_store.delete_message(int(message_id))
     if not deleted:
         raise HTTPException(status_code=404, detail="message not found")
+    await realtime.publish("chat", conv_id, {"type": "message_deleted", "message_id": int(message_id)})
     return {"deleted": True}
 
 
@@ -2613,7 +3197,7 @@ async def list_available_mcp(caller: str | None = Depends(get_agent_caller)) -> 
 
     场景保留服务（marketplace-status / issue-workflow / review-result）不在选择器里
     露出：它们只由对应场景的对话临时获权（见 ``agent_main._collect_service_tokens``
-    的 scene.services 门禁），普通 Agent 不应能勾选。
+    的 scene.capabilities 门禁），普通 Agent 不应能勾选。
     """
     import mcp_plugin_store
 
@@ -2786,254 +3370,450 @@ async def chat_media(request: ChatMediaRequest, caller: str | None = Depends(get
     return result
 
 
-# ── 定时任务管理 ─────────────────────────────────────────────────────
-
-def _get_scheduler():
-    from agent.scheduler import AgentScheduler
-    return AgentScheduler()
 
 
-@router.get("/scheduled-tasks")
-async def list_scheduled_tasks(caller: str | None = Depends(get_agent_caller)) -> list[dict]:
-    scheduler = _get_scheduler()
-    # 管理员(caller=None)看全部；用户只看自己的（user_id=caller 或历史平台行 NULL 不返）
-    user_filter = caller if caller is not None else None
-    jobs = await scheduler.get_jobs(user_id=user_filter)
-    if caller is not None:
-        # 历史平台行 user_id NULL 仅管理端可见,用户态过滤掉
-        jobs = [j for j in jobs if j.get("user_id") is not None]
-    return jobs
+def _ensure_scheduler_running(requested_enabled: bool | None) -> None:
+    """见 agent.runner.ensure_scheduler_running：开了调度意图就幂等拉起调度器。
+
+    仍被 /agents CRUD 的 per-agent 定时开关调用（scheduler_enabled）。工作流的 cron
+    走独立调度器，不经过这里。
+    """
+    from agent.runner import ensure_scheduler_running
+
+    ensure_scheduler_running(requested_enabled)
 
 
-@router.post("/scheduled-tasks")
-async def create_scheduled_task(request: CreateScheduledTaskRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
-    task_kind = (request.task_kind or "prompt").lower()
-    if task_kind == "script" and not (request.script_code or "").strip():
-        raise HTTPException(status_code=400, detail="task_kind=script requires script_code")
-    if task_kind == "prompt" and not (request.task_prompt or "").strip():
-        raise HTTPException(status_code=400, detail="task_kind=prompt requires task_prompt")
-    owner = await _resolve_agent_owner(caller)
-    # 任务级网关 key 必须对调用者可用，否则到点才失败（无人在场，只留一条 last_result）。
-    if request.api_key_id is not None:
-        await _validate_agent_gateway_key(request.api_key_id, caller)
-    scheduler = _get_scheduler()
-    # 脚本任务一律**不在创建时授权**：approved_hash 留空，任务落库后处于待授权态，
-    # 必须显式调 approve-script 才会执行。前端建完脚本任务即引导用户当场授权，
-    # 这样「谁授权了这段代码」始终是一个独立的、可审计的人工动作，而不是创建的副作用。
-    job_id = await scheduler.add_job(
-        name=request.name,
-        cron_expression=request.cron_expression,
-        task_prompt=request.task_prompt,
-        skill_id=request.skill_id,
-        enabled=request.enabled,
-        agent_id=request.agent_id,
-        user_id=owner,
-        task_kind=task_kind,
-        script_code=request.script_code,
-        script_type=request.script_type,
-        script_timeout=request.script_timeout,
-        background=request.background,
-        on_error=request.on_error,
-        allow_ai_script_fix=request.allow_ai_script_fix,
-        api_key_id=request.api_key_id,
-        model=request.model,
+# ---------------------------------------------------------------------------
+# Workflow endpoints (user-scoped: a workflow is an **independent artifact**
+# owned by a user. An agent — like the UI and cron — can only *launch* a run;
+# how the run executes is decided by the workflow's own steps, each of which
+# names its own resources (browser clients, MCP service, target agent).
+# ---------------------------------------------------------------------------
+
+async def _resolve_workflow_access(def_id: int, caller: str | None) -> dict:
+    """Load a workflow def and verify the caller **owns** it.
+
+    Ownership is the whole rule now (there is no owning agent to delegate to):
+    the def is reachable by its ``user_id`` owner, and by an admin
+    (caller=None). Someone else's workflow reads as 404 — no existence oracle.
+    """
+    from db import PostgresClient
+
+    if not PostgresClient.pool:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    async with PostgresClient.pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM workflow_defs WHERE id=$1", def_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    d = dict(row)
+    owner = d.get("user_id")
+    if caller is not None and owner is not None and str(owner) != str(caller):
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return d
+
+
+@router.get("/workflows")
+async def list_workflows(caller: str | None = Depends(get_agent_caller)) -> list[dict]:
+    """Workflows the caller owns (latest version each), with node counts."""
+    from agent import workflow_store
+
+    rows = await workflow_store.list_defs(caller)
+    out = []
+    for r in rows:
+        item = dict(r)
+        defn = item.get("definition")
+        if isinstance(defn, str):
+            try:
+                item["definition"] = json.loads(defn)
+            except ValueError:
+                pass
+        for key in ("created_at", "updated_at", "next_run_at", "last_run_at"):
+            if item.get(key) is not None:
+                item[key] = str(item[key])
+        item["node_count"] = len((item.get("definition") or {}).get("nodes") or [])
+        out.append(item)
+    return out
+
+
+@router.post("/workflows")
+async def create_workflow(request: WorkflowDefRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """Create a workflow owned by the caller."""
+    from agent import workflow_store
+
+    try:
+        row = await workflow_store.create_def(
+            request.name, request.description, request.definition,
+            user_id=await _resolve_agent_owner(caller) if caller is not None else None,
+            label=request.label,
+            retry_on_reboot=request.retry_on_reboot,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        detail = str(exc)
+        if "WorkflowDefError" in type(exc).__name__ or "definition" in detail.lower():
+            raise HTTPException(status_code=400, detail=f"definition invalid: {detail}")
+        raise HTTPException(status_code=500, detail=detail)
+    return {"id": row["id"], "version": row["version"], "name": row["name"], "label": row.get("label", "")}
+
+
+class WorkflowImportRequest(BaseModel):
+    """JSON 文件导入：整包搬运可移植字段（不含 id/版本/归属/运行记录）。"""
+    name: str = Field(..., min_length=1, max_length=200)
+    label: str = Field(default="", max_length=200)
+    description: str = ""
+    definition: dict[str, Any]
+    retry_on_reboot: bool = True
+
+
+@router.post("/workflows/import")
+async def import_workflow(request: WorkflowImportRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """导入一个工作流 JSON → 在调用者名下新建 v1（后端做全图静态校验）。"""
+    return await create_workflow(
+        WorkflowDefRequest(
+            name=request.name, label=request.label, description=request.description,
+            definition=request.definition, retry_on_reboot=request.retry_on_reboot,
+        ),
+        caller=caller,
     )
-    if not job_id:
-        raise HTTPException(status_code=500, detail="failed to create scheduled task")
+
+
+@router.get("/workflows/export/{def_id}")
+async def export_workflow(def_id: int, version: int | None = None, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """导出为可移植 JSON（kind/name/label/description/definition）。
+
+    归属、版本、定时、运行记录**不可移植**——换环境就是换所有者与运行身份；
+    导入端据此新建 v1。
+    """
+    from agent import workflow_store
+
+    await _resolve_workflow_access(def_id, caller)
+    row = await workflow_store.get_def(def_id, version=version)
+    if not row:
+        raise HTTPException(status_code=404, detail="workflow version not found")
     return {
-        "id": job_id,
-        "name": request.name,
-        "cron_expression": request.cron_expression,
-        "task_kind": task_kind,
-        # 前端据此判断是否要弹授权引导：脚本任务创建后必然待授权。
-        "needs_approval": task_kind == "script",
+        "kind": "workflow",
+        "name": row["name"],
+        "label": row.get("label") or "",
+        "description": row.get("description") or "",
+        "definition": row["definition"],
     }
 
 
-@router.patch("/scheduled-tasks/{job_id}")
-async def update_scheduled_task(job_id: int, request: UpdateScheduledTaskRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+# 静态子路径必须在 /workflows/{def_id} 之前声明：def_id 是 int 路径参数，
+# "options"/"accounts"/"export" 落到那条路由会 422 而不是命中这里。
+@router.get("/workflows/options")
+async def workflow_options(caller: str | None = Depends(get_agent_caller)) -> dict:
+    """步骤编辑器的一次性选项包：agent 列表（run_session）、MCP 服务+方法
+    （run_mcp）、浏览器客户端（web）、cache 固定前缀。
+
+    全部按调用者身份取，不与 agent 相关：工作流是用户资产。
+    """
     from db import PostgresClient
-    scheduler = _get_scheduler()
-    if caller is not None and not await scheduler.job_owned_by(job_id, caller):
-        raise HTTPException(status_code=404, detail="scheduled task not found")
 
-    # 任务级网关 key 换绑同样先校验可用性：与创建端点同口径，避免把「到点才发现
-    # 没权限」留给无人值守的那一刻。
-    if request.api_key_id is not None:
-        await _validate_agent_gateway_key(request.api_key_id, caller)
+    agents: list[dict] = []
+    services: list[dict] = []
+    browsers: list[dict] = []
+    if PostgresClient.pool:
+        team_id = await _resolve_team_id_safe(caller) if caller else None
+        for row in await PostgresClient.list_agents_for_caller(caller, team_id):
+            agents.append({
+                "id": row["id"],
+                "name": row.get("name") or "",
+                "display_name": row.get("display_name") or row.get("name") or "",
+                "enabled": bool(row.get("enabled", True)),
+            })
+        import mcp_plugin_store
 
-    # 先更新 DB
-    updates = {k: v for k, v in request.model_dump(exclude_none=True).items()}
-    if not updates:
-        raise HTTPException(status_code=400, detail="no fields to update")
-
-    # 改脚本正文/类型/超时 → 撤销授权（approved_hash 置空），任务转待授权并停止调度。
-    # 不在这里顺手重签：授权必须始终是一次独立的人工动作（approve-script），否则「编辑」
-    # 就成了绕过审批的后门——改一行代码即自动获得执行权，哈希锁形同虚设。
-    if any(k in updates for k in ("script_code", "script_type", "script_timeout")):
-        updates["approved_hash"] = None
-        updates["enabled"] = False
-
-    set_parts = [f"{k}=${i+2}" for i, k in enumerate(updates)]
-    values = list(updates.values())
-    async with PostgresClient.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"UPDATE agent_scheduled_tasks SET {', '.join(set_parts)} WHERE id=$1 RETURNING *",
-            job_id, *values,
-        )
-    if not row:
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-
-    # 如果更新了 cron 或 enabled，重新注册到 APScheduler。
-    # 用 build_trigger（支持 daily/every_N 等 repeat 关键字）+ 传函数对象 _execute_job，
-    # 不用 CronTrigger.from_crontab（对 repeat 关键字会抛错）和字符串引用（解析失败）。
-    if "cron_expression" in updates or "enabled" in updates:
         try:
-            scheduler._scheduler.remove_job(str(job_id))
-        except Exception:
-            pass
-        if row["enabled"]:
-            try:
-                from agent.scheduler import _execute_job, build_trigger
-                trigger = build_trigger(row["cron_expression"])
-                scheduler._scheduler.add_job(
-                    _execute_job, trigger=trigger,
-                    id=str(job_id), kwargs={"job_id": job_id},
-                    replace_existing=True,
-                )
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"invalid cron expression: {e}")
+            all_services = await mcp_plugin_store.list_services()
+        except Exception as exc:  # noqa: BLE001 — MCP 不可用不该拦编辑器打开
+            logger.warning("[workflow] options list_services failed: %s", exc)
+            all_services = []
+        enabled_services = [s for s in all_services if s.get("enabled")]
+        try:
+            usable = await mcp_plugin_store.usable_service_ids(
+                user_id=caller, services=enabled_services,
+            )
+        except Exception:  # noqa: BLE001
+            usable = {int(s["id"]) for s in enabled_services if s.get("id") is not None}
+        for svc in enabled_services:
+            sid = svc.get("id")
+            if sid is None or int(sid) not in usable:
+                continue
+            methods = []
+            cache = svc.get("tools_cache") or []
+            if isinstance(cache, list):
+                for m in cache:
+                    if isinstance(m, dict) and m.get("name"):
+                        methods.append({
+                            "name": m["name"],
+                            "description": m.get("description") or "",
+                            "input_schema": m.get("input_schema") or {},
+                        })
+            services.append({
+                "name": svc.get("name") or "",
+                "display_name": svc.get("display_name") or svc.get("name") or "",
+                "description": svc.get("description") or "",
+                "methods": methods,
+            })
+        try:
+            import builtin_tool_store
 
-    return dict(row)
+            for resource in await builtin_tool_store.list_resources(
+                "cdp_client", owner_user_id=caller, enabled=True,
+            ):
+                cid = builtin_tool_store.cdp_client_id_of(resource)
+                if cid:
+                    browsers.append({
+                        "client_id": cid,
+                        "name": resource.get("name") or cid,
+                        "enabled": bool(resource.get("enabled", True)),
+                    })
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[workflow] options cdp clients failed: %s", exc)
 
+    from agent.workflow import CACHE_KEY_PREFIX, NODE_KINDS
 
-@router.delete("/scheduled-tasks/{job_id}")
-async def delete_scheduled_task(job_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
-    from db import PostgresClient
-    scheduler = _get_scheduler()
-    if caller is not None and not await scheduler.job_owned_by(job_id, caller):
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-    # 从 APScheduler 移除
+    # 模型库存（model 类入参的候选）：与 Agent 编辑器同源（脱敏、仅启用）。
+    models: list[dict] = []
+    if PostgresClient.pool:
+        try:
+            for r in await PostgresClient.list_agent_llm_models(enabled_only=True):
+                models.append({
+                    "id": r.get("id"),
+                    "model_name": r.get("model_name") or "",
+                    "display_name": r.get("display_name") or r.get("model_name") or "",
+                    "config_name": r.get("config_name") or "",
+                })
+        except Exception:  # noqa: BLE001 — 模型列表拉不到不该拦编辑器
+            logger.warning("[workflow] options models failed", exc_info=True)
+
+    # 代理池（http 步骤 / proxy 入参）：按归属过滤——非管理员只见到 owner_user_id
+    # 为自己的条目（url/凭据从不暴露，只回 id/name/mode）。拉不到就空列表，不拦编辑器。
+    proxies: list[dict] = []
     try:
-        scheduler._scheduler.remove_job(str(job_id))
-    except Exception:
-        pass
-    # 从 DB 删除
-    async with PostgresClient.pool.acquire() as conn:
-        row = await conn.fetchrow("DELETE FROM agent_scheduled_tasks WHERE id=$1 RETURNING id", job_id)
+        import admin as _admin
+
+        all_proxies = _admin._read_proxies()
+        for p in all_proxies:
+            if caller is not None and str(p.get("owner_user_id") or "") not in ("", caller):
+                continue
+            proxies.append({
+                "id": str(p.get("id") or ""),
+                "name": str(p.get("name") or ""),
+                "mode": str(p.get("mode") or "network"),
+            })
+    except Exception:  # noqa: BLE001 — 代理池读不到不该拦编辑器
+        logger.warning("[workflow] options proxies failed", exc_info=True)
+
+    return {
+        "node_kinds": list(NODE_KINDS),
+        "cache_key_prefix": CACHE_KEY_PREFIX,
+        "agents": agents,
+        "mcp_services": services,
+        "browsers": browsers,
+        "models": models,
+        "proxies": proxies,
+    }
+
+
+@router.get("/workflows/accounts")
+async def workflow_account_options(url: str = Query(...), caller: str | None = Depends(get_agent_caller)) -> dict:
+    """入参来源「密钥账户列表」预览：按 url 的站点返回账号列表。
+
+    只回账号元数据（id/domain/username/url），**绝不回密码**——密码的解密出口
+    是浏览器密码管理页的二次鉴权路径，工作流拿不到也不该拿。
+    """
+    from urllib.parse import urlparse
+
+    host = urlparse(url).hostname or ""
+    if not host:
+        raise HTTPException(status_code=400, detail="url 无效（无法解析站点）")
+    if caller is None:
+        return {"ok": True, "accounts": []}
+    import browser_password_store
+
+    rows = await browser_password_store.list_passwords(str(caller), domain=host)
+    return {
+        "ok": True,
+        "accounts": [
+            {"id": r["id"], "domain": r["domain"], "username": r["username"], "url": r.get("url") or ""}
+            for r in rows
+        ],
+    }
+
+
+@router.get("/workflows/notify-channels")
+async def workflow_notify_channels(caller: str | None = Depends(get_agent_caller)) -> list[dict]:
+    """结束节点「通知方式」的候选：当前用户（含其团队）的启用通知渠道。
+
+    只回 meta（id/name/kind），**绝不回 webhook_url/secret**。渠道的新建/编辑在
+    通知设置页做，这里只给多选。
+    """
+    if caller is None:
+        return []
+    from user_platform.notify_dispatch import list_owner_channels
+
+    return await list_owner_channels(str(caller))
+
+
+@router.get("/workflows/{def_id}")
+async def get_workflow(def_id: int, version: int | None = None, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """读取工作流定义；不传 version 取最新版，传了取指定历史版本。"""
+    from agent import workflow_store
+
+    await _resolve_workflow_access(def_id, caller)
+    row = await workflow_store.get_def(def_id, version=version)
     if not row:
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-    return {"deleted": True}
+        raise HTTPException(status_code=404, detail="workflow version not found")
+    return row
 
 
-@router.post("/scheduled-tasks/{job_id}/run")
-async def run_scheduled_task(job_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
-    scheduler = _get_scheduler()
-    ok = await scheduler.run_now(job_id, user_id=caller)
-    if not ok:
-        raise HTTPException(status_code=404, detail="scheduled task not found or disabled")
-    return {"triggered": True}
+@router.patch("/workflows/{def_id}")
+async def update_workflow(def_id: int, request: WorkflowUpdateRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """保存工作流定义（产生新版本）；启动方式（triggers，含定时）随定义一起保存。
 
+    保存后幂等重载该 def 的调度 job，避免「编辑完定时没生效」；重载失败不影响保存。
+    """
+    from agent import workflow_store
 
-@router.post("/scheduled-tasks/{job_id}/toggle")
-async def toggle_scheduled_task(job_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
-    from db import PostgresClient
-    scheduler = _get_scheduler()
-    if caller is not None and not await scheduler.job_owned_by(job_id, caller):
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-
-    async with PostgresClient.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "UPDATE agent_scheduled_tasks SET enabled = NOT enabled WHERE id=$1 RETURNING id, enabled",
-            job_id,
+    await _resolve_workflow_access(def_id, caller)
+    try:
+        row = await workflow_store.update_def(
+            def_id, request.definition, description=request.description, label=request.label,
+            retry_on_reboot=request.retry_on_reboot,
         )
-    if not row:
-        raise HTTPException(status_code=404, detail="scheduled task not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # 启动方式（triggers，含定时）随定义一起保存。保存后幂等重载该 def 的 job——
+    # 调度器仍按旧 job 注册着（reload_def 才会指向最新定义），否则「编辑完定时没生效」。
+    try:
+        from agent.workflow_scheduler import get_workflow_scheduler
 
-    new_enabled = row["enabled"]
-    # 同步 APScheduler。同 update：build_trigger + 函数对象，别用 from_crontab/字符串引用。
-    if new_enabled:
-        async with PostgresClient.pool.acquire() as conn:
-            task = await conn.fetchrow("SELECT cron_expression FROM agent_scheduled_tasks WHERE id=$1", job_id)
-        if task:
-            try:
-                from agent.scheduler import _execute_job, build_trigger
-                trigger = build_trigger(task["cron_expression"])
-                scheduler._scheduler.add_job(
-                    _execute_job, trigger=trigger,
-                    id=str(job_id), kwargs={"job_id": job_id},
-                    replace_existing=True,
-                )
-            except Exception:
-                pass
-    else:
-        try:
-            scheduler._scheduler.remove_job(str(job_id))
-        except Exception:
-            pass
-
-    return {"id": job_id, "enabled": new_enabled}
+        sched = get_workflow_scheduler()
+        sched.start()
+        await sched.reload_def(def_id)
+    except Exception:  # noqa: BLE001 - 重载失败不影响保存本身
+        pass
+    return {"id": row["id"], "version": row["version"], "name": row["name"], "label": row.get("label", "")}
 
 
-@router.get("/scheduled-tasks/{job_id}")
-async def get_scheduled_task(job_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
-    """单条任务全字段（含 script_code / pending_script_code）——列表接口刻意不带这些大字段。"""
-    scheduler = _get_scheduler()
-    if caller is not None and not await scheduler.job_owned_by(job_id, caller):
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-    task = await scheduler.get_task(job_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-    if caller is not None and task.get("user_id") is None:
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-    return task
+@router.delete("/workflows/{def_id}")
+async def delete_workflow(def_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """删除工作流（破坏性操作）：删定义行并按家族口径清掉调度器里全部版本名的 cron job。"""
+    from agent import workflow_store
+
+    await _resolve_workflow_access(def_id, caller)
+    ok = await workflow_store.delete_def(def_id)
+    # 行删了，调度器里注册着的 cron job 不会自己消失——不摘掉就是「删掉的工作流继续按
+    # 定时点火」（点火时定义已不存在，只剩错误日志）。remove 走家族口径，
+    # 同工作流所有版本行名下的 job 一起清。
+    try:
+        from agent.workflow_scheduler import get_workflow_scheduler
+
+        await get_workflow_scheduler().remove(def_id)
+    except Exception:  # noqa: BLE001 - 摘 job 失败不影响删除本身
+        pass
+    return {"deleted": bool(ok)}
 
 
-@router.post("/scheduled-tasks/{job_id}/approve-script")
-async def approve_scheduled_task_script(job_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
-    """人工授权脚本：把 pending_script_code（或现有 script_code）提升为授权态并 enable。
+@router.post("/workflows/{def_id}/run")
+async def run_workflow_endpoint(def_id: int, request: WorkflowRunRequest, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """手动跑一次工作流。后台执行，立即返回 run_id；进度走 GET /workflows/{def_id}/runs/{run_id}。
 
-    这是唯一写 approved_hash 的人工入口——脚本必须经此才跑得起来（哈希锁真相源）。
+    ``trigger_id`` 命名定义里声明的某个启动方式（cron）：其 ``params`` 解析成本次的
+    ``$input.*``。``account_list`` + ``multiple=true`` 会**整图按账号扇出 N 遍**——
+    此时返回多条 ``run_ids``（``run_id`` 取第一条，兼容旧前端）。
     """
-    scheduler = _get_scheduler()
-    if caller is not None and not await scheduler.job_owned_by(job_id, caller):
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-    ok = await scheduler.approve_script(job_id)
-    if not ok:
-        raise HTTPException(status_code=400, detail="not a script task or no script to approve")
-    return {"approved": True, "id": job_id}
+    from agent import workflow_store, workflow_service
+
+    access = await _resolve_workflow_access(def_id, caller)
+    try:
+        run_ids = await workflow_service.start_and_run_multi(
+            def_id,
+            args=request.args,
+            version=request.version,
+            trigger="manual",
+            caller=caller,
+            trigger_id=request.trigger_id,
+            single_account_only=request.single_account_only,
+            pick_accounts=request.pick_accounts,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "run_id": run_ids[0] if run_ids else 0,
+        "run_ids": run_ids,
+        "def_id": def_id,
+        "version": access.get("version"),
+    }
 
 
-@router.get("/scheduled-tasks/{job_id}/runs")
-async def list_scheduled_task_runs(
-    job_id: int,
-    limit: int = Query(50, ge=1, le=100),
-    cursor: int | None = None,
-    caller: str | None = Depends(get_agent_caller),
-) -> list[dict]:
-    """某定时任务的执行记录列表（run_at 倒序）。详情走单条 runs/{run_id}。"""
-    scheduler = _get_scheduler()
-    if caller is not None and not await scheduler.job_owned_by(job_id, caller):
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-    return await scheduler.list_runs(job_id, limit=limit, cursor=cursor)
+@router.get("/workflows/{def_id}/runs")
+async def list_workflow_runs(def_id: int, limit: int = 50, caller: str | None = Depends(get_agent_caller)) -> list[dict]:
+    """列出该工作流的运行记录（最近在前，limit 上限截断）。"""
+    from agent import workflow_store
+
+    await _resolve_workflow_access(def_id, caller)
+    return await workflow_store.list_runs(def_id, limit=limit)
 
 
-@router.get("/scheduled-tasks/{job_id}/runs/{run_id}")
-async def get_scheduled_task_run(
-    job_id: int, run_id: int, caller: str | None = Depends(get_agent_caller),
-) -> dict:
-    """单条执行记录全字段（含 stdout/stderr/conversation_id）。
+@router.get("/workflows/{def_id}/runs/{run_id}")
+async def get_workflow_run(def_id: int, run_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """单条运行记录全字段：节点级日志（status/output/error/decision/duration）+
+    变量快照。前端拿 run_id 渲染节点时间线。"""
+    from agent import workflow_store
 
-    prompt/heal 执行的 Agent 对话不在此返回：前端拿 conversation_id 走既有
-    /conversations/{conv_id} 系列端点渲染（归属 = 任务 owner 建会话时已写入）。
-    """
-    scheduler = _get_scheduler()
-    if caller is not None and not await scheduler.job_owned_by(job_id, caller):
-        raise HTTPException(status_code=404, detail="scheduled task not found")
-    run = await scheduler.get_run(run_id)
-    if not run or int(run.get("job_id") or 0) != int(job_id):
+    await _resolve_workflow_access(def_id, caller)
+    run = await workflow_store.get_run(run_id, family_of=def_id)
+    if not run:
         raise HTTPException(status_code=404, detail="run not found")
     return run
+
+
+@router.post("/workflows/{def_id}/runs/{run_id}/cancel")
+async def cancel_workflow_run(def_id: int, run_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """取消在跑的 run（本进程的 asyncio task）。跨进程/已结束的 run 返回 cancelled=false。"""
+    from agent import workflow_service
+
+    await _resolve_workflow_access(def_id, caller)
+    return {"run_id": run_id, "cancelled": workflow_service.cancel_run(run_id)}
+
+
+class WorkflowScheduleRequest(BaseModel):
+    """兼容旧前端：定时已改为定义内的「启动方式（triggers）」。此请求体不再读取。"""
+    cron_expression: str | None = None
+    enabled: bool = True
+
+
+@router.post("/workflows/{def_id}/reload-schedule")
+async def reload_workflow_schedule(def_id: int, caller: str | None = Depends(get_agent_caller)) -> dict:
+    """按定义里声明的启动方式重载该工作流的定时 job（保存定义后调用）。
+
+    定时配置本身随 definition 一起保存（PATCH /workflows/{def_id}），本端点只负责
+    让调度器**立刻**反映最新定义——保存后幂等重载，避免「编辑完定时没生效」。
+    """
+    await _resolve_workflow_access(def_id, caller)
+    from agent.workflow_scheduler import get_workflow_scheduler
+
+    sched = get_workflow_scheduler()
+    sched.start()
+    await sched.reload_def(def_id)
+    return {"def_id": def_id, "reloaded": True}
+
+
+@router.patch("/workflows/{def_id}/schedule")
+async def set_workflow_schedule(
+    def_id: int, request: WorkflowScheduleRequest, caller: str | None = Depends(get_agent_caller),
+) -> dict:
+    """已废弃：定时改为定义内的启动方式。保留端点只为旧前端不 404——不做任何写入，
+    返回提示，真正改定时请保存 definition（PATCH /workflows/{def_id}）。"""
+    await _resolve_workflow_access(def_id, caller)
+    raise HTTPException(
+        status_code=410,
+        detail="定时已改为定义内的「启动方式（triggers）」，请保存工作流定义来改定时",
+    )
 
 
 # ---------------------------------------------------------------------------

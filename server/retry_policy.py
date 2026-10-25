@@ -20,6 +20,7 @@ config store / DB / Redis —— 所有配置（可重试规则、rate-limit 状
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -148,12 +149,134 @@ def is_non_retryable_upstream_error(status_code: int, detail: Any, rules: dict |
 #
 # 表驱动：要支持新的超限类别，只需在 _ERROR_CANONICAL_RULES 加一条，无需改任何调用点。
 # 非超限错误一律返回 None，交回原透传/配置规则逻辑，绝不越权改写。
+#
+# ⚠️ message 不是给人看的文案，是**客户端的压缩触发器**：Claude Code 对错误文案做
+#    大小写不敏感的子串匹配，认 "prompt is too long" / "input is too long for requested
+#    model" / "context window" / "input length and `max_tokens` exceed context limit"
+#    才会自动压缩后重发（OpenAI 系客户端认 "maximum context length"）。改/加 message 时
+#    **必须保留其中一个锚点**，否则归一化了 code 却客户端只会当普通错误显示，不会压缩。
+
+# 「输入/上下文超限」类目集合。归一表里还收了 thinking_budget_invalid 这类同样不可重试
+# 但与超限无关的参数冲突，所以「canonicalize 命中」≠「超限」——需要超限语义的调用点
+# （终端归因、SSE 错误码、客户端压缩提示）用这个集合或 CanonicalError.is_overflow 判定。
+OVERFLOW_CATEGORIES: frozenset[str] = frozenset({
+    "prompt_too_long",
+    "input_too_long",
+    "model_context_limit",
+    "context_length_exceeded",
+    "max_tokens_exceeded",
+})
+
+
+# ── 上下文窗口大小的抽取与呈现 ───────────────────────────────────
+# 客户端只被告知「超限了」而没有具体窗口大小时无法判断该压到多少——把窗口大小附到
+# 文案里（N tokens），用户/客户端就能立刻知道目标。窗口来源有两处：上游错误原文里
+# 常自带真实上限（"maximum context length is 202752 tokens"），或本地模型元数据的
+# max_context_tokens。抽取失败一律退化为「不显示」，绝不编造数字。
+#
+# 优先级：显式结构化字段（我们自己构造的 error.context_window，见 extract_context_window）
+# 永远高于文案正则——正则无法区分「窗口上限」与「本次估算输入」这类相邻数字，只有
+# 显式字段才是无歧义的。正则仅用于上游原文（我们没有控制权的第三方文案）。
+_CONTEXT_WINDOW_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:maximum |max\.? )?context length[^0-9]{0,40}?(\d{4,})\s*tokens?", re.I),
+    re.compile(r"max(?:imum)?[^0-9]{0,12}?(\d{4,})[^0-9]{0,4}?tokens?", re.I),
+    re.compile(r"(\d{4,})\s*tokens?[^0-9]{0,4}?limit", re.I),
+    re.compile(r"context[_\s-]*window[^0-9;,(]{0,40}?(\d{4,})", re.I),
+    re.compile(r"(?:supports?|supports up to)\s+(\d{4,})\s+tokens?", re.I),
+    re.compile(r"(?:令牌|上下文|最大)[^\d]{0,18}?(\d{4,})", re.I),
+)
+# 小于此值不当作上下文窗口：避免把 HTTP 状态码（500）、重试秒数（30）这类小数字误认成窗口。
+_CONTEXT_WINDOW_MIN_TOKENS = 1024
+
+
+def _stringify_detail(detail: Any) -> str:
+    """把 dict/list/str 形态的错误体摊平成一段可做正则的文本。"""
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, (dict, list)):
+        try:
+            return json.dumps(detail, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(detail)
+    return str(detail or "")
+
+
+def _explicit_context_window(detail: Any) -> int | None:
+    """读取我们自己塞进错误体里的显式窗口字段（``error.context_window`` / 顶层同名）。
+
+    这是我们构造的错误体（入口预检 / 终端收口）才有的字段，无歧义、优先级最高。
+    """
+    if not isinstance(detail, dict):
+        return None
+    candidates = []
+    error = detail.get("error")
+    if isinstance(error, dict):
+        candidates.append(error.get("context_window"))
+    candidates.append(detail.get("context_window"))
+    for raw in candidates:
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError):
+            continue
+        if value >= _CONTEXT_WINDOW_MIN_TOKENS:
+            return value
+    return None
+
+
+def extract_context_window(detail: Any) -> int | None:
+    """从上游错误文本/detail 里抽取声称的上下文窗口大小（token）；找不到返回 None。
+
+    纯函数、零 IO。优先读显式结构化字段（``error.context_window``，我们自造的错误体
+    才有）；没有时再从文本里用正则抽——识别常见服务商「超出上下文长度」报错里的具体
+    数字（OpenAI/vLLM 的 "maximum context length is N tokens"、Anthropic 的
+    "maximum context length of N"、中文「最大上下文长度 N」等），用于把窗口大小回显。
+    """
+    explicit = _explicit_context_window(detail)
+    if explicit is not None:
+        return explicit
+    text = _stringify_detail(detail)
+    if not text:
+        return None
+    for pattern in _CONTEXT_WINDOW_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        try:
+            value = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if value >= _CONTEXT_WINDOW_MIN_TOKENS:
+            return value
+    return None
+
+
+def with_context_window(message: str, window: int | None) -> str:
+    """把「具体窗口大小」附到超限文案上，**保留**客户端压缩触发锚点。
+
+    Claude Code / OpenAI 系客户端对 error.message 做大小写不敏感的子串匹配（认
+    "prompt is too long" / "context window" 等）才触发自动压缩后重发。因此窗口大小
+    只能**追加**在锚点文案之后，绝不能替换锚点词。窗口未知（None/<=0）时原样返回，
+    绝不硬塞 "unknown"。
+    """
+    try:
+        value = int(window or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return message
+    suffix = f" (context window: {value} tokens)"
+    if suffix in message:
+        return message
+    return f"{message}{suffix}"
+
 
 @dataclass(frozen=True, slots=True)
 class CanonicalError:
     """一条上游超限错误归一后的统一出口字段。
 
     message 由 code 查表得到，固定、跟上游解耦；不再拼上游原文、不再加英文锚点。
+    window 是从上游原文里抽出的窗口大小（可能为 None）；需要回显给客户端时用
+    ``display_message``（在固定锚点文案后追加窗口大小），不要直接改 ``message``。
     """
 
     category: str
@@ -161,6 +284,22 @@ class CanonicalError:
     code: str          # 统一小写 code
     status_code: int    # 统一 400
     message: str       # 固定文案
+    window: int | None = None  # 上游原文里声称的上下文窗口大小（token），未知为 None
+
+    @property
+    def display_message(self) -> str:
+        """面向客户端的文案：固定锚点文案 + 具体窗口大小（若已知）。"""
+        return with_context_window(self.message, self.window)
+
+    @property
+    def is_overflow(self) -> bool:
+        """是否「输入/上下文超限」——客户端应压缩后重发。
+
+        归一表里还收了 thinking_budget_invalid 这类**同样不可重试**但性质不同的参数冲突，
+        所以「命中归一」≠「超限」。需要区分两者的调用点（终端归因、客户端压缩提示）
+        一律走这个属性，不要拿 ``canonicalize_upstream_error() is not None`` 当超限判定。
+        """
+        return self.category in OVERFLOW_CATEGORIES
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,13 +317,14 @@ class _CanonicalRule:
     status_code: int
     message: str
 
-    def result(self) -> CanonicalError:
+    def result(self, window: int | None = None) -> CanonicalError:
         return CanonicalError(
             category=self.category,
             type=self.type,
             code=self.code,
             status_code=self.status_code,
             message=self.message,
+            window=window,
         )
 
 
@@ -194,6 +334,11 @@ class _CanonicalRule:
 #
 # 这批特征是**硬编码**的（不走管理端可配置的 non_retryable_parameter_errors），
 # 是否启用由 config 的 context_overflow_not_retryable_enabled() 开关控制（见 main 出口层）。
+#
+# ⚠️ markers 是「漏判→重试烧光候选→429 retry_exhausted」与「正确判→400 让客户端压缩」
+#    之间唯一的防线：上游把超长请求降级成 500/502、丢 code、或用自己方言文案时，只有
+#    命中 markers 才救得回来。新渠道/新上游报超长而客户端拿到 retry_exhausted 时，
+#    **第一动作是往这里补一条特征**（多词、具体，避免把真 5xx 误判成超长）。
 _ERROR_CANONICAL_RULES: tuple[_CanonicalRule, ...] = (
     _CanonicalRule(
         category="thinking_budget_invalid",
@@ -223,7 +368,7 @@ _ERROR_CANONICAL_RULES: tuple[_CanonicalRule, ...] = (
         type="invalid_request_error",
         code="max_tokens_exceeded",
         status_code=400,
-        message="max_tokens exceeds remaining context window",
+        message="max_tokens exceeds remaining context window. Please lower max_tokens or compact the conversation.",
     ),
     _CanonicalRule(
         category="prompt_too_long",
@@ -251,7 +396,7 @@ _ERROR_CANONICAL_RULES: tuple[_CanonicalRule, ...] = (
         type="invalid_request_error",
         code="input_too_long",
         status_code=400,
-        message="Input tokens exceed the maximum allowed limit",
+        message="Input is too long for requested model: it exceeds the model's context window",
     ),
     _CanonicalRule(
         category="model_context_limit",
@@ -288,11 +433,42 @@ _ERROR_CANONICAL_RULES: tuple[_CanonicalRule, ...] = (
             "reduce the length",
             "request too large",
             "payload too large",
+            # 上游方言：请求体/token 总量超限的各种表述。都要求出现具体名词，
+            # 避免把无关 5xx 误判成超限。
+            "conversation exceeds",          # e.g. "...conversation exceeds the model's context window"
+            "history is too long",           # 常见中转对超长历史的表述
+            "conversation is too long",
+            "messages is too long",
+            "messages too long",
+            "conversation too long",
+            "input length exceeds",
+            "exceeds the maximum token",     # "exceeds the maximum token limit (N tokens)"
+            "exceeds the token limit",
+            "token count exceeds",
+            "exceed the context",
+            "超出上下文",                     # 中文方言（状态码被中继降级、code 丢失时的兜底）
+            "上下文超",
+            "上下文过长",
+            "上下文超限",
+            "上下文长度超过",
+            "超长对话",
+            "对话过长",
+            "对话太长",
+            "历史过长",
+            "历史太长",
+            "输入过长",
+            "内容过长",
+            "内容太长",
+            # ⚠️ 别加「超过模型上下文」「超模型上下文」这类形态：选路 skip_reasons 的中文
+            #    标签就是「预估输入超过模型上下文窗口」，NoAvailableAccountError 的 detail
+            #    带着它——即便主因是冷却/冻结（该按 429 重试），也会被误判成超限 400。
+            #    内部选路错误本来就带显式 code，出口按 isinstance(NoAvailableAccountError)
+            #    分流，不走这张上游文案表。
         ),
         type="invalid_request_error",
         code="context_length_exceeded",
         status_code=400,
-        message="The context length exceeds the model's maximum limit",
+        message="Your input exceeds this model's maximum context window. Please reduce the length of the conversation.",
     ),
 )
 
@@ -332,21 +508,55 @@ def canonicalize_upstream_error(status_code: int | None, detail: Any) -> Canonic
     落回普通可重试分类，交由 classify_failure 切候选。
 
     非超限错误（鉴权/限流/普通参数错/5xx）一律返回 None，交回原透传/配置规则逻辑。
+
+    命中时若上游原文自带上下文窗口大小（如 "maximum context length is 202752 tokens"），
+    会一并抽出放进 ``CanonicalError.window``，供出口把「具体窗口」回显给客户端。
     """
     err_type, code, param, message = parse_error_detail(detail)
     haystack = f"{err_type} {code} {param} {message}"
+    window = extract_context_window(detail)
     if code:
         for rule in _ERROR_CANONICAL_RULES:
             if code in rule.codes:
-                return rule.result()
+                return rule.result(window)
     for rule in _ERROR_CANONICAL_RULES:
         if any(marker in haystack for marker in rule.markers):
-            return rule.result()
+            return rule.result(window)
     if status_code is not None and _is_structured_error_detail(detail):
         for rule in _ERROR_CANONICAL_RULES:
             if status_code in rule.trigger_status_codes:
-                return rule.result()
+                return rule.result(window)
     return None
+
+
+def canonical_overflow_error(status_code: int | None, detail: Any) -> CanonicalError | None:
+    """``canonicalize_upstream_error`` 的超限专用视图：命中且类目确属「输入/上下文超限」才返回。
+
+    归一表还收了 thinking_budget_invalid 这类参数冲突（同样不可重试但不是超限），
+    终端归因、SSE 错误码、压缩提示等需要「真超限」语义的调用点一律走这里。
+    """
+    canonical = canonicalize_upstream_error(status_code, detail)
+    if canonical is not None and canonical.is_overflow:
+        return canonical
+    return None
+
+
+def overflow_code_of(error_code: str | None) -> str | None:
+    """对外业务 code 是否属于超限码（含入口预检/选路归因用的 context_too_large）；是则原样返回。"""
+    normalized = str(error_code or "").strip().lower()
+    return normalized if normalized in _OVERFLOW_CODES else None
+
+
+# 对外 code 口径的超限码集合：canonical 表产出的 code + 入口预检 _validate_context_budget、
+# 选路 skip_reasons（context_window_exceeded→context_too_large）用的 context_too_large。
+_OVERFLOW_CODES: frozenset[str] = frozenset({
+    "prompt_too_long",
+    "input_too_long",
+    "model_context_limit",
+    "context_length_exceeded",
+    "max_tokens_exceeded",
+    "context_too_large",
+})
 
 
 # ── 失败决策 ────────────────────────────────────────────────────
@@ -400,6 +610,19 @@ class FailureInput:
     # 这属于候选渠道响应质量问题，应切换候选；已输出时仍由 downstream_started 优先阻止重试。
     retryable_incomplete_response: bool = False
     extra_retry_status_codes: set[int] = field(default_factory=set)
+    # 调用方判定「本次错误是可识别的上下文/输入超限，且出口会把它归一成 400+固定 code」
+    # （即 canonicalize 命中且 context_overflow_not_retryable_enabled() 开启）。仅当为 True
+    # 时 classify_failure 才允许它绕过 CLIENT_ERROR_STATUS_CODES 白名单——否则出口不会
+    # 归一、会把上游 500/502 原样吐给客户端。纯函数不碰 config，开关状态由调用方注入。
+    overflow_canonical_active: bool = False
+
+
+# 允许原样透传给客户端的状态码白名单。上游/中间网关可能自造任意 4xx
+# （426 Upgrade Required、私有风控码等），这类码对客户端无处理语义，把它当
+# 「客户端错误」透传只会把渠道内部状态泄漏出去；它们必须按普通上游失败处理
+# （重试 → 换候选 → 候选耗尽统一 429）。上下文超限的 413 在白名单内，且实际
+# 透传前会先被 canonicalize 归一成 400 + 固定 code（供 Claude Code 自动压缩重发）。
+CLIENT_ERROR_STATUS_CODES: frozenset[int] = frozenset({400, 401, 403, 404, 409, 413, 422, 429})
 
 
 def classify_failure(inp: FailureInput) -> FailureDecision:
@@ -428,13 +651,20 @@ def classify_failure(inp: FailureInput) -> FailureDecision:
         )
 
     # 3) 只有明确判定为客户端请求本身不可继续（参数错/模型不支持/上下文超限归一）时才透传。
+    #    状态码白名单仍把守，防止上游自造码（426 等）被误判成不可重试后原样吐给客户端；
+    #    但**超限（canonical 命中）除外**：中继常把超长降级成 500/502（状态回退、code 丢失），
+    #    白名单会把这类「请求不可继续」误判成可重试、反复重试后归到 retry_exhausted。
+    #    超限交给出口 _canonical_context_overflow_exception 归一成 400+固定 code，不泄漏 500/502。
     if inp.is_http_exception and inp.status_code is not None:
         non_retryable = inp.non_retryable_override
         if non_retryable is None:
             non_retryable = is_non_retryable_upstream_error(
                 inp.status_code, inp.detail, inp.non_retryable_rules
             )
-        if non_retryable:
+        if non_retryable and (
+            inp.status_code in CLIENT_ERROR_STATUS_CODES
+            or inp.overflow_canonical_active
+        ):
             return FailureDecision(
                 action=FailureAction.RETURN_CLIENT_ERROR,
                 rollback_reservation=True,

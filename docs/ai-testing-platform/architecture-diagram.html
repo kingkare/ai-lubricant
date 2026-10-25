@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="AI 测试平台分层架构图与流程图：业务层 / 能力层 / 数据层 / 技术层 + 用例生成流程 + 执行到报告流程。">
+<title>AI 测试平台 · 分层架构图</title>
+<style>
+:root{
+  --font-sans:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  --font-mono:"JetBrains Mono","Cascadia Code",Consolas,monospace;
+  --bg:#f6f7f9;--bg-card:#fff;--border:#e2e5ea;--border-strong:#cfd5de;
+  --text:#1f2530;--text-muted:#68707d;
+  --accent:#2f6fed;--accent-soft:#e9f0fd;--accent-2:#7a5cf5;
+  --code-bg:#f1f3f7;--code-border:#e2e5ea;
+  --biz:#5b8def;--cap:#7a5cf5;--dat:#1f9d6b;--tec:#64748b;
+  --biz-bg:#eef3fe;--cap-bg:#f1eeff;--dat-bg:#eaf8f1;--tec-bg:#eef1f5;
+  --ok-bg:#eefaf1;--ok-border:#a8dbb2;--ok-text:#166b2e;
+  --warn-bg:#fff7e8;--warn-border:#f0c168;--warn-text:#7a5200;
+  --danger-bg:#fdeeee;--danger-border:#f0a8a8;--danger-text:#8f1d1d;
+  --table-alt:#fafbfc;
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 6px 24px rgba(16,24,40,.06);
+}
+html[data-theme="dark"]{
+  --bg:#0e1218;--bg-card:#161c26;--border:#28303f;--border-strong:#3a4457;
+  --text:#d7dce4;--text-muted:#8b94a4;
+  --accent:#5c8bf5;--accent-soft:#1a2540;--accent-2:#9b82ff;
+  --code-bg:#11161f;--code-border:#28303f;
+  --biz:#6f9bff;--cap:#9b82ff;--dat:#3fc98a;--tec:#94a3b8;
+  --biz-bg:#141d33;--cap-bg:#1a1733;--dat-bg:#12291f;--tec-bg:#1a2029;
+  --ok-bg:#12271a;--ok-border:#2c5c3d;--ok-text:#93d4a5;
+  --warn-bg:#2a2312;--warn-border:#7a5a1c;--warn-text:#e2b86b;
+  --danger-bg:#2a1515;--danger-border:#7a3030;--danger-text:#ef9a9a;
+  --table-alt:#1b222e;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 28px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font-sans);font-size:15px;line-height:1.7}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.86em;background:var(--code-bg);border:1px solid var(--code-border);border-radius:4px;padding:1px 5px}
+.wrap{display:flex;min-height:100vh;max-width:1440px;margin:0 auto}
+
+.sidebar{width:210px;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto;background:#1b2130;color:#c3cad6;padding:22px 0 40px}
+html[data-theme="dark"] .sidebar{background:#0b0f16;border-right:1px solid var(--border)}
+.brand{display:flex;align-items:center;gap:11px;padding:0 20px 18px;font-size:15px;font-weight:700;color:#fff}
+.brand .dot{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;font-weight:800;font-size:14px}
+.sidebar nav a{display:flex;align-items:center;gap:9px;padding:7px 20px;color:#aeb6c4;font-size:13.5px;border-left:3px solid transparent}
+.sidebar nav a:hover{background:#242b3c;color:#fff;text-decoration:none}
+.sidebar nav a.active{background:#242b3c;color:#fff;border-left-color:var(--accent)}
+.main{flex:1;min-width:0}
+.topbar{position:sticky;top:0;z-index:30;display:flex;justify-content:flex-end;gap:10px;padding:10px 26px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(9px);border-bottom:1px solid var(--border)}
+.topbar button{border:1px solid var(--border);background:var(--bg-card);color:var(--text);padding:6px 13px;border-radius:8px;font-size:13px;cursor:pointer;font-family:var(--font-sans)}
+.topbar button:hover{border-color:var(--accent);color:var(--accent)}
+.content{max-width:1180px;margin:0 auto;padding:34px 40px 120px}
+
+h1{font-size:29px;margin:6px 0 4px;letter-spacing:-.5px}
+.page-sub{color:var(--text-muted);margin:0 0 30px;font-size:14px}
+h2{font-size:21px;margin:44px 0 6px;padding-bottom:9px;border-bottom:1px solid var(--border)}
+h2+p.lead{margin-top:10px}
+p{margin:10px 0}
+.lead{color:var(--text-muted);font-size:14px}
+
+/* ===== 分层架构图 ===== */
+.arch{background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:22px;box-shadow:var(--shadow);overflow-x:auto}
+.arch-grid{display:grid;grid-template-columns:minmax(0,1fr) 176px;gap:14px;align-items:stretch}
+.stack{display:flex;flex-direction:column;gap:10px}
+.layer{border:1.5px solid;border-radius:13px;padding:13px 16px 15px;display:flex;gap:14px;align-items:flex-start}
+.layer.biz{border-color:var(--biz);background:var(--biz-bg)}
+.layer.cap{border-color:var(--cap);background:var(--cap-bg)}
+.layer.dat{border-color:var(--dat);background:var(--dat-bg)}
+.layer.tec{border-color:var(--tec);background:var(--tec-bg)}
+.layer-name{flex:0 0 84px;text-align:center;font-weight:800;font-size:15px;padding-top:2px;letter-spacing:.5px;line-height:1.4}
+.layer.biz .layer-name{color:var(--biz)}
+.layer.cap .layer-name{color:var(--cap)}
+.layer.dat .layer-name{color:var(--dat)}
+.layer.tec .layer-name{color:var(--tec)}
+.layer-name small{display:block;font-size:10.5px;font-weight:600;color:var(--text-muted);letter-spacing:0;margin-top:2px;font-family:var(--font-mono)}
+.cells{flex:1;display:flex;flex-wrap:wrap;gap:8px}
+.cell{background:var(--bg-card);border:1px solid var(--border);border-radius:9px;padding:8px 11px;flex:1 1 auto;min-width:118px}
+.cell .cn{display:block;font-size:13.2px;font-weight:700;margin-bottom:2px}
+.cell .cd{font-size:11.5px;color:var(--text-muted);line-height:1.5;font-family:var(--font-mono)}
+.cell.wide{flex:1 1 200px}
+.down{display:flex;justify-content:center;color:var(--text-muted);font-size:13px;line-height:1;margin:-2px 0}
+
+.pillar{border:1.5px solid var(--accent-2);border-radius:13px;background:color-mix(in srgb,var(--accent-soft) 55%,var(--bg-card));padding:13px 12px;display:flex;flex-direction:column}
+.pillar .pn{font-size:13.5px;font-weight:800;color:var(--accent-2);text-align:center;margin-bottom:2px}
+.pillar .ps{font-size:10.5px;color:var(--text-muted);text-align:center;margin-bottom:11px;font-family:var(--font-mono)}
+.pillar .pl{display:flex;flex-direction:column;gap:7px;flex:1}
+.pill{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:6px 9px;font-size:12px;font-weight:600;text-align:center}
+.pill small{display:block;font-size:10.5px;font-weight:400;color:var(--text-muted);font-family:var(--font-mono);margin-top:1px}
+
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin:14px 0 0;font-size:12px;color:var(--text-muted)}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-1px;border:1px solid var(--border-strong)}
+.legend .b1{background:var(--biz-bg);border-color:var(--biz)}
+.legend .b2{background:var(--cap-bg);border-color:var(--cap)}
+.legend .b3{background:var(--dat-bg);border-color:var(--dat)}
+.legend .b4{background:var(--tec-bg);border-color:var(--tec)}
+.legend .b5{background:var(--accent-soft);border-color:var(--accent-2)}
+
+/* ===== 流程图（竖向） ===== */
+.vflow{max-width:760px;margin:20px auto;display:flex;flex-direction:column}
+.vstep{border:1.5px solid var(--accent);border-radius:12px;padding:13px 17px;background:var(--bg-card);box-shadow:var(--shadow)}
+.vstep .vh{display:flex;align-items:center;gap:10px;margin-bottom:4px;flex-wrap:wrap}
+.vstep .vn{font-size:11.5px;font-weight:800;color:#fff;background:var(--accent);border-radius:7px;padding:3px 9px}
+.vstep .vt{font-size:15px;font-weight:700}
+.vstep .vw{font-size:12px;color:var(--accent-2);border:1px solid var(--accent-2);border-radius:20px;padding:1px 10px}
+.vstep .vb{font-size:13px;color:var(--text-muted);margin:4px 0 0}
+.vstep .vb b{color:var(--text);font-weight:600}
+.vstep.gate{border-color:var(--warn-border);background:var(--warn-bg)}
+.vstep.gate .vn{background:var(--warn-text)}
+.vstep.gate .vt{color:var(--warn-text)}
+.vstep.gate .vw{color:var(--warn-text);border-color:var(--warn-border)}
+.vstep.end{border-color:var(--ok-border);background:var(--ok-bg)}
+.vstep.end .vn{background:var(--ok-text)}
+.vstep.end .vt{color:var(--ok-text)}
+.vconn{display:flex;justify-content:center;align-items:center;height:30px;position:relative}
+.vconn::before{content:"";width:2px;height:100%;background:var(--accent);position:absolute;top:0}
+.vconn span{position:relative;z-index:1;background:var(--bg);padding:0 10px;font-size:11.5px;color:var(--text-muted);font-weight:600}
+.vconn span::after{content:"▼";display:block;text-align:center;font-size:9px;color:var(--accent);line-height:1}
+.vcols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:760px){.vcols{grid-template-columns:1fr}}
+
+.table-wrap{overflow-x:auto;margin:14px 0;border:1px solid var(--border);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:13.6px}
+th,td{border-bottom:1px solid var(--border);padding:9px 13px;text-align:left;vertical-align:top}
+th{background:var(--accent-soft);font-weight:600;white-space:nowrap}
+tbody tr:nth-child(even){background:var(--table-alt)}
+tbody tr:last-child td{border-bottom:none}
+.note{border-radius:10px;padding:12px 16px;margin:16px 0 0;border:1px solid var(--border);background:var(--bg-card);font-size:13.5px;color:var(--text-muted)}
+.note b{color:var(--text)}
+footer{margin-top:48px;padding-top:22px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}
+@media (max-width:980px){.arch-grid{grid-template-columns:1fr}.pillar{order:5}}
+@media (max-width:920px){.sidebar{display:none}.content{padding:24px 18px 90px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<aside class="sidebar">
+  <div class="brand"><span class="dot">T</span> AI 测试平台</div>
+  <nav style="margin-top:8px">
+    <a href="#arch">分层架构</a>
+    <a href="#gen">流程图 · 用例生成</a>
+    <a href="#exec">流程图 · 执行到报告</a>
+    <a href="#gates">三道停顿点</a>
+  </nav>
+</aside>
+
+<main class="main">
+<div class="topbar">
+  <button id="theme-toggle" type="button">☾ 深色</button>
+  <button id="print-page" type="button">⎙ 打印</button>
+</div>
+
+<article class="content">
+
+<h1>AI 测试平台 分层架构图</h1>
+<p class="page-sub">平台整体分层架构见 <a href="../architecture-platform.html">Ai Lubricant 架构图</a>；本页是测试域的分层，外加两张流程图。</p>
+
+<!-- ===================== 分层架构 ===================== -->
+<h2 id="arch">分层架构</h2>
+<p class="lead">测试是本服务内的一个能力域，与 GA 无关、不借用其概念；域逻辑独立，共用平台的存储、通知、附件、调度等基础设施。</p>
+
+<div class="arch">
+  <div class="arch-grid">
+    <div class="stack">
+
+      <!-- 业务层 -->
+      <div class="layer biz">
+        <div class="layer-name">业务层<small>用户可见</small></div>
+        <div class="cells">
+          <div class="cell"><span class="cn">需求管理</span><span class="cd">五条入口 · 分析 · 需求评审</span></div>
+          <div class="cell"><span class="cn">测试点与用例</span><span class="cd">提点 · 覆盖补全 · 用例生成 · 评审 · 确认</span></div>
+          <div class="cell"><span class="cn">场景与脚本</span><span class="cd">场景化 · 探索门 · 方法脚本</span></div>
+          <div class="cell"><span class="cn">测试策略</span><span class="cd">一轮测试 · 勾选用例 · 分配人员</span></div>
+          <div class="cell"><span class="cn">版本管理</span><span class="cd">版本状态机 · 血缘 · 用例继承 · 多端兼容</span></div>
+          <div class="cell"><span class="cn">执行与结果</span><span class="cd">波次 · 隔离区 · 四态</span></div>
+          <div class="cell"><span class="cn">缺陷管理</span><span class="cd">分流 · 提单 · 根因 · 活动流 · 周期报表</span></div>
+          <div class="cell"><span class="cn">报告与复盘</span><span class="cd">上线判定 · 四受众视图 · 复盘</span></div>
+          <div class="cell"><span class="cn">知识图谱视图</span><span class="cd">需求→测试点→用例 树 · 力导向图 · 可靠性仪表</span></div>
+        </div>
+      </div>
+
+      <div class="down">▼ 调用</div>
+
+      <!-- 能力层 -->
+      <div class="layer cap">
+        <div class="layer-name">能力层<small>平台能力</small></div>
+        <div class="cells">
+          <div class="cell"><span class="cn">能力面（唯一出口）</span><span class="cd">工具方法 · MCP · 接口契约 · AI 工作流</span></div>
+          <div class="cell"><span class="cn">生成编排</span><span class="cd">生成任务状态机 · 三层调度 · 三道闸 · 暂存区</span></div>
+          <div class="cell"><span class="cn">测试执行引擎</span><span class="cd">步骤分发 · 断言 · 变量五作用域 · 三模执行</span></div>
+          <div class="cell"><span class="cn">知识引擎</span><span class="cd">知识源适配 · 抽取 · 图谱 · 测试画像</span></div>
+          <div class="cell"><span class="cn">校验器与门禁</span><span class="cd">八道门禁 · 沉淀四件套（约定/模板/样例/校验器）</span></div>
+          <div class="cell"><span class="cn">疑问与变更</span><span class="cd">疑问一等公民 · 变更传导 · 溯源</span></div>
+          <div class="cell"><span class="cn">缺陷域</span><span class="cd">七态状态机 · 七动作守卫 · 根因分析</span></div>
+          <div class="cell"><span class="cn">策略与版本域</span><span class="cd">轮次分配 · 版本 FSM · 回归影响面</span></div>
+          <div class="cell wide"><span class="cn">复用平台能力</span><span class="cd">浏览器通道 · 设备控制 · node-ios · 定时调度 · 通知 · 附件证据 · Git 客户端 · 审计</span></div>
+        </div>
+      </div>
+
+      <div class="down">▼ 读写</div>
+
+      <!-- 数据层 -->
+      <div class="layer dat">
+        <div class="layer-name">数据层<small>存储</small></div>
+        <div class="cells">
+          <div class="cell"><span class="cn">测试域表</span><span class="cd">用例 · 场景/步骤 · 传输 · 数据集 · 环境/变量 · 方法 · 自定义工具 · 策略 · 运行/结果/证据 · 缺陷/根因 · 报告 · 疑问 · 变更 · 生成任务/测试点/暂存/覆盖/规则</span></div>
+          <div class="cell"><span class="cn">公共知识表</span><span class="cd">知识源 · 条目 · 锚点 · 边 · 原始层 · 测试画像</span></div>
+          <div class="cell"><span class="cn">PostgreSQL</span><span class="cd">表前缀 mc_test_* / mc_knowledge_* · Tortoise · UUID 主键</span></div>
+          <div class="cell"><span class="cn">文件目录</span><span class="cd">证据附件 · 资源镜像</span></div>
+        </div>
+      </div>
+
+      <div class="down">▼ 运行于</div>
+
+      <!-- 技术层 -->
+      <div class="layer tec">
+        <div class="layer-name">技术层<small>技术栈</small></div>
+        <div class="cells">
+          <div class="cell"><span class="cn">Python 3.11 · FastAPI</span><span class="cd">全异步 · 同一进程随主服务运行</span></div>
+          <div class="cell"><span class="cn">Tortoise ORM</span><span class="cd">建表入口 = user_platform/database</span></div>
+          <div class="cell"><span class="cn">前端</span><span class="cd">React + TS · 思维导图 · 力导向图 · 表格/弹框/树选</span></div>
+          <div class="cell"><span class="cn">协议</span><span class="cd">MCP（Streamable HTTP）· SSE · OpenAI 兼容</span></div>
+          <div class="cell"><span class="cn">方法基底</span><span class="cd">《18 个 Skills》原文</span></div>
+          <div class="cell"><span class="cn">建库工具</span><span class="cd">Graphify 同进程直调 · 自建 tree-sitter 薄层</span></div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 右侧贯穿 -->
+    <div class="pillar">
+      <div class="pn">质量治理</div>
+      <div class="ps">贯穿全层</div>
+      <div class="pl">
+        <div class="pill">AI 不裁判<small>框架裁判</small></div>
+        <div class="pill">产物先暂存<small>人确认后入库</small></div>
+        <div class="pill">八道门禁<small>机器判定</small></div>
+        <div class="pill">三道停顿点<small>门⓪①②</small></div>
+        <div class="pill">稳定 ID + 状态机<small>版本 + 溯源</small></div>
+        <div class="pill">变更必有因<small>可回滚</small></div>
+        <div class="pill">疑问不靠猜<small>阻塞下游</small></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="legend">
+    <span><i class="b1"></i>业务层</span>
+    <span><i class="b2"></i>能力层</span>
+    <span><i class="b3"></i>数据层</span>
+    <span><i class="b4"></i>技术层</span>
+    <span><i class="b5"></i>质量治理（贯穿）</span>
+  </div>
+</div>
+
+<!-- ===================== 流程图 1 ===================== -->
+<h2 id="gen">流程图 · 用例生成</h2>
+<p class="lead">从需求文档到用例进库。AI 产物先落暂存区，人确认了才进正式表——三道需要人拍板的停顿点用黄色标出。</p>
+
+<div class="vflow">
+
+  <div class="vstep">
+    <div class="vh"><span class="vn">环节 0</span><span class="vt">需求入口</span><span class="vw">人 + 可选 AI</span></div>
+    <p class="vb">五条入口：浏览器连着打开的文档（飞书 / Confluence）、本地文档、URL、文件上传、手工录入。原始内容先存下来，再建需求记录。</p>
+  </div>
+  <div class="vconn"><span>落原始层 → 建需求</span></div>
+
+  <div class="vstep">
+    <div class="vh"><span class="vn">环节 1</span><span class="vt">需求分析</span><span class="vw">AI 思考</span></div>
+    <p class="vb">每条需求一个会话、并行：看缺什么、有没有说不清、能不能写成条件和预期，产出结构化分析和一份问题清单。写得太含糊的过不了四条标准，停在「分析未过」。</p>
+  </div>
+  <div class="vconn"><span>四条标准不合格不放行</span></div>
+
+  <div class="vstep gate">
+    <div class="vh"><span class="vn">门⓪</span><span class="vt">需求评审</span><span class="vw">人拍板</span></div>
+    <p class="vb">AI 先评需求文档本身好不好，逐条给证据和建议；然后一次只问一个问题、每个问题带推荐答案，最多问 10-15 个。问到没预算了就自动按推荐答案往下走，人可以再改回来。人确认需求过关才继续。</p>
+  </div>
+  <div class="vconn"><span>需求过关</span></div>
+
+  <div class="vstep">
+    <div class="vh"><span class="vn">环节 3</span><span class="vt">测试点提取 + 分派</span><span class="vw">AI 分工</span></div>
+    <p class="vb">先按影响和概率给方向定权重，再每个方向派一个 AI 并行提测试点；接口方向机械铺一遍，另一个供应商的模型查漏。每个测试点带上：五个字段、覆盖轴、设计方法、批次、依据（事实 / 推断 / 待确认三色）。</p>
+  </div>
+  <div class="vconn"><span>定每个点测哪些端</span></div>
+
+  <div class="vstep">
+    <div class="vh"><span class="vn">环节 4</span><span class="vt">覆盖补全</span><span class="vw">主要是代码</span></div>
+    <p class="vb">铺一张「覆盖轴 × 端」的表，查漏查重：空格子补测试点，不适用的必须写清依据。</p>
+  </div>
+  <div class="vconn"><span>热力图亮 / 灰 / 斜纹</span></div>
+
+  <div class="vstep gate">
+    <div class="vh"><span class="vn">门①</span><span class="vt">需求确认</span><span class="vw">人拍板</span></div>
+    <p class="vb">人看着测试点和覆盖图：答问题、点改端归属、勾选「确认入选」或「打回」。这个需求下的点全确认了，才进用例生成——不等别的需求。</p>
+  </div>
+  <div class="vconn"><span>确认过的测试点</span></div>
+
+  <div class="vstep">
+    <div class="vh"><span class="vn">环节 5</span><span class="vt">用例细化</span><span class="vw">AI 写</span></div>
+    <p class="vb">按「测试点 × 端」派活（只给路径不给正文）：六种设计策略显式过一遍 → 先写行为 → 再单独设计断言 → 每个功能点 1 条正向 + 至少 3 条异常/边界 → 数据按五个作用域归位 → 查重。产物只写进暂存区。</p>
+  </div>
+  <div class="vconn"><span>先进暂存区，不碰正式表</span></div>
+
+  <div class="vstep">
+    <div class="vh"><span class="vn">环节 6</span><span class="vt">评审</span><span class="vw">代码 + 两个 AI 互评</span></div>
+    <p class="vb">三道闸：① 代码查硬伤（证据够不够、有没有编造的接口/选择器、断言是不是只有 200、硬编码、配比、规则回执）；② 两个不同供应商的 AI 各看一半、互不见面，必须意见一致；③ 五维打分，不及格打回重写，重写版本不许比上一版断言更少。</p>
+  </div>
+  <div class="vconn"><span>分歧不自动裁决，带两份意见交给人</span></div>
+
+  <div class="vstep gate">
+    <div class="vh"><span class="vn">门②</span><span class="vt">用例确认</span><span class="vw">人拍板</span></div>
+    <p class="vb">按「测试点 × 端」分组看：组头显示五维分和双评意见，四种判断——保留 / 就地改 / 打回（必须选原因）/ 先挂起（关联一个问题）。确认了才进正式表；有问题打回的，之后修好了可以重开一轮只重跑它。</p>
+  </div>
+  <div class="vconn"><span>进正式表</span></div>
+
+  <div class="vstep end">
+    <div class="vh"><span class="vn">环节 7</span><span class="vt">场景化</span></div>
+    <p class="vb">用例说的是「测什么」，场景是「怎么跑」。接口的参数/格式类直接机械翻译成步骤；字段规则、接口逻辑、网页和 App 的场景必须真跑一遍探索，用真实轨迹替换推测的步骤，然后把改动包拿给人签。</p>
+  </div>
+
+  <div class="vstep" style="border-style:dashed;margin-top:14px">
+    <div class="vh"><span class="vn">回流</span><span class="vt">越用越准</span></div>
+    <p class="vb">打回原因、缺陷结案、返工教训都存进问题库；评审通过且分高的用例打上黄金标记，下一轮同模块生成时优先拿来当范例。</p>
+  </div>
+
+</div>
+
+<!-- ===================== 流程图 2 ===================== -->
+<h2 id="exec">流程图 · 执行到报告</h2>
+<p class="lead">从场景化好的用例跑到最终报告。失败先分类，不是所有失败都算数。</p>
+
+<div class="vflow">
+
+  <div class="vstep">
+    <div class="vh"><span class="vn">环节 8</span><span class="vt">执行</span><span class="vw">确定性引擎</span></div>
+    <p class="vb">跑之前 SQL 语句先过红线闸（没有 WHERE 的更新删除、查敏感字段、大表没加 LIMIT → 直接拒绝）。按冒烟/重点/扩展分波次跑，抖动的先隔离掉，互不相关的才并行。</p>
+  </div>
+  <div class="vconn"><span>每条结果归到四种状态之一</span></div>
+
+  <div class="vcols">
+    <div class="vstep end">
+      <div class="vh"><span class="vn">过</span><span class="vt">通过</span></div>
+      <p class="vb">接着往下走。</p>
+    </div>
+    <div class="vstep" style="border-color:var(--danger-border);background:var(--danger-bg)">
+      <div class="vh"><span class="vn" style="background:var(--danger-text)">挂</span><span class="vt" style="color:var(--danger-text)">判定是产品缺陷</span></div>
+      <p class="vb">进缺陷环节。</p>
+    </div>
+    <div class="vstep gate">
+      <div class="vh"><span class="vn">判不了</span><span class="vt">环境抖动 / 脚本问题</span></div>
+      <p class="vb">不算失败率、不产 bug：环境的回隔离区重测，脚本的回场景化重写。</p>
+    </div>
+    <div class="vstep">
+      <div class="vh"><span class="vn">没裁</span><span class="vt">用例过期 / 被跳过</span></div>
+      <p class="vb">用例过期的回门②打回重做；跳过的不算失败率的分母。</p>
+    </div>
+  </div>
+
+  <div class="vconn"><span>「挂」的进缺陷</span></div>
+
+  <div class="vstep">
+    <div class="vh"><span class="vn">环节 9</span><span class="vt">缺陷</span><span class="vw">代码分流 + AI 分析</span></div>
+    <p class="vb">建单前先查是不是同一个原因（像就提示合并）→ 规范化六段单，复现步骤从用例继承 → AI 定级和人工改级的一致率记账 → 八步分析（现象、影响模块、翻日志、推荐 SQL、关联历史缺陷、回归范围、风险、复核点；没日志不许下根因结论）→ 沿 trace 定位到代码行 → 修复验证七点。</p>
+  </div>
+  <div class="vconn"><span>修完验证</span></div>
+
+  <div class="vstep end">
+    <div class="vh"><span class="vn">环节 10</span><span class="vt">回归 + 上线判定 + 报告</span></div>
+    <p class="vb">按这次改了哪些代码算出必须测 / 建议测 / 抽测三级清单 → 跑回归。上线要看两个条件同时满足才放行（共识是「上」且置信度达到 0.9），不够就拦下并给出理由；回滚触发条件提前声明好。报告结论必须有执行数据支撑，分四种受众展示。</p>
+  </div>
+
+  <div class="vstep" style="border-style:dashed;margin-top:14px">
+    <div class="vh"><span class="vn">回流</span><span class="vt">下一轮更准</span></div>
+    <p class="vb">优质脚本进范例库、缺陷模式进模式库、覆盖事实更新测试画像，回流到需求环节。</p>
+  </div>
+
+</div>
+
+<!-- ===================== 三道停顿点 ===================== -->
+<h2 id="gates">三道停顿点</h2>
+<div class="table-wrap"><table>
+<thead><tr><th style="width:120px">停在哪</th><th style="width:150px">什么时候</th><th>人干什么</th></tr></thead>
+<tbody>
+<tr><td><b>门⓪ 需求评审</b></td><td>分析完、提测试点之前</td><td>看 AI 给的需求质量报告，确认需求过关</td></tr>
+<tr><td><b>门① 需求确认</b></td><td>测试点和覆盖图出来后</td><td>答问题、改端归属、勾选确认入选</td></tr>
+<tr><td><b>门② 用例确认</b></td><td>用例评审打分完</td><td>保留 / 就地改 / 打回 / 先挂起</td></tr>
+</tbody></table></div>
+
+<footer>
+  事实源：<code>docs/ai-testing-platform/design.md</code> · <code>plans/25</code> · <code>plans/19/20/22/23</code>。<br>
+  平台整体分层架构见 <a href="../architecture-platform.html">Ai Lubricant 架构图</a>。
+</footer>
+
+</article>
+</main>
+</div>
+
+<script>
+(function(){
+  var root=document.documentElement;
+  var t=document.getElementById('theme-toggle');
+  var saved=null;try{saved=localStorage.getItem('tp-arch-theme')}catch(e){}
+  if(saved){root.setAttribute('data-theme',saved);}
+  else if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches){root.setAttribute('data-theme','dark');}
+  function sync(){t.textContent=root.getAttribute('data-theme')==='dark'?'☀ 浅色':'☾ 深色';}
+  sync();
+  t.addEventListener('click',function(){
+    var next=root.getAttribute('data-theme')==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('tp-arch-theme',next);}catch(e){}
+    sync();
+  });
+  document.getElementById('print-page').addEventListener('click',function(){window.print()});
+  var links=[].slice.call(document.querySelectorAll('.sidebar nav a'));
+  var targets=links.map(function(a){return document.querySelector(a.getAttribute('href'))}).filter(Boolean);
+  function onScroll(){
+    var y=window.scrollY+140,cur=null;
+    targets.forEach(function(el){if(el.offsetTop<=y)cur=el;});
+    links.forEach(function(a){a.classList.toggle('active',cur&&a.getAttribute('href')=='#'+cur.id);});
+  }
+  window.addEventListener('scroll',onScroll,{passive:true});
+  onScroll();
+})();
+</script>
+</body>
+</html>

@@ -348,6 +348,233 @@ class WithoutLoopback:
     assert not hasattr(cls2, "handle_loopback_callback") or "handle_loopback_callback" not in vars(cls2)
 
 
+# ---- 步骤认证（step auth）----
+
+def test_step_auth_hooks_surface_as_instance_methods():
+    """声明 begin_step_auth + submit_step_auth -> 适配器暴露实例方法，形态符合 admin 契约。"""
+    src = """
+class StepFlow:
+    @staticmethod
+    async def init_auth(p, is_check=False): return True
+    @staticmethod
+    async def begin_step_auth(p):
+        return {
+            "task_type": "steps",
+            "step": {"id": "phone", "title": "输入手机号",
+                     "fields": [{"key": "phone", "label": "手机号", "type": "tel"}]},
+            "step_state": {"sent": False},
+            "expires_in": 600,
+        }
+    @staticmethod
+    async def submit_step_auth(p, step_id, values, step_state):
+        if step_id == "phone":
+            return {"status": "next",
+                    "step": {"id": "code", "fields": [{"key": "code", "label": "验证码"}]},
+                    "step_state": {"phone": values.get("phone")}}
+        return {"status": "authorized", "account_data": {"username": "u1", "access_token": "tok"}}
+"""
+    ns: dict = {}
+    exec(src, ns)
+    cls = build_adapter_class("step", ns["StepFlow"])
+    assert hasattr(cls, "begin_step_auth") and hasattr(cls, "submit_step_auth")
+    p = cls(username="u", password="")
+    started = _run(p.begin_step_auth())
+    assert started["task_type"] == "steps"
+    assert started["step"]["id"] == "phone"
+    nxt = _run(p.submit_step_auth("phone", {"phone": "13800000000"}, started["step_state"]))
+    assert nxt["status"] == "next"
+    assert nxt["step"]["id"] == "code"
+    done = _run(p.submit_step_auth("code", {"code": "123456"}, nxt["step_state"]))
+    assert done["status"] == "authorized"
+    assert done["account_data"]["access_token"] == "tok"
+
+
+def test_no_step_auth_hook_not_present_on_adapter():
+    """未声明 begin_step_auth -> 适配器不暴露该方法（admin getattr 探测走 501 回落）。"""
+    src = """
+class NoStep:
+    @staticmethod
+    async def init_auth(p): return True
+"""
+    ns: dict = {}
+    exec(src, ns)
+    cls = build_adapter_class("no-step", ns["NoStep"])
+    assert "begin_step_auth" not in vars(cls)
+    assert "submit_step_auth" not in vars(cls)
+
+
+def test_step_auth_hooks_receive_auth_context_when_signature_allows():
+    """begin_step_auth / submit_step_auth 声明了 auth_context 尾参就收到框架上下文。"""
+    src = """
+class StepCtx:
+    @staticmethod
+    async def init_auth(p): return True
+    @staticmethod
+    async def begin_step_auth(p, auth_context=None):
+        return {"task_type": "steps", "step": {"id": "s1"},
+                "seen_origin": (auth_context or {}).get("origin", "")}
+    @staticmethod
+    async def submit_step_auth(p, step_id, values, step_state, action=None, auth_context=None):
+        return {"status": "authorized", "account_data": {"origin": (auth_context or {}).get("origin", "")},
+                "seen_action": action}
+"""
+    ns: dict = {}
+    exec(src, ns)
+    cls = build_adapter_class("step-ctx", ns["StepCtx"])
+    p = cls(username="u", password="")
+    ctx = {"origin": "https://panel.example.com"}
+    started = _run(p.begin_step_auth(ctx))
+    assert started["seen_origin"] == "https://panel.example.com"
+    done = _run(p.submit_step_auth("s1", {}, {}, "resend", ctx))
+    assert done["account_data"]["origin"] == "https://panel.example.com"
+    assert done["seen_action"] == "resend"
+
+
+def test_step_auth_action_optional_signature():
+    """老写法（不声明 action 参数）不受影响——框架按签名决定是否传 action。"""
+    src = """
+class StepNoAction:
+    @staticmethod
+    async def init_auth(p): return True
+    @staticmethod
+    async def begin_step_auth(p):
+        return {"task_type": "steps", "step": {"id": "s1"}}
+    @staticmethod
+    async def submit_step_auth(p, step_id, values, step_state):
+        return {"status": "authorized", "account_data": {"username": "u"}}
+"""
+    ns: dict = {}
+    exec(src, ns)
+    cls = build_adapter_class("step-no-action", ns["StepNoAction"])
+    p = cls(username="u", password="")
+    _run(p.begin_step_auth())
+    # 即使传了 action，签名容不下就不传，钩子照常跑
+    done = _run(p.submit_step_auth("s1", {}, {}, "resend"))
+    assert done["status"] == "authorized"
+
+
+# ---- 账号动作（perform_action） ----
+
+def test_perform_action_hook_presence_triggered():
+    """声明 perform_action 才注入适配器；未声明的渠道 admin 报「未声明动作」。"""
+    src_with = """
+class WithActions:
+    @staticmethod
+    async def init_auth(p, is_check=False): return True
+    @staticmethod
+    async def perform_action(p, action_id, account, cfg=None):
+        if action_id == "checkin":
+            return {"last_checkin": "已签到"}
+        if action_id == "boom":
+            return {"_error": "签到失败", "last_checkin": "签到失败"}
+        raise ValueError("未知动作 " + action_id)
+"""
+    ns: dict = {}
+    exec(src_with, ns)
+    cls = build_adapter_class("with-actions", ns["WithActions"])
+    assert "perform_account_action" in vars(cls)
+    p = cls(username="u", password="")
+    assert _run(p.perform_account_action("checkin", {"username": "u"}, None)) == {"last_checkin": "已签到"}
+    out = _run(p.perform_account_action("boom", {}, None))
+    assert out["_error"] == "签到失败"
+    with pytest.raises(ValueError):
+        _run(p.perform_account_action("nope", {}, None))
+
+    src_without = """
+class WithoutActions:
+    @staticmethod
+    async def init_auth(p, is_check=False): return True
+"""
+    ns2: dict = {}
+    exec(src_without, ns2)
+    cls2 = build_adapter_class("without-actions", ns2["WithoutActions"])
+    assert "perform_account_action" not in vars(cls2)
+
+
+def test_checkin_condition_hook_presence_triggered():
+    """声明 checkin_condition 才注入适配器；未声明的渠道框架无条件门（直接执行）。"""
+    src_with = """
+class WithGate:
+    @staticmethod
+    async def init_auth(p, is_check=False): return True
+    @staticmethod
+    async def perform_action(p, action_id, account, cfg=None):
+        return {"_checkin_status": "ok", "_checkin_detail": "+80"}
+    @staticmethod
+    async def checkin_condition(p, action_id, account, cfg=None):
+        return {"ok": False, "reason": "今日已签到"}
+"""
+    ns: dict = {}
+    exec(src_with, ns)
+    cls = build_adapter_class("with-gate", ns["WithGate"])
+    assert "checkin_condition" in vars(cls)
+    p = cls(username="u", password="")
+    gate = _run(p.checkin_condition("checkin", {"username": "u"}, None))
+    assert gate == {"ok": False, "reason": "今日已签到"}
+
+    src_without = """
+class WithoutGate:
+    @staticmethod
+    async def init_auth(p, is_check=False): return True
+    @staticmethod
+    async def perform_action(p, action_id, account, cfg=None):
+        return {"_checkin_status": "ok"}
+"""
+    ns2: dict = {}
+    exec(src_without, ns2)
+    cls2 = build_adapter_class("without-gate", ns2["WithoutGate"])
+    assert "checkin_condition" not in vars(cls2)
+
+
+def test_parse_credential_file_hook_presence_triggered():
+    """声明 parse_credential_file 才注入适配器；未声明 admin 走通用解析器。"""
+    src_with = """
+class WithImporter:
+    @staticmethod
+    async def init_auth(p, is_check=False): return True
+    @staticmethod
+    async def parse_credential_file(p, filename, content_bytes):
+        return {"fields": {"password": content_bytes.decode()},
+                "extras": {}, "notes": ["自定义解析 " + filename]}
+"""
+    ns: dict = {}
+    exec(src_with, ns)
+    cls = build_adapter_class("with-import", ns["WithImporter"])
+    assert "parse_credential_file" in vars(cls)
+    p = cls(username="u", password="")
+    parsed = _run(p.parse_credential_file("cred.json", b"sk-abc"))
+    assert parsed["fields"]["password"] == "sk-abc"
+    assert parsed["notes"] == ["自定义解析 cred.json"]
+
+    src_without = """
+class WithoutImporter:
+    @staticmethod
+    async def init_auth(p, is_check=False): return True
+"""
+    ns2: dict = {}
+    exec(src_without, ns2)
+    cls2 = build_adapter_class("without-import", ns2["WithoutImporter"])
+    assert "parse_credential_file" not in vars(cls2)
+
+
+def test_parse_credential_file_optional_cfg_arg():
+    """声明 cfg 尾参就收到渠道配置；不声明也能跑（框架按签名传参）。"""
+    src = """
+class ImporterWithCfg:
+    @staticmethod
+    async def init_auth(p): return True
+    @staticmethod
+    async def parse_credential_file(p, filename, content_bytes, cfg=None):
+        return {"fields": {}, "extras": {}, "notes": [str((cfg or {}).get("marker", ""))]}
+"""
+    ns: dict = {}
+    exec(src, ns)
+    cls = build_adapter_class("import-cfg", ns["ImporterWithCfg"])
+    p = cls(username="u", password="")
+    parsed = _run(p.parse_credential_file("f.json", b"{}", {"marker": "M"}))
+    assert parsed["notes"] == ["M"]
+
+
 # ---- 类级开关 ----
 
 def test_class_flags_copied_to_adapter():
@@ -435,7 +662,8 @@ def test_hook_aliases_documented():
         "headers", "build_url", "base_url", "payload", "parse_chunk",
         "account_schema", "build_auth_start", "handle_auth_callback",
         "begin_device_flow", "poll_device_flow", "handle_loopback_callback",
-        "refresh_auth",
+        "begin_step_auth", "submit_step_auth", "parse_credential_file",
+        "refresh_auth", "perform_action",
         "on_response_headers", "update_quota", "check_message",
         "on_channel_attached", "clear_conversations", "close",
     ):

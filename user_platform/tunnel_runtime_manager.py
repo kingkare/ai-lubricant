@@ -133,6 +133,14 @@ def _compat_conn():
 
 
 def is_grouped(scheme: TunnelScheme) -> bool:
+    """Is one client process shared by all bindings of a (target × scheme)?
+
+    * frpc / cloudflared managed — grouped: one config file lists every member.
+    * cloudflared quick / npc / **chmlfrp** — per-binding: each binding owns its
+      own client. chmlfrp is per-binding because each binding creates its own
+      panel tunnel (own name + relay node) and the panel hands back a complete
+      frpc ini per tunnel; merging several into one process is not meaningful.
+    """
     if scheme.kind == "frpc":
         return True
     return scheme.kind == "cloudflared" and (scheme.config or {}).get("mode") == "managed"
@@ -249,14 +257,21 @@ async def reconcile_runtime(
 def _permanent_provisioning_error(error: str | None) -> bool:
     """Was this a provisioning failure retrying cannot fix?
 
-    Matches only Cloudflare-API-shaped errors (auth/permission/not-found/
-    hostname-occupied-by-user). Client-runtime stderr failures ("connection
-    refused" etc. from cloudflared/frpc itself) deliberately do NOT match —
-    those may recover on their own and keep the existing retry behavior.
+    Matches Cloudflare-API-shaped errors (auth/permission/not-found/
+    hostname-occupied-by-user) AND ChmlFrp panel tunnel-creation failures
+    (port out of range / name exists / panel rejected). A failed panel create
+    must NOT be retried on every 45s tick — it would hammer the panel with the
+    same bad request (risking rate-limit/lockout) while the binding sits in a
+    red "失败" the user can see and fix (change port/name, then click 重试).
+    Client-runtime stderr failures ("connection refused" etc. from frpc itself)
+    deliberately do NOT match — those may recover on their own.
     """
     if not error:
         return False
-    markers = ("HTTP 401", "HTTP 403", "HTTP 404", "occupied by a user-created")
+    markers = (
+        "HTTP 401", "HTTP 403", "HTTP 404", "occupied by a user-created",
+        "ChmlFrp 创建隧道失败", "不在节点", "可用范围",  # chmlfrp panel rejections
+    )
     return any(marker in str(error) for marker in markers)
 
 
@@ -586,16 +601,30 @@ def _local_runtime_live(runtime: TunnelRuntime, scheme: TunnelScheme) -> bool:
 
 
 def _readiness(kind: str, text: str) -> str | None:
+    """Classify one line of client output: "ready", "failed", or None (neither).
+
+    frpc prints ``login to server success`` the moment it authenticates to
+    frps — *before* any proxy is registered — so that line alone is NOT proof
+    the tunnel works. Only a proxy-level marker (``start proxy success`` /
+    ``proxy added``) means the exposed port is actually live. Treating the
+    login ack as ready was the "shows 连接成功 while the proxy never came up"
+    bug: a rejected proxy (port conflict, server error) left the binding green.
+    """
     lower = text.lower()
     failures = (
-        "authentication failed", "login failed", "connection refused",
-        "permission denied", "invalid token", "failed to connect",
+        # frpc/frps real failure lines (login rejected, proxy refused, dial fail).
+        "login to server failed", "start proxy error", "start error",
+        "connect to server error", "dial tcp", "i/o timeout",
+        "no route to host", "connection refused", "port already used",
+        "already exists", "address already in use", "authentication failed",
+        "login failed", "permission denied", "invalid token", "failed to connect",
     )
     if any(marker in lower for marker in failures):
         return "failed"
-    if kind == "frpc" and (
-        "login to server success" in lower
-        or "start proxy success" in lower
+    if kind in ("frpc", "chmlfrp") and (
+        # Proxy-level success only. ``login to server success`` is deliberately
+        # NOT here: it is a login ack, not proof the proxy is registered.
+        "start proxy success" in lower
         or "proxy added" in lower
     ):
         return "ready"

@@ -180,8 +180,8 @@ async def test_claude_delegate_passes_review_capabilities(db, monkeypatch):
     assert acquire_calls == [["node-1"]]
     # No editor-derived child key is planted; task_service owns the LLM config.
     assert "_session_llm" not in req
-    # A review holds its own slot lease, so it must NOT take the exclusive
-    # TaskNodeBinding — otherwise unique(node_id) caps a node at one review.
+    # A review holds its own slot lease, so it must NOT take an exclusive
+    # node binding — otherwise it would cap a node at one review.
     assert req["_review_lease_id"]
 
 

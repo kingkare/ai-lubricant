@@ -193,6 +193,11 @@ async def list_my_services(authorization: str | None = Header(None)) -> list[dic
 
 @router.post("/my-services")
 async def create_my_service(payload: CreateMyMcpServiceRequest, authorization: str | None = Header(None)) -> dict:
+    """创建个人外部 MCP（kind=sse, user_id=自己）。
+
+    token 组装为 Authorization: Bearer 存入 headers，敏感头不随响应回显；建好后
+    立刻试拉一次工具缓存（失败不阻断创建）。名称冲突返回 409。
+    """
     user_id = await _async_user_id()
     if not user_id:
         raise HTTPException(401, "未登录")
@@ -230,6 +235,12 @@ async def update_my_service(
     payload: UpdateMyMcpServiceRequest,
     authorization: str | None = Header(None),
 ) -> dict:
+    """更新个人外部 MCP（PATCH）。
+
+    token 字段缺省时不改、空串清除 Bearer；headers 为脱敏视图回填，敏感头沿用旧值
+    以免遮蔽串覆盖真实凭据。仅 owner 可改（否则 404）。token/headers/url/enabled
+    变更会触发工具再发现。
+    """
     user_id = await _async_user_id()
     if not user_id:
         raise HTTPException(401, "未登录")
@@ -265,6 +276,10 @@ async def update_my_service(
 
 @router.delete("/my-services/{service_id}")
 async def delete_my_service(service_id: int, authorization: str | None = Header(None)) -> dict:
+    """删除个人外部 MCP：先从 runtime 卸载再删表，避免 registry 留死引用。
+
+    仅 owner 可删；非 owner 与不存在都返回 404（不泄露他人服务存在性）。
+    """
     user_id = await _async_user_id()
     if not user_id:
         raise HTTPException(401, "未登录")

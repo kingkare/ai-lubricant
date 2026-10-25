@@ -1441,9 +1441,19 @@ def test_runtime_key_keeps_npc_per_binding_until_verified():
 def test_readiness_parser():
     import user_platform.tunnel_runtime_manager as rm
 
-    assert rm._readiness("frpc", "login to server success") == "ready"
+    # Login ack alone is NOT ready — frpc logs it before proxies register; only
+    # a proxy-level marker proves the tunnel is actually up (the "连接成功 but
+    # proxy never came up" fix).
+    assert rm._readiness("frpc", "login to server success") is None
+    assert rm._readiness("frpc", "start proxy success") == "ready"
+    assert rm._readiness("frpc", "proxy added") == "ready"
+    assert rm._readiness("chmlfrp", "start proxy success") == "ready"
     assert rm._readiness("cloudflared", "Registered tunnel connection") == "ready"
+    # frpc's real failure lines now classify as failed.
     assert rm._readiness("frpc", "authentication failed") == "failed"
+    assert rm._readiness("frpc", "login to server failed") == "failed"
+    assert rm._readiness("frpc", "start error: port already used") == "failed"
+    assert rm._readiness("frpc", "dial tcp 1.2.3.4:7000: i/o timeout") == "failed"
     assert rm._readiness("frpc", "routine debug output") is None
 
 
@@ -1533,10 +1543,6 @@ def test_resolve_project_node_picks_node(monkeypatch):
     monkeypatch.setattr(
         "user_platform.models_task.Task.filter",
         classmethod(lambda cls, **k: _q([task])),
-    )
-    monkeypatch.setattr(
-        "user_platform.models_task.TaskNodeBinding.get_or_none",
-        classmethod(lambda cls, **k: _awaitable(None)),
     )
     resolved = asyncio.run(
         svc._resolve_project_node("00000000-0000-0000-0000-000000000000")

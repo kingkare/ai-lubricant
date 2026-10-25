@@ -16,6 +16,7 @@
 | 有 OAuth 设备码登录 | 不要在前端硬编码字段 | `account_schema` + `begin_device_flow` + `poll_device_flow` | [场景 F](#场景-f设备码授权) |
 | 有 OAuth 回调登录 | 不要自己做授权页面 | `account_schema` + `build_auth_start` + `handle_auth_callback` | [场景 G](#场景-g回调式-oauth) |
 | token 需要定时刷新 | 不要另写后台定时任务 | `refresh_auth` + `SCHEDULED_REFRESH = True` | [场景 H](#场景-h刷新-token) |
+| 有每日签到 / 额度同步这类「作用于账号」的周期动作 | 不要在前端硬编码按钮 | `account_schema()["account_actions"]` + `perform_action`（`refresh_auth` 作复合入口顺带也做） | [场景 P](#场景-p账号动作签到同步额度等周期动作) |
 | 账号密码先换 ticket / Cookie | 不要继承 `BaseProvider` | `init_auth` + 需要的聊天/模型钩子 | [场景 I](#场景-i账密登录和非标聊天) |
 | 只想拒绝某些模型或消息 | 不要在聊天函数里偷偷判断 | `check_message` | [场景 J](#场景-j请求前拦截) |
 | 上游不认 function calling（模型把工具调用当正文吐） | 不要自己写文本→工具解析 | `p.build_tools_prompt` + `p.parse_tool_calls` | [场景 K](#场景-k上游不认-function-calling文本转工具调用) |
@@ -164,6 +165,10 @@ class SseChannel:
 
 **什么时候用：** 上游要求用户打开网页、输入 `user_code`，然后后台轮询直到授权完成。
 
+> **统一后**：设备码被框架自动包装成「异步步骤」——前端只认步骤一种形态（显示 user_code /
+> 授权地址 + 后台轮询）。spec 仍按下面写 `begin_device_flow` + `poll_device_flow` 即可，
+> 框架自动套壳；如要主动声明步骤化（迁移后的推荐写法），按本节末尾的「步骤化写法」包一层。
+
 这里有 3 个关键部分：
 
 1. `account_schema()` 告诉前端要显示哪些账号字段和授权按钮。
@@ -188,6 +193,45 @@ class SseChannel:
 
 授权成功的落库由服务端中央扫描器在轮询到 `authorized` 时完成，不依赖管理页面继续开着；
 spec 不要自己写 `while True`。
+
+> **统一后变化**：`authorized` **不再自动落库**——扫描器标记 `completed` + 存 `account_data`，
+> 前端轮询拿到后回填账号表单，用户核对后手动点「保存」才建账号（与步骤认证一致）。
+
+### 步骤化写法（迁移后的推荐）
+
+存量 spec 只声明 `begin_device_flow` + `poll_device_flow` 就能被框架自动包装。迁移后的
+推荐写法是显式声明 `begin_step_auth` / `submit_step_auth`，把设备码流包成一个异步步骤：
+
+```python
+@staticmethod
+async def begin_step_auth(p, auth_context=None) -> dict:
+    """把设备码流包装成异步步骤：显示 user_code/地址 + 声明 poll（后台照旧轮询）。"""
+    flow = await DeviceChannel.begin_device_flow(p, auth_context)
+    return {
+        "task_type": "steps",
+        "step": {
+            "id": "device_authorize",
+            "title": "设备码授权",
+            "description": "请在授权页面完成登录，完成后自动继续。",
+            "fields": [],
+            "user_code": str(flow.get("user_code") or ""),
+            "verification_uri": str(flow.get("verification_uri") or ""),
+            "auth_url": str(flow.get("auth_url") or flow.get("login_url") or ""),
+            "poll": {"interval": int(flow.get("interval") or 5),
+                     "expires_in": int(flow.get("expires_in") or 900)},
+        },
+        "step_state": {"poll_params": flow.get("poll_params") or {}},
+        "expires_in": int(flow.get("expires_in") or 900),
+    }
+
+@staticmethod
+async def submit_step_auth(p, step_id, values, step_state, action=None, auth_context=None) -> dict:
+    """异步步骤无表单输入：提交即等待，后台轮询推进。"""
+    return {"status": "pending", "message": "等待授权完成…", "step_state": step_state or {}}
+```
+
+`poll_device_flow` 保留不动——后台扫描器仍调它轮询。这样存量流零改动，spec 只是显式表达了
+「这是异步步骤」，前端走统一的步骤渲染。
 
 ### 声明「授权怎么才算完成」：`auth_start.completion`
 
@@ -385,7 +429,7 @@ class CallbackChannel:
 
 **什么时候用：** 账号已有 `refresh_token`，access token 会过期。
 
-只实现 `refresh_auth`，并在类上写 `SCHEDULED_REFRESH = True`，管理端的刷新按钮和每日定时任务都会调用它：
+只实现 `refresh_auth`，并在类上写 `SCHEDULED_REFRESH = True`，账号页「刷新授权」按钮和**账号动作调度器**的 `refresh_auth` 动作（默认每天 10:00，时刻/频率改 spec 声明的 `account_actions` 里的 `refresh_auth` 条目）都会调用它：
 
 ```python
 class RefreshableChannel:
@@ -411,6 +455,8 @@ class RefreshableChannel:
 ```
 
 返回字典中的字段会窄写回该账号；不要自己改整份渠道配置。
+
+> `refresh_auth` 是「刷新授权」**复合入口**：换 token 的同时**顺带**签到/额度等周期动作（与 `perform_action` 同实现，幂等），调度默认每天 10:00。每日签到、额度同步**另有独立动作**（`perform_action` 的 checkin / sync_quota）与独立的「签到」按钮——按 spec 是否在 `account_actions` 声明决定显隐（`checkin` 默认 `enabled=False` 仅手动，每日签到已由 `refresh_auth` 带上，要独立定时签到把 `default.enabled` 改 `True`）。
 
 ---
 
@@ -618,7 +664,7 @@ class DynamicBaseChannel:
 
 **什么时候用：** access_token 在请求途中过期，spec 自己刷新了新 token，想把它写回账号配置，进程重启后还在。注意区分两个时机：
 
-- **每日定时刷新 / 账号页「刷新」按钮** → 写 `refresh_auth` 钩子，返回字典，admin 统一落库，spec 不用自己写。
+- **定时 / 账号页「刷新授权」按钮** → 写 `refresh_auth` 钩子，返回字典，admin 统一落库，spec 不用自己写。
 - **请求途中自愈刷新**（401 重试、token 临过期自动换）→ 走 `await p.persist_account_fields({...})`，框架按 `(渠道, username)` 窄写单账号行 + 广播 + 同步池内同名账号的其它实例。
 
 ```python
@@ -650,6 +696,396 @@ class AutoRefreshChannel:
 
 ---
 
+## 场景 N：步骤认证（多步交互式登录）
+
+**什么时候用：** 上游登录是多步交互——手机号 → 收短信码 → 邮箱 → 收邮箱码…… 既不是一次设备码轮询，也不是一次 OAuth 回调。每提交一步，服务端立刻执行该步动作并返回下一步。
+
+与设备码的根本区别是**同步交互**：不需要中央扫描器轮询。`account_auth_states` 表里 `task_type='steps'`，扫描器查询天然忽略它，`delete_expired_account_auth_states` 照常清理过期行。spec 只声明两个钩子，框架负责状态存储 + 通用步骤 UI 渲染 + 提交分发。
+
+### 钩子
+
+```python
+async def begin_step_auth(p, auth_context=None) -> dict
+async def submit_step_auth(p, step_id, values, step_state, action=None, auth_context=None) -> dict
+```
+
+`begin_step_auth` 返回第一步 + 框架不解释的 opaque 状态（每步原样回传）。**渠道不需要交互步骤时返回 `exit`**：
+
+```python
+{
+    "task_type": "steps",
+    "step": <StepDescriptor>,     # 第一步
+    "step_state": {"internal": "..."},   # 框架不解释，每步原样回传
+    "expires_in": 900,            # 可选
+}
+
+# 渠道纯手填、无需任何交互步骤 → 直接进账号表单：
+{
+    "task_type": "steps",
+    "exit": True,                 # 框架跳过授权阶段，直接显示账号表单
+    "account_data": {...},        # 可选：预填账号字段
+}
+```
+
+`submit_step_auth` 按签名传参（老写法少声明尾参也能跑，框架按签名探测，绝不 call-and-retry）。返回四选一：
+
+| `status` | 含义 | 前端 |
+|---|---|---|
+| `"next"` | 进入下一步 | 换渲染下一步（必须附 `step` + `step_state`） |
+| `"pending"` | 不推进，原地提示（如「验证码已发送」） | 显示 `message`，保留当前步 |
+| `"authorized"` | 完成 | 把 `account_data` 回填进账号表单，用户核对后**手动点保存**才建账号（框架不自动落库） |
+| `"error"` | 失败 | 显示 `error`（400） |
+
+`StepDescriptor` 框架只透传、不解释，`fields` 复用 `AccountSchemaField` 形态：
+
+```python
+{
+    "id": "sms_code",
+    "title": "输入短信验证码",
+    "description": "...",            # 可选
+    "hint": "...",                   # 可选，常驻提示
+    "fields": [
+        {"key": "code", "label": "验证码", "type": "code",
+         "required": True, "placeholder": "6 位数字", "span": 1}
+    ],
+    "submit_label": "下一步",         # 可选，默认「下一步」
+    "actions": [{"id": "resend", "label": "重新发送"}]   # 可选，走 submit 的 action 参数
+}
+```
+
+字段 `type` 复用 `AccountSchemaFieldType`；`tel`/`email`/`code` 是文本输入变体，仅影响 `inputMode`/`autoComplete`，渲染仍走同一套。
+
+### 声明
+
+`account_schema()` 里把 `auth_start.mode` 写成 `"steps"`，`add_methods` 加 `"steps"`：
+
+```python
+@staticmethod
+def account_schema():
+    return {
+        "fields": [
+            {"key": "username", "label": "用户名", "type": "text", "required": True},
+            {"key": "password", "label": "API Key", "type": "password", "required": True},
+        ],
+        "auth_start": {"enabled": True, "mode": "steps", "label": "多步登录"},
+        "add_methods": ["manual_form", "steps"],
+    }
+```
+
+### 样例：手机号 → 短信码 → 完成
+
+```python
+class StepAuthChannel:
+    @staticmethod
+    async def begin_step_auth(p, auth_context=None):
+        return {
+            "task_type": "steps",
+            "step": {
+                "id": "phone",
+                "title": "输入手机号",
+                "fields": [{"key": "phone", "label": "手机号", "type": "tel", "required": True}],
+                "actions": [],
+            },
+            "step_state": {"ticket": await _create_ticket()},
+            "expires_in": 600,
+        }
+
+    @staticmethod
+    async def submit_step_auth(p, step_id, values, step_state, action=None, auth_context=None):
+        ticket = step_state["ticket"]
+        if step_id == "phone":
+            if action == "resend":
+                return {"status": "pending", "message": "验证码已重新发送"}
+            await _send_sms(ticket, values["phone"])
+            return {
+                "status": "next",
+                "step": {
+                    "id": "sms_code",
+                    "title": "输入短信验证码",
+                    "fields": [{"key": "code", "label": "验证码", "type": "code", "required": True}],
+                    "actions": [{"id": "resend", "label": "重新发送"}],
+                },
+                "step_state": {"ticket": ticket, "phone": values["phone"]},
+            }
+        if step_id == "sms_code":
+            token = await _verify_sms(ticket, values["code"])
+            if not token:
+                return {"status": "error", "error": "验证码错误"}
+            return {"status": "authorized",
+                    "account_data": {"username": step_state["phone"], "password": token}}
+        return {"status": "error", "error": f"未知步骤 {step_id}"}
+```
+
+**关键不变式：**
+
+- 步骤认证是**逐步收集数据**的向导：进行中只显示步骤面板（这一步要填什么），**不显示账号创建表单**——步骤与「回填创建」是两件事。
+- `authorized` **不自动落库**：框架把 `account_data` 回填进账号表单，用户核对后手动点「保存」才建账号。spec 只返回 `account_data`，不要自己写库。
+- 钩子签名的可选 `auth_context` 由框架按签名探测转发，与 `begin_device_flow` 同源；`action` 同理（老 spec 不声明 `action` 参数也照常工作）。
+- 页面刷新后，`/auth/status` 返回当前 `step` + `step_state`，前端据此恢复 UI（不需要前端存 step_state，服务端持久化）。
+- **设备码 / 跳转登录已被框架包装成「步骤」**：存量 spec 声明 `begin_device_flow`/`build_account_auth_start` 后零改动——框架把它们包成带 `poll` 的异步步骤（显示 user_code / 授权地址，后台照旧轮询），前端只认步骤一种形态。
+
+### 条件表达式（字段显隐 / 动态选项 / 动态必填）
+
+字段和步骤可声明**表达式**（JS 语法子集），前端实时求值——不用写任何 UI 代码就能做「选了 A 才显示 B」：
+
+| 属性 | 作用 | 示例 |
+|---|---|---|
+| `visible_when` | 为假则隐藏该字段（**提交时一并剔除**，不会写入账号） | `"values.method == 'sms'"` |
+| `required_when` | 为真则该字段必填（覆盖静态 `required`） | `"values.phone.length == 11"` |
+| `disabled_when` | 为真则禁用该字段 | `"values.locked == true"` |
+| `options_when` | 求值结果为数组时替换静态 `options`（动态选项） | `"values.kind == 'a' ? [{'value':'x','label':'X'}] : []"` |
+| `skip_if`（步骤级） | 为真则跳过该步 | `"values.method != 'sms'"` |
+
+```python
+{
+    "key": "region", "label": "区域", "type": "select",
+    "options": [{"label": "国内", "value": "cn"}, {"label": "海外", "value": "os"}],
+},
+{
+    "key": "cn_phone", "label": "手机号", "type": "tel",
+    "visible_when": "values.region == 'cn'",     # 只在选「国内」时出现
+    "required_when": "values.region == 'cn'",    # 出现时必填
+},
+```
+
+可用 `values.<字段key>` 读同表单/同步骤的其它字段，`state.<key>` 读步骤间 opaque 状态。
+
+**支持的语法子集**（前端求值器手写、**不用 `eval`**，越界即返回 undefined 并按「可见」兜底）：
+
+- 字面量：数字、单/双引号字符串、`true`/`false`/`null`/`undefined`
+- 比较：`== != === !== > >= < <=`；逻辑：`&& || !`（短路语义同 JS）
+- 成员：`.length`、`.includes(x)`、`.startsWith(x)`、`.endsWith(x)`、`.indexOf(x)`、`.toLowerCase()`、`.toUpperCase()`、`.trim()`
+- 下标 `a[i]`、三元 `cond ? a : b`、数组/对象字面量、括号分组
+
+> 表达式求值失败（写错语法 / 访问未定义属性）**不抛错**：显隐类按「可见」处理，避免一个写错的表达式把用户永久卡在空步骤里。`values.x` 只在同一步/同表单内可见——跨步骤的数据请放 `step_state` 由 spec 自己管理。
+
+---
+
+## 场景 O：导入/上传凭据文件识别
+
+**什么时候用：** 上游没有可编程的登录接口，用户只能从浏览器导出凭据（cookie / token / HAR 抓包）再导入。添加账号时上传文件，服务端识别出字段自动回填表单，用户确认后走正常 add 流程——**不落库**。
+
+### 通用解析器（不写钩子也能用）
+
+框架内置 `providers/credential_import`，认三种格式：
+
+| 格式 | 识别来源 | 识别出的槽位 |
+|---|---|---|
+| JSON | 递归按键名找 `access_token`/`token`/`api_key`/`key`/`refresh_token`/`cookie(s)`/`authorization`/`user_name`/`user_email`/`account_id` 等 | access_token / refresh_token / cookie / username / email / account_id / session_id / csrf_token |
+| HAR | `log.entries[].request.headers[]`，取命中渠道 `base_url` host 的（或最新一条）请求 | Cookie 头 → cookie；`Authorization` 去 `Bearer ` 前缀 → access_token |
+| cookies.txt | Netscape 7 字段制表符格式（`#HttpOnly_` 前缀是真实行不是注释） | 拼 `cookie` 头 |
+
+识别结果按 `account_schema().fields` 的 key 名分到 `fields`（前端可安全回填）和 `extras`（额外字段区）；`notes` 给人读的来源说明。
+
+槽位到表单字段的映射是双向的：`access_token` 槽位匹配 schema 里 `password` / `api_key` / `key` / `access_token` 任一字段名；`refresh_token` 匹配 `refresh_token`；以此类推。同一槽位只填第一个命中的字段（凭据字段单写，避免 `api_key > key > password` 的 init 优先级遮蔽出陈旧值）。
+
+### 声明
+
+`account_schema()` 的 `add_methods` 加 `"import"`：
+
+```python
+"add_methods": ["manual_form", "import"],
+```
+
+不写钩子时，上传文件走通用解析器。渠道有非标格式时声明 `parse_credential_file` 钩子完全接管：
+
+```python
+async def parse_credential_file(p, filename, content_bytes, cfg=None) -> dict
+```
+
+返回与通用解析器同形态：`{"fields": {...}, "extras": {...}, "notes": [...]}`。钩子抛错时框架回落通用解析器（标格式用户不受非标渠道影响）。
+
+### 端点
+
+- `POST /admin/providers/{name}/accounts/import-file`（multipart `UploadFile`）
+- 大小护栏 5MB；返回 `{ok, format, fields, extras, notes}`，**不落库**
+- 前端拿到 `fields` 合并进表单（凭据字段仍只写单一 `schemaPasswordField.key`）、`extras` 进额外字段、`notes` 显示为一行摘要
+- 用户确认后走正常 `PUT /accounts/add`
+
+> 这是 admin 侧**第一个** multipart 端点。前端 `importProviderAccountCredentials` 用 FormData + 显式 `Content-Type: undefined`——共享 axios 默认 JSON，axios 1.x 会把 FormData 静默转 JSON（坑见 `@admin-port/api/nodes.ts`）。
+
+### JSON 批量导入（一批账号一次贴）
+
+**什么时候用：** 手里有一批账号（上游批量注册导出、别的系统迁移），要一次全贴进来。渠道**什么都不用写**——`account_schema()["fields"]` 声明了哪些字段，导入就按那些字段名落，所以代码渠道天然支持。
+
+- `POST /admin/providers/{name}/accounts/import-json`，body `{"text": "<json>"}`，**同样不落库**
+- 接受的形态：顶层账号数组 `[ {...}, {...} ]`，或 `{"accounts": [...]}` / `data` / `list` / `items` / `result` 包裹
+- 每条 dict 的键走与单账号导入**同一套**映射（`credential_import.map_account_entry`）：
+  - 键名先归一（camelCase→snake_case、去分隔符、大小写不敏感），schema 的 **key 和 label 都是匹配入口**——`accessToken` / `Access_Token` / 界面上的 `UIN` 标签都认
+  - 上游原始叫法也认：`access_token`/`token`/`authorization`（自动去 `Bearer `）→ schema 的 `password`/`api_key`/`key`/`access_token` 任一；`user_name`/`user_email` → `username`。schema 声明但没有槽位的字段（`user_id`/`enterprise_id`/`uin`…）按同名键直取
+  - **同一凭据槽位只写一个字段**，避免 `api_key > key > password` 的 init 优先级把刚导入的凭据遮蔽掉
+  - 值按字段类型校正：`number`/`checkbox` 留原值，其余一律转字符串——spec 里 `p.uin.strip()` / `p.user_id.startswith(...)` 是常态，JSON 给数字会 `AttributeError`
+- 逐条校验并回报（不整批失败）：缺用户名 / 与已有账号重名 / 批内重名 / 缺 `required` 字段 / 条目不是对象 →
+  该行标红进不了 `accounts`，其余好行照常可导入；`username` 缺失时按
+  `username`→`user_name`→`user_email`→`account_id`→`user_id`→`name` 兜底
+- schema 没声明的键**不丢**：与单账号导入把 `extras` 合并回表单同一口径，一并写进账号行
+- 返回 `{ok, schema_fields, rows[], accounts[], total, importable, failed}`：`rows` 是预览行
+  （凭据已按 `_mask_secret` 脱敏，明文凭据只在顶层 `accounts` 出现一次），`accounts` 是确认后
+  原样发回 `POST /accounts/batch-add` 的完整账号行
+- 入口在账号 tab「批量添加」弹框的 **JSON 导入** 页签：粘贴 → 解析预览（表格 + 可导入/跳过计数）→
+  确认导入。大小护栏 5MB。
+
+---
+
+## 场景 P：账号动作（签到 / 同步额度等周期动作）
+
+**什么时候用：** 上游有「作用于账号但不属于聊天」的动作——每日签到、同步积分/余额、领福利…… 它们要有**独立的结果展示 + 独立的手动按钮**，并能各自配置调度。
+
+**两个按钮的分工**（这是设计的核心，别搞混）：
+
+| 按钮 | 后端 | 作用 | 显隐 |
+|---|---|---|---|
+| 「刷新授权」（操作列） | `refresh_auth` 钩子 | **复合入口**：换 token 的同时顺带签到/额度（与 `perform_action` 同实现，幂等）。适合"我现在要把这个账号全刷一遍" | 有 `refresh_auth` 钩子就显示 |
+| 「签到」（账号行「额度·动作」列） | `perform_action` 的 `checkin` | **只做签到**这一件事，不碰 token/沙箱 | spec 在 `account_actions` 声明了 `checkin` 才显示 |
+
+`refresh_auth` 与 `perform_action` 共用同一套 `_checkin_fields` / `_fetch_points` 之类的实现，重复调用是幂等的（当日已签则跳过），所以复合入口 + 独立按钮并存不会打乱上游。
+
+### 声明
+
+`account_schema()` 里加 `account_actions`（每个动作独立：独立调度、独立按钮、独立状态，互不牵连）：
+
+```python
+def account_schema():
+    return {
+        "fields": [...],
+        "auth_start": {...},
+        "account_actions": [
+            {"id": "checkin", "label": "每日签到", "manual": True,
+             "display": {"format": "badge", "label": "签到",
+                         "badge_field": "last_checkin",
+                         "status_field": "last_checkin_status"},
+             # refresh_auth 复合入口已每天带一次签到（幂等）；
+             # checkin 只做「签到」按钮、默认不单独调度，避免重复打上游。
+             "default": {"enabled": False, "frequency_unit": "daily", "frequency_value": 1}},
+            {"id": "sync_quota", "label": "同步积分", "manual": True,
+             "display": {"format": "value", "label": "积分", "value_field": "quota_text"},
+             "default": {"enabled": True, "frequency_unit": "hours", "frequency_value": 6}},
+        ],
+    }
+```
+
+- `display.format`：`value` = 账号行直接显示字段值（额度）；`badge` = 显示为徽标（按 `status_field` 的 `日期|状态|+金额` 着色：ok/already 绿、fail/error 红）；`none`（缺省）= 只进「账号动作」面板，不出账号行。
+- `default`：**调度配置的真相源就在渠道代码里**（enabled/频率/daily_time/账号范围）。管理端「账号动作」面板只读展示解析后的生效配置 + 提供「立即执行」，**不提供编辑**——要改频率/时刻/范围就改这里的 `default` 重新保存源码。
+- `manual`：账号行是否出手动执行按钮（默认 True）。
+
+### 实现
+
+```python
+@staticmethod
+async def perform_action(p, action_id, account, cfg):
+    """执行一个账号动作，返回要窄写回账号的字段（admin 统一落库）。"""
+    if action_id == "sync_quota":
+        return {"quota_text": f"积分 {await _fetch_points(p):,}"}
+    if action_id != "checkin":
+        raise ValueError(f"未知动作 {action_id}")
+    # 签到：只回「状态 + 拿到了多少」，徽标展示串由框架统一格式化（见下）
+    ok, reward = await _do_checkin(p)          # 你自己的上游调用
+    if not ok:
+        return {"_checkin_status": "failed", "_checkin_detail": "上游 500"}
+    return {"_checkin_status": "ok", "_checkin_detail": f"+{reward}"}
+
+
+@staticmethod
+async def checkin_condition(p, action_id, account, cfg):
+    """（可选）签到前置条件门：框架在调 perform_action 前先问一句要不要签。"""
+    if action_id != "checkin":
+        return {"ok": True}
+    if _already_signed_today(account):          # 读账号行 / JdbcClient.redis 都行
+        return {"ok": False, "reason": "今日已签到"}
+    return {"ok": True}
+```
+
+- 返回字典窄写回该账号（与 `refresh_auth` 同语义）；**不要**在钩子里自己 `persist_account_fields`——admin 随后会用它自己的旧快照 + 返回值整行回写，中间窄写的字段会被冲掉。
+- 动作**执行失败**（如签到一个都没成）：徽标字段照写（前端能看到「签到失败」），再带一个 `_error` 键——admin 把它记为「本次执行失败」（悬浮可见），**不落库**该键。
+- **签到类动作改用结构化状态返回**（框架弹出、不落库原样键）：
+
+  | 返回键 | 取值 | 含义 |
+  | --- | --- | --- |
+  | `_checkin_status` | `ok` | **真签到了**，`_checkin_detail` = 拿到了多少（如 `+80`）→ **框架解冻该账号** |
+  | | `failed` | 签到失败，`_checkin_detail` = 失败原因 → 不解冻 |
+  | | `skipped` | 没签（今日已签/无活动/条件不满足），`_checkin_detail` = 跳过原因 → **不解冻** |
+
+  框架据此把状态格式化进本动作 `display.badge_field` / `status_field` 声明的字段（缺省
+  `last_checkin` / `last_checkin_status`），并把「最近一次签到状态 + 拿到了多少/原因 + 时间」
+  统一记进账号动作结果供页面悬浮展示——**spec 不再自己拼「签到成功 +80」这类展示串**。
+  「跳过」与「成功」必须分开：只有 `ok` 能证明账号拿到了新额度，才配解冻；把
+  「今日已签/无活动」也当成功解冻，等于给一个额度耗尽的号放行流量。
+- **解冻只认 `ok`**：额度不足类冻结（冻结周期设「今天/本周/本月」）在签到成功那一刻解除，
+  不用干等到期；走的是与「测试成功自动解冻」同一条链路（内存桶 + Redis + 跨实例广播）。
+- **条件门 `checkin_condition`**（可选钩子，不声明就没有门、直接执行）：逻辑归 spec，可读
+  账号行、也可用注入的 `JdbcClient.redis` 记跨重启的当日标记。返回 `{"ok": False, "reason": ...}`
+  时框架**不调 perform_action**、直接记 `skipped`（同样不解冻）——省掉重复的上游请求。
+- 幂等：有了条件门就不必再靠 `status_field` 自查「当日已签」；两者可并存（门做廉价本地判断，
+  `perform_action` 内的上游复核兜最终一致性）。调度器重启当天会补跑一次，幂等兜住。
+
+### 调度与手动触发
+
+- **自动**：账号动作调度器每 60s 扫描到点的 `(渠道, 动作)`，候选账号入队、worker 串行消费。`daily` 按**每日时刻**执行——`default.daily_time`（"HH:MM"，缺省 "10:00"）决定当天几点跑，当天到点才跑、重启当天补跑一次（spec 的当日幂等兜住）；`minutes`/`hours` 按间隔滚动。手动「立即执行」**不**推迟下一次自动调度。
+- **手动**：账号行每动作一个按钮（只跑本动作）；渠道「账号动作」面板每动作一个「立即执行」（按 `default.accounts` 范围异步入队）。
+- **端点**：`POST /admin/providers/{name}/accounts/{username}/actions/{action_id}`（单账号）、`POST /admin/providers/{name}/actions/{action_id}/run-all`（批量入队）。
+- `refresh_auth` 是框架**自动合成**的动作：声明了 `refresh_auth` 钩子的渠道自动有它（默认 `daily 10:00`）；`SCHEDULED_REFRESH = True` 时默认纳入自动调度，否则只留手动按钮。**想改它的默认频率/时刻**，直接在 `account_actions` 里声明一个 `id="refresh_auth"` 的条目覆盖即可。
+
+---
+
+## 场景 Q：浏览器操作（驱动 CDP）与渠道定时任务
+
+**什么时候用：** 上游不是纯 HTTP 能搞定的——反爬挑战头要页面内 JS 求解（如 duck.ai 的 `X-Vqd-Hash-1`）、验证码必须页面内跑 SDK（阿里云无痕）、登录要真实 SSO 页面交互。这些操作由 spec **直接驱动 CDP 浏览器**完成（原「站点服务」的能力已并入本框架，站点服务已删除）。
+
+### 浏览器操作门（`p` 上常驻，无需声明）
+
+框架给每个渠道实例常驻挂了浏览器操作方法（薄委托 `SiteServer`，与 CDP 桥共用连接）：
+
+| 方法 | 说明 |
+|---|---|
+| `await p.run_js(client_id, code, *, tab_id="")` | 在浏览器 tab 里执行 JS，返回值 |
+| `await p.open_tab(client_id, url="", *, active=False)` | 开 tab（默认记为常驻 tab），返回 session_key |
+| `await p.find_tab(client_id, url_contains)` | 找 URL 含关键字的已有 tab |
+| `await p.set_default_tab(client_id, session_key)` | 把已有 tab 认作常驻 tab |
+| `await p.navigate(client_id, url, *, tab_id="")` | 跳转 |
+| `await p.capture_start(client_id, url_pattern="")` | 开始监听网络，返回 capture_id |
+| `await p.wait_capture(client_id, capture_id, *, timeout=30)` | 等捕获帧 |
+| `await p.capture_stop(client_id, capture_id)` | 停止监听 |
+| `await p.list_clients()` | 列**渠道归属者**名下的在线 CDP 浏览器 |
+
+- `client_id` 是「设备工具 → 浏览器」资源的 id；`p.list_clients()` 按**渠道 creator**（`owner_user_id`）收窄，操作不了别人的浏览器。
+- 同一方法里**不能同时挂两个 listen**（扩展按 tabId 只维持一份抓包）——要监听多个接口就 `capture_start → wait_capture → capture_start → wait_capture` 依次来。
+- 渠道自己的常驻 tab / 浏览器池状态放 **spec 模块级 dict**（namespace 进程内单例，跨账号存活，源码一改才失效；先例见 `_ASK_LOCKS` 的用法）。
+
+### 渠道定时任务（`SCHEDULED_TASKS` 类属性）
+
+原站点 `register_task` 的移植。spec 类上声明：
+
+```python
+SCHEDULED_TASKS = [
+    {"id": "keepalive", "frequency_unit": "minutes", "frequency_value": 10},
+    # {"id": "sync", "frequency_unit": "daily", "daily_time": "10:30", "enabled": False},
+]
+
+@staticmethod
+async def keepalive(p):
+    """渠道级定时任务：p 是渠道级单例实例（能 p.run_js 驱动浏览器）。"""
+    ...
+```
+
+- 调度词汇与账号动作一致：`frequency_unit` = `daily`（带 `daily_time` "HH:MM"，缺省 10:00）/ `minutes` / `hours`（带正整数 `frequency_value`）；`enabled` 缺省 True。
+- 由账号动作调度器统一驱动（同一循环，独立于账号动作——纯保活渠道没有账号也会跑）；重启后首轮即跑（替代原站点开机拉起池的行为）。
+- 每个 `id` 对应 spec 里一个同名 `@staticmethod def id(p)`；**声明了没写方法，加载即报错**（防静默不跑）。
+- 打外网的渠道该开关无额外要求；纯保活型渠道（无任何钩子）写 `REQUIRES_BASE_URL = False` 豁免渠道地址必填。
+
+### 站点 → spec 移植对照（原站点服务用户的迁移配方）
+
+| 站点现在 | 渠道 spec 之后 |
+|---|---|
+| `class X(SiteRuntimeBase)` 独立 code 行 | spec 同一源码里的普通静态方法 |
+| `self.run_js(cid, js)`（继承基类） | `await p.run_js(cid, js)`（框架常驻门） |
+| `self.register_api("ask", ...)` | `async def _ask(p, ...)` 普通方法，spec 内部直调 |
+| `self.register_task("keepalive", minutes=10)` | `SCHEDULED_TASKS=[{"id":"keepalive","frequency_unit":"minutes","frequency_value":10}]` + `@staticmethod def keepalive(p)` |
+| 池/常驻 tab 状态 | spec 模块级 dict（namespace 单例，跨账号存活） |
+| `login_site_id/login_site_token` 账号字段 | 删；`login_client_id` 保留（账号↔浏览器钉位） |
+| 跨渠道借别的渠道的能力 | 该能力上提为 `providers/` 下的共享模块，或经渠道类直调 |
+
+---
+
 ## 类级开关（spec 类属性）
 
 类级开关写在 spec 类上，框架复制到适配器。已在前述场景分散出现，这里集中列：
@@ -657,7 +1093,7 @@ class AutoRefreshChannel:
 | 开关 | 默认 | 作用 |
 |---|---|---|
 | `SUPPORTS_TOKEN_AUTO_REFRESH` | False | 账号凭据过期后能否自愈；True 时前端标「已过期（等待自动刷新）」 |
-| `SCHEDULED_REFRESH` | False | 纳入 admin 每日 10:00 主动刷新（需同时写 `refresh_auth`） |
+| `SCHEDULED_REFRESH` | False | 自动合成的 `refresh_auth` 动作默认纳入自动调度（需同时写 `refresh_auth`；未声明则只有手动按钮） |
 | `SUPPORTS_MULTI_MESSAGES` | False | 是否把多轮 messages 整批发给上游 |
 | `NEEDS_STREAM_TOOL_FALLBACK` | False | 流式工具调用降级开关 |
 | `TOOLS_AS_PROMPT` | False | 上游不认 OpenAI function calling 时把工具说明进 system（见场景 K） |
@@ -686,9 +1122,14 @@ class AutoRefreshChannel:
 | `account_schema` | `() -> dict` | 声明前端账号字段和授权入口 |
 | `begin_device_flow` | `(p) -> dict` | 启动设备码授权 |
 | `poll_device_flow` | `(p, poll_params) -> dict` | 设备码单步轮询 |
+| `begin_step_auth` | `(p) -> dict` | 启动步骤认证，返回第一步（见[场景 N](#场景-n步骤认证多步交互式登录)） |
+| `submit_step_auth` | `(p, step_id, values, step_state, action=None) -> dict` | 提交步骤认证的一步输入 |
 | `build_auth_start` | `(name, account, redirect_uri, state, cfg)` | 生成 OAuth 跳转 |
 | `handle_auth_callback` | `(name, params, state_data, cfg)` | 处理 OAuth 回调 |
-| `refresh_auth` | `(p, account, cfg) -> dict` | 刷新 token 并返回窄写字段 |
+| `refresh_auth` | `(p, account, cfg) -> dict` | 刷新 token 并返回窄写字段（框架自动合成 `refresh_auth` 动作，见[场景 H](#场景-h刷新-token)） |
+| `perform_action` | `(p, action_id, account, cfg) -> dict` | 执行一个账号动作（签到/额度等），返回窄写字段 + 签到类动作的 `_checkin_status`/`_checkin_detail`（见[场景 P](#场景-p账号动作签到同步额度等周期动作)） |
+| `checkin_condition` | `(p, action_id, account, cfg) -> {ok, reason}` | （可选）签到前置条件门：`ok=False` 时框架跳过本次签到并记 skipped、不解冻账号（见[场景 P](#场景-p账号动作签到同步额度等周期动作)） |
+| `parse_credential_file` | `(p, filename, content_bytes, cfg=None) -> dict` | 自定义凭据文件解析（见[场景 O](#场景-o导入上传凭据文件识别)） |
 
 ### 聊天、模型和请求
 

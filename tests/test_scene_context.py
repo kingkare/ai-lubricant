@@ -31,8 +31,14 @@ def test_browser_scene_uses_tab_id_from_session_key():
     assert spec.identity["client_id"] == "cli-1"
     assert spec.identity["tab_id"] == "42"
     assert spec.identity["client_alias"] == "我的浏览器"
-    # The scene exists to drive cdp-bridge, so its SOP gets inlined on turn one.
-    assert spec.services == ("cdp-bridge",)
+    # Internal identity keeps the bare Chrome id (persist + tab lease need it)…
+    assert spec.display_identity["tab_id"] == "cli-1:42"
+    # …while the model is shown the composite form the browser tools speak.
+    assert "tab_id: cli-1:42" in sc.render_prompt(spec)
+    # The scene's capability is the built-in ``web`` tool — the name the agent
+    # actually calls. ``cdp-bridge`` is the external MCP name and never reaches
+    # the agent, so it must not appear here.
+    assert spec.capabilities == ("web",)
 
 
 def test_browser_scene_prompt_carries_client_id_not_url():
@@ -40,10 +46,15 @@ def test_browser_scene_prompt_carries_client_id_not_url():
     spec = sc.normalize(cdp={"client_id": "cli-1", "session_key": "cli-1:42"})
     prompt = sc.render_prompt(spec)
     assert "cli-1" in prompt
-    assert "tab_id: 42" in prompt
+    # The model is shown the COMPOSITE id (the form web(tabs) returns and tab= takes),
+    # never the bare Chrome id — a bare id is a legacy, ambiguity-prone token.
+    assert "tab_id: cli-1:42" in prompt
+    assert "tab_id: 42\n" not in prompt
+    # The binding is server-side: the model must not be told to pass these params.
+    assert "不需要你传" in prompt
     # No URL, and the model is told to fetch the page itself.
     assert "http" not in prompt
-    assert "scan" in prompt
+    assert "web" in prompt
 
 
 def test_browser_scene_omits_alias_when_same_as_client_id():
@@ -68,8 +79,8 @@ def test_node_scene_binds_node_id_and_defers_cwd():
     spec = sc.normalize(node_id="node-7")
     assert spec.type == sc.NODE_TERMINAL
     assert spec.identity == {"node_id": "node-7"}
-    # Terminal cwd / recent output are per-turn facts injected elsewhere.
-    assert spec.services == ()
+    # The scene's capability is the built-in node_shell_exec tool.
+    assert spec.capabilities == ("node_shell_exec",)
     prompt = sc.render_prompt(spec)
     assert "node-7" in prompt
     assert "node_shell_exec" in prompt
@@ -81,7 +92,7 @@ def test_node_scene_binds_node_id_and_defers_cwd():
 def test_marketplace_scene_inlines_its_service():
     spec = sc.normalize(context="marketplace_admin")
     assert spec.type == sc.MARKETPLACE_ADMIN
-    assert spec.services == ("marketplace-status",)
+    assert spec.capabilities == ("marketplace-status",)
     prompt = sc.render_prompt(spec)
     assert "市场管理" in prompt
     # 规则里点名外部榜单草稿工具（场景保留能力的核心增量）与保留性质说明
@@ -139,10 +150,10 @@ def test_replace_prompt_swaps_tab_id_and_keeps_base():
     merged = sc.replace_prompt(base, old, new)
 
     assert merged.startswith("你是一个浏览器助手。")
-    assert "tab_id: 77" in merged
-    assert "tab_id: 42" not in merged
+    assert "tab_id: cli-1:77" in merged
+    assert "tab_id: cli-1:42" not in merged
     # Exactly one scene segment remains — the old one was removed, not appended to.
-    assert merged.count("[场景: browser]") == 1
+    # render_prompt is deterministic, so the rebound prompt equals a fresh append.
     assert merged == sc.append_prompt("你是一个浏览器助手。", new)
 
 
@@ -163,7 +174,7 @@ def test_replace_prompt_leaves_prompt_alone_when_old_segment_absent():
     old, new = _cdp("42"), _cdp("77")
     merged = sc.replace_prompt("完全无关的提示词", old, new)
     assert merged.startswith("完全无关的提示词")
-    assert "tab_id: 77" in merged
+    assert "tab_id: cli-1:77" in merged
 
 
 def test_replace_prompt_is_idempotent_for_same_tab():
@@ -203,8 +214,8 @@ def test_scheduled_scene_identity_and_rules():
     assert spec is not None
     assert spec.type == sc.SCHEDULED
     assert spec.identity == {"job_id": "12", "task": "每日巡检", "schedule": "0 9 * * *"}
-    # 定时场景不驱动某个 MCP 服务，只声明「现场没人」这件事。
-    assert spec.services == ()
+    # 定时场景不驱动某个 MCP 服务/工具，只声明「现场没人」这件事。
+    assert spec.capabilities == ()
     prompt = sc.render_prompt(spec)
     assert "每日巡检" in prompt
     # 关键约束：问不到人 + 结论要自己落地。

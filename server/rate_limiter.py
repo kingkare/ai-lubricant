@@ -19,7 +19,7 @@ import config
 import model_catalog
 from db import PostgresClient
 from channel import Channel, strip_model_owner_prefix
-from limit_policy_store import get_effective_provider_policy, get_effective_provider_policy_sync, match_freeze_rules, normalize_freeze_policy
+from limit_policy_store import get_effective_provider_policy, get_effective_provider_policy_sync, match_freeze_rules, normalize_freeze_policy, freeze_rule_to_action
 from limits import LimitManager
 from limits.manager import (
     ROUTING_AUX_REDIS_TIMEOUT_SECONDS,
@@ -106,6 +106,30 @@ def end_routing_timing(token) -> None:
     _ROUTING_TIMING.reset(token)
 
 
+# 请求级出站上下文：选路前由编排层 set（messages/tools/tool_choice——足够渠道复现
+# 自己实际发供应商的请求体），reserve 阶段的 check_message 按需读。渠道在**选路时**就能
+# 算出「这条请求发到我这儿到底多大」，超限即拒绝该候选、换下一个渠道/账号，全部候选都
+# 拒才按主因收口成业务码（见 _REASON_TO_BUSINESS_CODE 的 context_window_exceeded）。
+# 任务级 ContextVar（同 _ROUTING_TIMING 先例），请求结束由编排层 finally reset，不跨请求泄漏。
+_ROUTING_REQUEST_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "routing_request_ctx", default=None
+)
+
+
+def begin_routing_request_ctx(ctx: dict | None = None):
+    return _ROUTING_REQUEST_CTX.set(ctx if isinstance(ctx, dict) else {})
+
+
+def end_routing_request_ctx(token) -> None:
+    _ROUTING_REQUEST_CTX.reset(token)
+
+
+def current_routing_request_ctx() -> dict | None:
+    """当前请求的出站上下文；未 set（admin 只读预检、单测等）返回 None——
+    调用方据此退回老签名钩子调用，绝不拿半个上下文去猜渠道的出站形态。"""
+    return _ROUTING_REQUEST_CTX.get()
+
+
 def _routing_stage_started() -> float:
     return time.monotonic()
 
@@ -133,10 +157,16 @@ async def _timed_routing_call(name: str, awaitable):
         _record_routing_stage(name, started)
 
 
+# 顶层候选键顺序即优先级：OpenAI 用 message，腾讯系业务信封（codebuddy/workbuddy 的
+# {code,msg}）用 msg，FastAPI 风格用 detail，error 需向下递归。同时存在时先取更「人类
+# 可读」的 message，再 msg——所以把 msg 排在 detail/error 前、message 后。
+_REASON_MESSAGE_KEYS = ("message", "msg", "detail", "error")
+
+
 def _pick_reason_message(value) -> str:
-    """从 JSON 解析后的错误体里递归抽取 message/detail 文本。"""
+    """从 JSON 解析后的错误体里递归抽取 message/msg/detail 文本。"""
     if isinstance(value, dict):
-        for key in ("message", "detail", "error"):
+        for key in _REASON_MESSAGE_KEYS:
             inner = value.get(key)
             if isinstance(inner, str) and inner.strip():
                 return inner.strip()
@@ -144,6 +174,15 @@ def _pick_reason_message(value) -> str:
                 picked = _pick_reason_message(inner)
                 if picked:
                     return picked
+        # displayMsg/display_message：多语言文案 dict（{en, zh, zh-hant}），键名不在上面
+        # 候选里，递归取不到——上游只给 displayMsg 不给 msg 时仍能拿到英文文案兜底。
+        for dm_key in ("displayMsg", "display_message"):
+            dm = value.get(dm_key)
+            if isinstance(dm, dict):
+                for lang in ("en", "zh", "zh-hant"):
+                    text = dm.get(lang)
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
         return ""
     if isinstance(value, list):
         for item in value:
@@ -219,6 +258,10 @@ _REASON_TO_BUSINESS_CODE = {
     "selection_deadline": "no_available_account",
     "selection_exhausted": "no_available_account",
     "selection_returned_none": "no_available_account",
+    # 窗口超限是配置/载荷类问题，无重试意义：归专用码 context_too_large，由调用方
+    # 转 400（与入口预检 _validate_context_budget 同码），客户端据此调整输入或压缩，
+    # 而不是按 429 退避重试。
+    "context_window_exceeded": "context_too_large",
 }
 
 
@@ -607,10 +650,12 @@ class AccountState(str, Enum):
     """账号此刻的规范状态——「账号处于什么状态」的唯一判据。
 
     取代散落各处的布尔组合（is_frozen / cooldown / disabled / auth_ok 各自拼），
-    由 :meth:`AccountClient.state` 一次算出，前端/移动端只读它做展示与筛选。
+    由 :meth:`AccountClient.state` 一次算出，前端/移动端只读它做展示与筛选，
+    选路过滤同样读它（:data:`ROUTABLE_STATES` = 可参与选路的状态集合）。
 
-    优先级（高→低，与 LimitManager.account_available_locked 的判定顺序一致）：
-      disabled > frozen > cooling > model_frozen > auth_failed > checking > available
+    优先级（高→低）：
+      disabled > credential_invalid > quota_exhausted > frozen > cooling
+      > model_frozen > uninitialized > auth_failed > checking > available
 
     互斥：任一时刻账号只落一个状态，由 :meth:`AccountClient.state` 的 if-elif 链保证。
     实时性：每次调用都拿 now 重算 until，账号级 TTL 到期后同一方法会立刻改判——
@@ -620,15 +665,37 @@ class AccountState(str, Enum):
     - model_frozen 表示「账号级未冻，但有部分模型在冻」——承载 per-model 冻结维度，
       具体是哪些模型见结构化 freeze_items（scope=account_model）/ frozen_model_ids()。
     - requesting（_in_flight>0）是瞬时活动标志，与静态状态正交，不并入本枚举。
+    - auth_failed / checking 是**诊断态**（体检结论，可能误判），不参与选路过滤——
+      「状态由冻结决定」：只有冻结类（credential_invalid/quota_exhausted/frozen/cooling）
+      和开关/未初始化才拦路。
+
+    2026-10-20 扩展（docs/channel-error-semantics-design.md）：凭证失效 / 额度耗尽 /
+    未初始化 从「普通永久冻结 + 中文文案」中拆成独立状态；冻结条目带 category 维度
+    （credential/quota/temporary/""），由 spec 抛语义异常（ChannelError 家族）写入。
     """
 
-    DISABLED = "disabled"          # 账号开关关闭 / 未加载（是禁用，不是冻结）
-    FROZEN = "frozen"              # 永久冻结（_freeze_state until=None）
-    COOLING = "cooling"            # 临时冷却（until>now，有剩余秒数）
-    MODEL_FROZEN = "model_frozen"  # 账号级未冻，但部分模型在冻（见 frozen_model_ids）
-    AUTH_FAILED = "auth_failed"    # 认证失败（auth_ok is False）
-    CHECKING = "checking"          # 尚未体检（auth_ok is None）
-    AVAILABLE = "available"        # 可用
+    DISABLED = "disabled"                    # 账号开关关闭 / 未加载（是禁用，不是冻结）
+    CREDENTIAL_INVALID = "credential_invalid"  # 凭证失效：重试无用，只有重新授权能恢复
+    QUOTA_EXHAUSTED = "quota_exhausted"      # 额度耗尽：无到期，签到成功（或请求成功）恢复
+    FROZEN = "frozen"                        # 永久冻结（_freeze_state until=None，普通规则触发）
+    COOLING = "cooling"                      # 临时冷却（until>now，有剩余秒数）
+    MODEL_FROZEN = "model_frozen"            # 账号级未冻，但部分模型在冻（见 frozen_model_ids）
+    UNINITIALIZED = "uninitialized"          # 凭证字段不全（provider.is_init() False）
+    AUTH_FAILED = "auth_failed"              # 认证失败（auth_ok is False；仅诊断，不拦路）
+    CHECKING = "checking"                    # 尚未体检（auth_ok is None；仅诊断，不拦路）
+    AVAILABLE = "available"                  # 可用
+
+
+#: 可参与正常选路的账号状态。选路过滤唯一判据（非此集合即候选剔除）。
+#: - CHECKING 放行：auth_ok 纯内存、重启归 None，拦住 = 重启后全平台无号可选；
+#: - AUTH_FAILED 放行：体检结论可能误判（WAF/抖动），拦了会饿死好号；
+#: - MODEL_FROZEN 账号级放行：只冻了部分模型，具体模型由 is_model_frozen(m) 二维判。
+ROUTABLE_STATES = frozenset({
+    AccountState.AVAILABLE,
+    AccountState.CHECKING,
+    AccountState.AUTH_FAILED,
+    AccountState.MODEL_FROZEN,
+})
 
 
 class FailureWindow:
@@ -807,14 +874,22 @@ class AccountClient:
         lease = result.lease
         if lease is None:
             return result
+        test_probe = bool(getattr(self, "_is_test", False))
         async with self._lock:
             if lease.local_fallback and self.concurrent_limit > 0 and self._in_flight >= self.concurrent_limit:
                 from limits.rules import LimitDecision, LimitReservation
                 return LimitReservation(None, LimitDecision(False, "concurrent_limit"))
             self._limit_leases[lease.lease_id] = lease
             self._lease_context.set((*self._lease_context.get(), lease.lease_id))
-            self._requests.append(time.time())
+            if not test_probe:
+                # 本地频次窗口是评分信号（也喂 last_request_at → 定时检测 skip_if_requested_within），
+                # 测试/探测不计入，避免一次手动测试把该账号下轮探测跳过、污染频率评分。
+                self._requests.append(time.time())
             self._in_flight += 1
+        if test_probe:
+            # 测试/探测只占并发：不写渠道侧 message 配额账本（预占侧 ledger 已在
+            # acquire_account 按 is_test 清零）。
+            return result
         try:
             await self.provider.record_message(model_id, messages)
         except BaseException:
@@ -878,13 +953,19 @@ class AccountClient:
 
     # ── 冻结态：唯一入口 freeze/unfreeze，内部 _freeze_state 桶不对外暴露 ──
     def freeze(self, *, kind: str = "account", model_id: str | None = None,
-               seconds: int | None = 0, reason: str = "", refresh: bool = True) -> bool:
+               seconds: int | None = 0, reason: str = "", refresh: bool = True,
+               category: str = "") -> bool:
         """冻结账号（或账号×模型）。内存为准，Redis 兜底由调用方/广播负责落 key。
 
         kind ∈ {"account", "account_model"}：
           - account：冻结整账号。model_id 被忽略。seconds=None 永久，>0 临时到 now+seconds。
           - account_model：冻结该账号的该模型，账号其他模型不受影响。model_id 必填。
         seconds=0 等价于「不冻结」（无操作）。
+
+        category：冻结类别（""=普通规则冻结 / "credential"=凭证失效 / "quota"=额度耗尽 /
+        "temporary"=临时冻结）。供 status 属性计算账号状态与恢复动作精确匹配
+        （凭证失效只认重新授权、额度耗尽只认签到成功，见 clear_runtime_freeze_on_success）。
+        仅账号级有意义，随桶条目持久化到 Redis。
 
         refresh=False（渠道「失败刷新冻结周期」关）时，若该对象已处于生效冻结中则不改动，
         保留原到期时间。返回是否真的写了冻结态——调用方据此决定要不要落 Redis TTL 与广播，
@@ -901,6 +982,8 @@ class AccountClient:
             if already:
                 return False
         entry = {"until": until, "reason": reason or ""}
+        if category:
+            entry["category"] = category
         if kind == "account_model" and model_id:
             self._freeze_state["models"][model_id] = entry
         else:
@@ -927,14 +1010,21 @@ class AccountClient:
         return changed
 
     def set_freeze_state_raw(self, *, account_until=None, model_untils: dict | None = None,
-                             reason: str = "") -> None:
+                             reason: str = "", category: str = "") -> None:
         """内部/回灌用：直接写桶（从 Redis 兜底回灌时调用，绕过时间戳计算）。
-        account_until: None=永久, float=到期点, 0=没冻。model_untils: {model_id: float|None}。"""
+        account_until: None=永久, float=到期点, 0=没冻。model_untils: {model_id: float|None}。
+        category: 冻结类别（credential/quota/temporary/""），回灌时从 Redis 还原账号状态类别。"""
         if account_until is not None and account_until != 0:
-            self._freeze_state["account"] = {"until": account_until, "reason": reason}
+            entry = {"until": account_until, "reason": reason}
+            if category:
+                entry["category"] = category
+            self._freeze_state["account"] = entry
         if model_untils:
             for mid, u in model_untils.items():
-                self._freeze_state["models"][mid] = {"until": u, "reason": reason}
+                entry = {"until": u, "reason": reason}
+                if category:
+                    entry["category"] = category
+                self._freeze_state["models"][mid] = entry
 
     @property
     def is_frozen(self) -> bool:
@@ -1026,22 +1116,48 @@ class AccountClient:
     def state(self) -> AccountState:
         """账号此刻的规范状态（唯一判据，见 :class:`AccountState`）。
 
-        优先级与 LimitManager.account_available_locked 对齐：禁用先于冻结——
-        账号开关关掉后即便还留着冻结态，它也不参与路由，展示也应说「已禁用」。
+        优先级与 :data:`ROUTABLE_STATES`/LimitManager.account_available_locked 对齐：
+        禁用先于冻结——账号开关关掉后即便还留着冻结态，它也不参与路由，展示也应说「已禁用」。
         永久冻结 vs 临时冷却靠 cooldown_remaining 区分（永久 until=None → 剩余 0）。
+        冻结类别（credential/quota）先于普通 frozen 判定——spec 抛语义异常写入的类别
+        决定展示与恢复语义（凭证失效=等重新授权，额度耗尽=等签到/刷新）。
         账号级冻结优先于模型级：账号级到期后同一次调用就会翻成 model_frozen。
         """
         if self.disabled:
             return AccountState.DISABLED
         if self.is_frozen:
+            category = self.freeze_category
+            if category == "credential":
+                return AccountState.CREDENTIAL_INVALID
+            if category == "quota":
+                return AccountState.QUOTA_EXHAUSTED
             return AccountState.COOLING if self.cooldown_remaining() > 0 else AccountState.FROZEN
         if self.frozen_model_ids():
             return AccountState.MODEL_FROZEN
+        # 未初始化：凭证字段不全（provider.is_init() False）。放在冻结之后——冻结是
+        # 更强的「此刻不可用」结论；未初始化只在无冻结时拦路（与 reserve 现有
+        # provider_not_initialized 口径一致，选路候选阶段补上）。
+        # 没有 is_init 方法（测试桩/第三方 provider）按「已初始化」处理，不误判。
+        is_init = getattr(self.provider, "is_init", None)
+        if callable(is_init):
+            try:
+                if not is_init():
+                    return AccountState.UNINITIALIZED
+            except Exception:  # noqa: BLE001 - is_init 抛错按未初始化处理（保守拦路）
+                return AccountState.UNINITIALIZED
         if self.auth_ok is False:
             return AccountState.AUTH_FAILED
         if self.auth_ok is None:
             return AccountState.CHECKING
         return AccountState.AVAILABLE
+
+    @property
+    def freeze_category(self) -> str:
+        """当前账号级生效冻结的类别（""=普通规则 / credential / quota / temporary）。
+        未冻结返回 ""。"""
+        if not self.is_frozen:
+            return ""
+        return str(self._freeze_state["account"].get("category") or "")
 
     # cooldown_until / cooldown_reason 旧读写点（admin 显示、pubsub、clear_runtime_freeze）
     # 在桶化后仍被多处直接读写，这里做兼容 shim 转发，阶段三清理完外部调用点后删除。
@@ -1270,12 +1386,13 @@ class ProviderPool:
                 if info is None:
                     continue
                 reason = str(info.get("reason") or "")
+                category = str(info.get("category") or "")
                 if info.get("permanent"):
-                    client.freeze(kind="account", seconds=None, reason=reason)
+                    client.freeze(kind="account", seconds=None, reason=reason, category=category)
                 else:
                     until = float(info.get("until") or 0)
                     if until > now:
-                        client.set_freeze_state_raw(account_until=until, reason=reason)
+                        client.set_freeze_state_raw(account_until=until, reason=reason, category=category)
             except Exception:
                 pass
         # 模型级回灌：Redis 是跨重启真相源，内存桶必须从冻结索引重建。
@@ -1290,12 +1407,13 @@ class ProviderPool:
                     if not model:
                         continue
                     reason = str(e.get("reason") or "")
+                    category = str(e.get("category") or "")
                     if e.get("permanent"):
-                        client.freeze(kind="account_model", model_id=model, seconds=None, reason=reason)
+                        client.freeze(kind="account_model", model_id=model, seconds=None, reason=reason, category=category)
                     else:
                         until = float(e.get("until") or 0)
                         if until > now:
-                            client.set_freeze_state_raw(model_untils={model: until}, reason=reason)
+                            client.set_freeze_state_raw(model_untils={model: until}, reason=reason, category=category)
         except Exception:
             logger.exception(f"[{self.provider_name}] 模型级冷却回灌失败")
 
@@ -1470,6 +1588,122 @@ class ProviderPool:
             ))
         except Exception:
             pass
+
+    def apply_channel_error(self, username: str, error, *, model_id: str | None = None) -> str:
+        """语义异常统一收口（ChannelError 家族）：按异常类型改账号状态或声明不冻结。
+
+        错误 → 账号状态的唯一入口。与 apply_freeze_policy 的区别：后者按状态码/响应头
+        匹配渠道规则表（猜），本方法按异常**类型**决定动作（spec 明说）。
+
+        返回:
+        - "freeze"    : 已写账号状态（凭证失效/额度耗尽/临时冻结）
+        - "no_freeze" : 异常声明不改状态（UpstreamTransient/RateLimited/InvalidRequest）
+        - ""          : 非 ChannelError，未处理（调用方回落 apply_freeze_policy 老路径）
+
+        冻结时长优先级（docs/channel-error-semantics-design.md §1）：
+          ① 异常自带 freeze 参数 → 直接执行，**不经过渠道策略时长判断**（refresh_freeze_on_failure
+             也不覆盖——供应商显式意图即终态）；
+          ② 只给 kind → 查渠道 freeze_policy 的 error_kind 规则；
+          ③ 都没有 → 用异常类默认（凭证失效/额度耗尽=无到期，临时冻结=60s）。
+        """
+        from providers.base import ChannelError, CredentialInvalid, QuotaExhausted, TemporaryFreeze
+        if not isinstance(error, ChannelError) or not username:
+            return ""
+        freeze_hint = getattr(error, "freeze", None)
+        reason = summarize_freeze_reason(str(error.detail or "")) or f"channel_error:{error.kind}"
+
+        # 特殊处理类（UpstreamTransient/RateLimited/InvalidRequest）：freeze=False，不改状态。
+        if freeze_hint is False:
+            return "no_freeze"
+
+        # ② 未显式给 freeze → 查渠道 error_kind 规则（管理端可覆盖默认时长/类别）
+        if freeze_hint is None:
+            matched = self._match_error_kind(error.kind)
+            if matched is not None:
+                action = freeze_rule_to_action(
+                    matched.get("freeze_object", "account"),
+                    matched.get("freeze_period", "seconds"),
+                    matched.get("freeze_value", 60))
+                category = self._category_for_kind(error.kind)
+                if action.get("disable"):
+                    # 规则配的是「禁用」（停用账号/渠道）：不写冻结桶，走禁用路径。
+                    scope = action.get("scope") or "account"
+                    if scope not in ("account", "channel"):
+                        return ""
+                    self._apply_disable(scope, username, reason)
+                    self._notify_freeze(scope, username, None, 0, reason, permanent=False, disabled=True)
+                    return "freeze"
+                seconds = None if action.get("permanent") else action.get("seconds", 60)
+                if action.get("scope") == "account_model" and model_id:
+                    # 规则要求只冻该账号的某个模型（账号级仍可用）。
+                    return self._apply_model_state(username, model_id, seconds, reason, category)
+                return self._apply_account_state(username, seconds, reason, category)
+            # 规则表也没配 → ③ 用类默认
+            category = self._category_for_kind(error.kind)
+            default = {"credential": None, "quota": None, "temporary": 60}.get(category, 60)
+            return self._apply_account_state(username, default, reason, category)
+
+        # ① 显式 freeze：供应商指定即终态（不被渠道策略时长判断覆盖）
+        seconds = freeze_hint.get("seconds")
+        category = self._category_for_kind(error.kind)
+        hint_model = freeze_hint.get("model_id")
+        if hint_model:
+            # 显式要求只冻该账号的某个模型（账号级仍可用）
+            return self._apply_model_state(username, hint_model, seconds, reason, category,
+                                           respect_refresh=False)
+        return self._apply_account_state(username, seconds, reason, category, respect_refresh=False)
+
+    def _apply_model_state(self, username: str, model_id: str, seconds: int | None, reason: str,
+                           category: str, *, respect_refresh: bool = True) -> str:
+        """语义冻结落到「账号 × 模型」维度（账号级仍可选，具体模型被挡）。"""
+        changed = self._freeze_account_model(
+            username, model_id, seconds, reason,
+            refresh=True if not respect_refresh else None)
+        if not changed:
+            return "no_freeze"
+        logger.warning(f"[{self.provider_name}] 账号 {username} 模型 {model_id} 语义冻结 "
+                       f"category={category or 'normal'} seconds={seconds} 原因: {reason}")
+        return "freeze"
+
+        # ① 显式 freeze：供应商指定即终态
+        seconds = freeze_hint.get("seconds")
+        category = self._category_for_kind(error.kind)
+        return self._apply_account_state(username, seconds, reason, category, respect_refresh=False)
+
+    def _apply_account_state(self, username: str, seconds: int | None, reason: str,
+                             category: str, *, respect_refresh: bool = True) -> str:
+        """把语义异常的冻结动作落到账号（内存桶 + Redis + 广播），类别带进去。
+
+        respect_refresh=False（供应商显式指定时长）→ 强制 refresh=True 覆盖既有到期时间，
+        即「终态，不被渠道失败刷新逻辑改」。"""
+        client = next((c for c in self.clients if c.username == username), None)
+        if client is None:
+            return ""
+        self._freeze_account(client, seconds, reason, category=category,
+                             refresh=True if not respect_refresh else None)
+        logger.warning(f"[{self.provider_name}] 账号 {username} 语义冻结 "
+                       f"category={category or 'normal'} seconds={seconds} 原因: {reason}")
+        return "freeze"
+
+    @staticmethod
+    def _category_for_kind(kind: str) -> str:
+        """异常 kind → 冻结类别（status 属性据此判账号状态）。"""
+        return {
+            "credential_invalid": "credential",
+            "quota_exhausted": "quota",
+            "temporary_freeze": "temporary",
+        }.get(kind, "")
+
+    def _match_error_kind(self, kind: str) -> dict | None:
+        """查渠道 freeze_policy 里 condition="error_kind" 的规则。没有返回 None。"""
+        return self._match_error_kind_from_policy(kind)
+
+    def _match_error_kind_from_policy(self, kind: str) -> dict | None:
+        try:
+            policy = get_effective_provider_policy_sync(self.provider_name)
+        except Exception:
+            return None
+        return match_freeze_rules(policy.get("freeze_policy"), error_kind=kind)
 
     def apply_freeze_policy(self, username: str, status_code: int | None = None, headers: dict | None = None, model_id: str | None = None, reason: str | None = None, exception: bool = False, error_code: str | None = None) -> str:
         """根据 freeze_policy 规则评估是否冻结该账号。
@@ -1680,46 +1914,64 @@ class ProviderPool:
             dedupe_window_seconds=3600 if (permanent or disabled) else 300,
         )
 
-    def _freeze_account(self, client, seconds: int | None, reason: str, *, refresh: bool | None = None) -> bool:
+    def _freeze_account(self, client, seconds: int | None, reason: str, *, refresh: bool | None = None,
+                        category: str = "") -> bool:
         """冻结单账号：内存桶 + Redis 兜底 + pubsub 广播。seconds=None 永久冻结。
 
         refresh 缺省读取渠道「失败刷新冻结周期」；关时已冻结账号保留原 TTL，且不再写 Redis/广播。
         永久冻结等升级动作可显式传 refresh=True。
+        category（credential/quota/temporary/""）随冻结落桶与 Redis，供 status 属性
+        判账号状态（凭证失效/额度耗尽/临时冻结）；语义异常路径必带，规则表路径为空。
         """
         should_refresh = self.freeze_refresh_on_failure() if refresh is None else bool(refresh)
-        changed = client.freeze(kind="account", seconds=seconds, reason=reason, refresh=should_refresh)
+        changed = client.freeze(kind="account", seconds=seconds, reason=reason,
+                                refresh=should_refresh, category=category)
         if not changed:
             return False
-        asyncio.create_task(RedisLimitBackend.set_account_cooldown(
-            self.provider_name, client.username, seconds, reason))
-        self._broadcast_cooldown(client.username, model_id=None, seconds=seconds, reason=reason)
+        # Redis 清除是 I/O，仅在有事件循环时调度（同步单测无 loop 时纯内存清除即可）。
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(RedisLimitBackend.set_account_cooldown(
+                self.provider_name, client.username, seconds, reason, category))
+        except RuntimeError:
+            pass
+        self._broadcast_cooldown(client.username, model_id=None, seconds=seconds, reason=reason,
+                                 category=category)
         return True
 
-    def _freeze_account_model(self, username: str, model_id: str, seconds: int | None, reason: str, *, refresh: bool | None = None) -> bool:
+    def _freeze_account_model(self, username: str, model_id: str, seconds: int | None, reason: str, *, refresh: bool | None = None, category: str = "") -> bool:
         """冻结账号+模型：内存桶 + Redis 兜底 + pubsub 广播。seconds=None 永久冻结。
 
         Redis SET 必须先于广播完成：接收端（含本实例自收自发）靠读 Redis 落桶，
         若广播先到、SET 未落地，会读到 None 而误清，导致月底冻结被重新选中。
+        category（credential/quota/temporary/""）随冻结落桶与 Redis，语义异常路径必带。
         """
         client = next((c for c in self.clients if c.username == username), None)
         should_refresh = self.freeze_refresh_on_failure() if refresh is None else bool(refresh)
         if client is not None:
             changed = client.freeze(
-                kind="account_model", model_id=model_id, seconds=seconds, reason=reason, refresh=should_refresh,
+                kind="account_model", model_id=model_id, seconds=seconds, reason=reason,
+                refresh=should_refresh, category=category,
             )
             if not changed:
                 return False
-        asyncio.create_task(self._freeze_account_model_async(username, model_id, seconds, reason))
+        # Redis 兜底是 I/O，仅在有事件循环时调度（同步单测无 loop 时纯内存清除即可）。
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(self._freeze_account_model_async(username, model_id, seconds, reason, category))
+        except RuntimeError:
+            pass
         return True
 
-    async def _freeze_account_model_async(self, username: str, model_id: str, seconds: int | None, reason: str) -> None:
+    async def _freeze_account_model_async(self, username: str, model_id: str, seconds: int | None, reason: str, category: str = "") -> None:
         """先写 Redis（权威），再广播；保证事件到达时 Redis 已有 key。"""
         try:
             await RedisLimitBackend.set_account_model_cooldown(
                 self.provider_name, username, model_id, seconds, reason)
         except Exception:
             pass
-        self._broadcast_cooldown(username, model_id=model_id, seconds=seconds, reason=reason)
+        self._broadcast_cooldown(username, model_id=model_id, seconds=seconds, reason=reason,
+                                 category=category)
 
     def _apply_fallback_cooldown(self, username: str, seconds: int, reason: str, model_id: str | None) -> None:
         """兜底冷却：有 model_id 时只冻结账号+模型，否则退回整账号冷却。"""
@@ -1734,16 +1986,22 @@ class ProviderPool:
         else:
             self.mark_account_cooldown(username, seconds, reason)
 
-    def _broadcast_cooldown(self, username: str, model_id: str | None, seconds: int | None, reason: str) -> None:
+    def _broadcast_cooldown(self, username: str, model_id: str | None, seconds: int | None, reason: str,
+                            category: str = "") -> None:
         try:
             import runtime_sync
             # 接收端以 Redis 为权威、忽略此 until 字段；permanent(seconds=None) 时置 None，仅作信号。
             until = None if seconds is None else (time.time() + seconds)
+            asyncio.get_running_loop()
+        except Exception:
+            return  # 无事件循环（同步单测）或 runtime_sync 不可用：跳过广播
+        try:
             asyncio.create_task(runtime_sync.publish(
                 runtime_sync.EVENT_COOLDOWN,
                 f"{self.provider_name}:{username}",
                 extra={"provider": self.provider_name, "username": username,
-                       "model_id": model_id, "until": until, "reason": reason},
+                       "model_id": model_id, "until": until, "reason": reason,
+                       "category": category},
             ))
         except Exception:
             pass
@@ -1799,10 +2057,13 @@ class ProviderPool:
                 c.auth_checked_at = time.time()
                 c.auth_error = "初始化超时"
                 logger.error(f"{self.provider_name} 账号 {c.username} 初始化超时")
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - 单账号失败不阻断整轮体检
                 c.auth_ok = False
                 c.auth_checked_at = time.time()
                 c.auth_error = "初始化失败"
+                # 探测与真请求同权：spec 抛语义异常（ChannelError）同样改账号状态，
+                # 不再「体检失败只写 auth_ok、账号照样被选中白撞」。
+                self._apply_channel_error_from_exception(c, exc)
                 # 通知走统一事件域：是否进通知中心/webhook 由订阅配置决定，
                 # 这里只负责产生事件，绝不直接写 notifications 表。
                 from user_platform.notify_core import emit_notification_background
@@ -1826,6 +2087,17 @@ class ProviderPool:
                 logger.error(f"{self.provider_name} 账号 {c.username} 初始化失败: {traceback.format_exc()}")
             if use_invitation_interval:
                 await asyncio.sleep(c.provider.invitation_interval)
+
+    def _apply_channel_error_from_exception(self, client, exc: Exception) -> None:
+        """把探测/初始化阶段抛出的 ChannelError 喂进统一收口（探测与请求同权）。
+        非 ChannelError 一律忽略，保持现有「只写 auth_ok」行为。"""
+        from providers.base import ChannelError
+        if not isinstance(exc, ChannelError):
+            return
+        try:
+            self.apply_channel_error(client.username, exc)
+        except Exception:  # noqa: BLE001 - 收口失败不能阻断体检循环
+            logger.warning(f"[{self.provider_name}] 探测异常收口失败: {exc}")
 
     async def clean_message(self, max_age_hours):
         for c in self.clients:
@@ -1902,6 +2174,21 @@ class ProviderPool:
                 )
 
 
+# 上游模型条目里的「窗口数据」字段别名 → 平台字段名。各家命名不统一：OpenAI 兼容渠道
+# 把窗口放在模型条目顶层（context_length / max_input_tokens），代码渠道多塞在自建的
+# metadata 里（context_window / max_tokens）。别名清单与
+# server/model_metadata_auto_import.py 的 _CHANNEL_FIELD_ALIASES、前端 ModelMetadata
+# 的 normalizeUpstreamItem 同口径，改一处要同步改三处。
+_WINDOW_CONTEXT_KEYS = (
+    "max_context_tokens", "context_length", "context_window",
+    "context_window_tokens", "input_token_limit", "max_input_tokens",
+)
+_WINDOW_OUTPUT_KEYS = (
+    "max_tokens", "max_output_tokens", "output_limit",
+    "output_token_limit", "max_completion_tokens",
+)
+
+
 class ModelClientPool:
     """模型客户端池 - 一个模型可有多个提供商"""
 
@@ -1917,6 +2204,16 @@ class ModelClientPool:
     # 模型 TPM 固定窗口触线镜像：model -> 到期时间戳。选路只读内存，Redis 仅在 token 回写时累加。
     _model_tpm_cooldowns: dict[str, float] = {}
     _model_rr_index: dict[str, int] = {}  # model_id -> 轮询索引
+    # 定时同步「连续两轮缺失才删行」的观察位：provider -> 上一轮不在上游列表的 upstream_model_id 集合。
+    # 见 refresh_models 内 to_remove 计算处的注释——单轮缺失可能是多账号轮询/上游抖动，删行会连带
+    # 抹掉管理员手填的 extra_config（max_context_tokens 等），故缺失要先观察一轮。
+    _model_sync_absent: dict[str, set[str]] = {}
+    # 定时同步删行时的「手填配置墓碑」：provider -> {upstream_model_id: (删除时间戳, 用户非下划线 extra_config, 删除时的 model_id)}。
+    # 模型再回来走 to_add 时复活手填值**和手改名**（防 ≥3 账号轮询时仅部分账号可见的模型
+    # 连缺两轮被删后丢配置；防「规则改版后不再命中 → 删行 → 回来重建」把手填名冲回规则名）。
+    # 带 TTL：真·永久下线的墓碑到期清掉，不无限堆积。
+    _model_sync_deleted_extra: dict[str, dict[str, tuple[float, dict, str]]] = {}
+    MODEL_SYNC_TOMBSTONE_TTL_SECONDS = 7 * 24 * 3600  # 墓碑保留 7 天：模型 7 天内回来就复活配置
     _channel_scores: dict[str, dict] = {}
     _provider_billing_mode: dict[str, str] = {}  # provider_name -> "token" | "request"
     # Header 模板库缓存：id -> headers(dict)；由 admin 写入后失效，provider 运行时读
@@ -2116,11 +2413,11 @@ class ModelClientPool:
 
     @classmethod
     def _is_regex_hit(cls, provider_name: str, raw_model_id: str) -> bool:
-        """规则是否命中了这个模型——命中即 is_regex=True，导入/自动更新时保留。
+        """规则是否命中了这个模型——命中即该模型保留（定时同步的过滤条件）。
 
         两种命中：改写规则改了名字（只切 owner/ 前缀不算，那是无配置时的默认
-        形态），或「只搜索」规则命中了全量名。前端「预览过滤结果」开关只是预览
-        这个标记；数据层过滤（手动导入、自动更新）都用它，两处不能各写各的判定。
+        形态），或「只搜索」规则命中了全量名。这是**内部判定**，不再作为字段发给
+        前端——前端按「勾选过滤与否」二选一显示 model_id / regex_model_id 即可。
         """
         pool = cls.get_provider_pool(provider_name)
         channel = getattr(pool, "channel", None) if pool else None
@@ -2131,40 +2428,99 @@ class ModelClientPool:
             return True
         return channel.matches_search_rules(raw_model_id)
 
-    @classmethod
-    def _resolve_target_model_id(
-        cls,
-        provider_name: str,
-        upstream_id: str,
-        raw_model_id: str,
-        tracked_map: dict,
-    ) -> str:
-        """决定这个上游模型对外应该叫什么——改写与落库的唯一判定入口。
+    @staticmethod
+    def _display_info_from_row(row: dict) -> dict:
+        """取上游模型行里 spec 声明的「其他信息」展示键（_ 前缀标量，如 _model_desc）。
 
-        流程（与改写规则的语义同源）：拉到上游列表 → 过一遍改写规则得出目标名
-        → 看目标名在本渠道是否已被占用 → 占了就不动，没占就用改写结果。
+        下划线前缀 = 展示专用快照：落进 extra_config 后不会进 apply_extra_config_overrides
+        的出站注入（出站侧跳过 _ 前缀），只给管理端「其他信息」列渲染。
 
-        存在性判断落在**改写后**的名字上，而不是拿上游原始 ID 去查 tracked_map。
-        老写法只要这个 upstream_id 在库里整行就跳过改写，规则于是只对全新模型
-        生效——改一版规则想让已入库的 xxx:free 变成真实名字做不到。
-
-        但重算只在渠道**配了规则**时才发生：切 owner/ 前缀是无配置时的默认形态，
-        不是规则。若不加这道闸，没配规则的渠道每轮定时同步都会把管理端里的手工
-        改名（如 acme/kept → custom-kept）冲回默认形态 kept。
-
-        撞名不让位：渠道的 model_id 只有普通索引、本来允许多个同名，deepseek-v4-flash-free
-        改名后和原版 deepseek-v4-flash 撞成同名是正常的——两行 upstream_model_id 不同，
-        各自一房。早期实现为了「避免撞名」让后到的行退回只切前缀，反而让规则改不生效，
-        与「规则搜到就改名保留」的意图相悖，已删。
+        **_cost_multiplier 不在这里返回**：倍率已提升为 provider_models.cost_multiplier
+        独立列（见 _cost_multiplier_from_row），落库走列不走 extra_config，避免重拉上游
+        时被 mergeUpstreamInfoIntoExtra 整组覆盖掉手填值。
         """
-        current = tracked_map.get(upstream_id)
-        if current is not None and not cls._channel_has_rewrite_rules(provider_name):
-            # 已跟踪 + 无规则：库里的值就是真相，手工改名不被默认形态冲掉。
-            return current
-        rewritten = cls._public_model_id(provider_name, raw_model_id)
-        if rewritten == current:
-            return rewritten
-        return rewritten
+        return {
+            k: v for k, v in row.items()
+            if isinstance(k, str) and k.startswith("_")
+            and k != "_cost_multiplier"
+            and isinstance(v, (str, int, float, bool))
+        }
+
+    @staticmethod
+    def _cost_multiplier_from_row(row: dict) -> float | None:
+        """从上游模型行抽积分倍率（独立列 cost_multiplier 的取值口径）。
+
+        spec 先不改：仍在模型条目顶层带 ``_cost_multiplier`` 下划线键（loomy/codebuddy/
+        codearts 都是 spec 自己抠出来的数值）。这里把它提成为独立字段，落库进
+        provider_models.cost_multiplier 列，不再塞 extra_config。OpenAI 兼容渠道若在
+        raw 里带驼峰 costMultiplier 也兜底认一下。取值顺序：行顶层 _cost_multiplier →
+        行顶层 cost_multiplier → raw.costMultiplier。只认有限数值；bool 不算（True==1）。
+        """
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else None
+        for value in (
+            row.get("_cost_multiplier"),
+            row.get("cost_multiplier"),
+            raw.get("costMultiplier") if raw else None,
+        ):
+            if value is None or isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    continue
+                try:
+                    return float(text)
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _window_number(value) -> int | None:
+        """窗口字段取值：只认正整数。0/负数是上游的「未知」占位（codearts 没给就是 0），
+        字符串容忍 "1,000,000" 这类带分隔符写法；bool 不算数（True==1 会误判成 1 token）。"""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            num = int(value)
+            return num if num > 0 else None
+        if isinstance(value, str):
+            text = value.strip().replace(",", "").replace("_", "")
+            try:
+                num = int(float(text))
+            except ValueError:
+                return None
+            return num if num > 0 else None
+        return None
+
+    @classmethod
+    def _window_info_from_model(cls, model: dict) -> dict:
+        """从上游模型条目抽窗口数据（max_context_tokens / max_tokens）。
+
+        管理端「编辑模型 → 同步上游数据」的唯一取值口径。扫描顺序：条目顶层 → 条目
+        metadata → raw.metadata → raw，第一个正数即停（代码渠道把窗口写在 metadata，
+        custom/OpenAI 兼容渠道写在顶层或 raw 原文，两种形态都要捞得到）。
+        捞不到返回空 dict——由前端提示「上游未提供」，这里不猜、不用目录值兜底。
+        """
+        candidates: list[dict] = [model]
+        raw = model.get("raw") if isinstance(model.get("raw"), dict) else None
+        for nested in (model.get("metadata"), raw.get("metadata") if raw else None):
+            if isinstance(nested, dict):
+                candidates.append(nested)
+        if raw:
+            candidates.append(raw)
+        info: dict = {}
+        for field, keys in (("max_context_tokens", _WINDOW_CONTEXT_KEYS), ("max_tokens", _WINDOW_OUTPUT_KEYS)):
+            for source in candidates:
+                for key in keys:
+                    value = cls._window_number(source.get(key))
+                    if value is not None:
+                        info[field] = value
+                        break
+                if field in info:
+                    break
+        return info
 
     @classmethod
     def _build_upstream_model_rows(
@@ -2175,31 +2531,57 @@ class ModelClientPool:
     ) -> list[dict]:
         """把上游模型列表整形成带规则判定的行；管理端拉取与定时同步共用。
 
-        每行的 is_regex / regex_model_id 就是规则判定的唯一结果：管理端「预览过滤
-        结果」读它，定时同步也读它。两处共用一份计算，预览看到的过滤与改名就是真正
-        落库的结果，不会各写一套判定再漂移。
+        每行三个字段，取值只有一条规则——**在不在库里决定一切**：
+
+        - upstream_model_id：上游原始 id（行主键，永不变）。
+        - model_id：已入库 = 库内现名；未入库 = 切 owner/ 前缀（不套规则）。
+        - regex_model_id：已入库 = 库内现名；未入库且配了规则 = 套规则后的名字；
+          未入库且没配规则 = model_id 的取值（退化回切前缀）。
+
+        已入库行两字段恒等（都是库内名）——所以无论走哪个字段，定时同步都不会
+        把管理端的手工改名冲掉。前端按「有没有勾选过滤」二选一显示/落库，配了规则
+        时两字段才有区别，没配规则时完全同值。
         """
         rows: list[dict] = []
+        has_rules = cls._channel_has_rewrite_rules(provider_name)
         for model in models:
             upstream_id, public_model_id = cls._provider_model_mapping(model)
             if not upstream_id:
                 continue
-            # 纯规则结果（切前缀 + 套规则），供前端判「这行有没有被规则命中」。
-            regex_model_id = cls._public_model_id(provider_name, public_model_id)
-            # 命中规则 = 规则改了名字；只切前缀不算（那是无配置时的默认形态）。
+            tracked = upstream_id in tracked_map
             is_regex = cls._is_regex_hit(provider_name, public_model_id)
-            # 落库用的目标名：规则搜到就改名，撞名无所谓（渠道允许多个同名）。
-            rewritten_model_id = cls._resolve_target_model_id(
-                provider_name, upstream_id, public_model_id, tracked_map)
+            if tracked:
+                # 库里有这行：两个名字都是库内现名，规则只作用于新进模型，不追溯改名。
+                model_id = regex_model_id = tracked_map[upstream_id]
+            else:
+                # 新行：model_id 只切前缀；配了规则时 regex_model_id 再套一遍规则。
+                model_id = strip_model_owner_prefix(public_model_id)
+                regex_model_id = cls._public_model_id(provider_name, public_model_id) if has_rules else model_id
+            # 下划线前缀的展示键：spec 在模型条目顶层塞的、给管理端模型列表「其他信息」
+            # 列用的附加信息（如 codebuddy/codearts 的 _model_desc）。原样透传给前端，
+            # 前端落库进 extra_config 快照；下划线前缀避开 apply_extra_config_overrides
+            # 的出站注入（绝不污染发往上游的请求体）。
+            # 取值口径与定时同步落库共用 _display_info_from_row（两处必须是同一份定义）。
+            extra_info = cls._display_info_from_row(model)
+            # 积分倍率是独立列：spec 顶层 _cost_multiplier → 行顶层 cost_multiplier
+            # （非下划线键，不会被收进 extra_config 展示快照）。上游没声明就不带这个键，
+            # 前端据此保留库内手填值，不臆造 1.0。
+            cost_multiplier = cls._cost_multiplier_from_row(model)
             rows.append({
                 "upstream_model_id": upstream_id,
-                "model_id": rewritten_model_id,
-                "raw_model_id": public_model_id,
+                "model_id": model_id,
                 "regex_model_id": regex_model_id,
                 "is_regex": is_regex,
                 "name": model.get("name") or public_model_id or upstream_id,
-                "tracked": upstream_id in tracked_map,
-                "current_model_id": rewritten_model_id,
+                # 窗口数据（max_context_tokens / max_tokens）：上游条目有声明才带，
+                # 供管理端「编辑模型 → 同步上游数据」回填表单。非下划线键 = 不会被
+                # _display_info_from_row 落进 extra_config，定时同步路径零影响。
+                **cls._window_info_from_model(model),
+                # 展示键（spec 声明、框架透传、前端落 extra_config 快照；取不到就不显示）。
+                **extra_info,
+                # 积分倍率（独立列，落 provider_models.cost_multiplier）。只有上游真声明
+                # 了才带键——前端按「有键才覆盖」处理手填值。
+                **({"cost_multiplier": cost_multiplier} if cost_multiplier is not None else {}),
                 # Provider implementations may expose the original upstream
                 # payload under raw; the base/custom provider path keeps it at
                 # the model root, so preserve that metadata instead of
@@ -2549,8 +2931,9 @@ class ModelClientPool:
     async def scheduled_test_loop(cls):
         """定时渠道检测：按各渠道 scheduled_test 配置到点跑一次 /accounts/test 同款流程。
 
-        走 is_probe 模式：与手动测试一样绕过选路/预占（冻结键不拦探测），但失败时按正常
-        请求语义记健康度 + 冻结。是否按新周期刷新已冻结对象的 TTL 由渠道级冻结策略
+        走 is_probe 模式：与手动测试一样照常占每账号并发槽位（只不写 RPM/TPM 账本、
+        冻结键不拦探测），失败时按正常请求语义记健康度 + 冻结。是否按新周期刷新已冻结对象的
+        TTL 由渠道级冻结策略
         freeze_policy.refresh_freeze_on_failure 在冻结写入点判定，与请求模式无关，本循环不再透传。
         成功会解除临时或永久冻结（clear_runtime_freeze_on_success），
         但绝不改账号 switch / 渠道 enabled；禁用对象不会进入定时检测。与 check_account_loop
@@ -3005,66 +3388,44 @@ class ModelClientPool:
 
     @classmethod
     def _groups_index_from_loaded_data(cls, by_id: dict, default: dict, enabled_groups: dict) -> dict:
-        try:
-            default_max = int(default.get("max_tokens") or 0)
-        except (TypeError, ValueError):
-            default_max = 0
         groups_by_id: dict = {}
         for name, group in (enabled_groups or {}).items():
-            metadata_model = str(group.get("metadata_model") or "").strip()
-            best_record = by_id.get(metadata_model) if metadata_model else None
-            best_max = None
-            members = [m for m in group.get("models", []) if isinstance(m, str) and m]
-            if best_record is None:
-                for member in members:
-                    record = by_id.get(member)
-                    if not record:
-                        continue
-                    try:
-                        eff = int(record.get("max_tokens") or default_max or 0)
-                    except (TypeError, ValueError):
-                        eff = default_max
-                    if best_record is None or eff < best_max:
-                        best_record = record
-                        best_max = eff
-            if best_record is not None:
-                groups_by_id[name] = {k: v for k, v in best_record.items() if k != "model_id"}
-            # 别名继承同组 same best_record
+            computed = model_catalog.compute_group_metadata(
+                group.get("models"),
+                group.get("metadata_model"),
+                group.get("metadata_mode"),
+                by_id,
+                default,
+            )
+            if computed is None:
+                continue
+            groups_by_id[name] = dict(computed)
+            # 别名继承同组同一份元数据（重名先到先得）。
             for alias in group.get("aliases", []) or []:
                 if isinstance(alias, str) and alias and alias != name and alias not in groups_by_id:
-                    if best_record is not None:
-                        groups_by_id[alias] = {k: v for k, v in best_record.items() if k != "model_id"}
+                    groups_by_id[alias] = dict(computed)
         return groups_by_id
 
     @classmethod
-    def _apply_group_member_min_tokens_from_indices(cls, item: dict, members: list[str], by_id: dict, groups_by_id: dict) -> None:
+    def _apply_group_token_aggregate_from_indices(cls, item: dict, group: dict, members: list[str], by_id: dict, groups_by_id: dict) -> None:
+        # 按取值模式（min/max/avg/model）对 max_tokens / max_context_tokens 聚合；
+        # model 模式或 metadata_model 命中时直接用该真实模型原值，不聚合。
+        computed = model_catalog.compute_group_metadata(
+            members,
+            group.get("metadata_model"),
+            group.get("metadata_mode"),
+            by_id,
+        )
+        if not computed:
+            return
         for field in ("max_tokens", "max_context_tokens"):
-            values = []
-            for member in members:
-                metadata, _ = cls._metadata_for_model(member, by_id, groups_by_id)
-                try:
-                    value = int(metadata.get(field) or 0)
-                except (TypeError, ValueError):
-                    value = 0
-                if value > 0:
-                    values.append(value)
-            if values:
-                item[field] = min(values)
+            if computed.get(field) is not None:
+                item[field] = computed[field]
 
     @classmethod
-    async def _apply_group_member_min_tokens(cls, item: dict, members: list[str]) -> None:
-        for field in ("max_tokens", "max_context_tokens"):
-            values = []
-            for member in members:
-                metadata, _ = await get_model_metadata(member)
-                try:
-                    value = int(metadata.get(field) or 0)
-                except (TypeError, ValueError):
-                    value = 0
-                if value > 0:
-                    values.append(value)
-            if values:
-                item[field] = min(values)
+    async def _apply_group_token_aggregate(cls, item: dict, group: dict, members: list[str]) -> None:
+        by_id = {model_id: _mutable(record) for model_id, record in model_catalog.current_snapshot().metadata.items()}
+        cls._apply_group_token_aggregate_from_indices(item, group, members, by_id, {})
 
     @classmethod
     async def _build_models_from_routes(cls, snapshot=None) -> list[dict]:
@@ -3118,10 +3479,9 @@ class ModelClientPool:
                 item["remark"] = remark
                 item["name"] = remark
             cls._apply_metadata_from_indices(item, by_id, groups_by_id)
-            # 仅当未显式指定「模型元数据」来源时，才按成员逐字段取最小值；
-            # 显式指定时直接采用该模型的原值，不做最小值折算。
-            if not str(group.get("metadata_model") or "").strip():
-                    cls._apply_group_member_min_tokens_from_indices(item, members, by_id, groups_by_id)
+            # 按取值模式（min/max/avg/model）聚合 max_tokens / max_context_tokens。
+            # model 模式或 metadata_model 命中时直接用该真实模型原值。
+            cls._apply_group_token_aggregate_from_indices(item, group, members, by_id, groups_by_id)
             model_list.append(item)
         return model_list
 
@@ -3398,14 +3758,40 @@ class ModelClientPool:
                 return True
         return False
 
+    @staticmethod
+    def _reset_models_fetch_proxy_decision() -> None:
+        """拉模型前清掉上一次出站的代理决策——ContextVar 是 task 级的，
+        不清就会把同一 task 里更早的认证/探测出站当成「本次拉模型的代理」。"""
+        try:
+            from providers.proxy_manager import reset_outbound_proxy
+            reset_outbound_proxy()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _models_fetch_proxy_decision() -> dict | None:
+        """读取 ProxyManager 在真正出站前记下的代理决策（mode/proxy_config_id/前缀），
+        供管理端排查「改了账号代理，拉模型到底走没走代理」。未出站（静态列表）返回 None。"""
+        try:
+            from providers.proxy_manager import take_outbound_proxy
+            return take_outbound_proxy()
+        except Exception:
+            return None
+
     @classmethod
-    async def fetch_provider_upstream_models(cls, provider_name: str) -> dict:
+    async def fetch_provider_upstream_models(cls, provider_name: str, account_username: str = "") -> dict:
         """打上游拉全量模型列表，与 provider_models 表中该渠道已有行做 join，供管理端选择导入。
 
         每行同时返回：
-          model_id = 套用改写规则后的短名（去 owner/ 前缀 + 规则替换）
-          raw_model_id = 原始上游模型名（未经任何处理）
-        前端可通过开关在两者间切换显示，无需重新拉取上游。
+          model_id = 库内现名（已入库时）；未入库时是去 owner/ 前缀的短名
+          regex_model_id = 库内现名（已入库时）；未入库且配了规则时是套规则后的名字，
+                        没配规则时与 model_id 同值
+          is_regex = 规则是否命中这行（前端预览据此滤行，定时同步也用它筛）
+        前端可通过开关在 model_id / regex_model_id 间切换显示，无需重新拉取上游。
+
+        ``account_username`` 非空 = 只用这个账号（管理端「重新获取」按钮：上一步显示的
+        就是它，重取必须还用它，否则换号后拉到的列表与用户看到的账号名对不上）。
+        该账号取不到（禁用/初始化失败）时直接报错，不静默换号。
         """
         pool = cls.get_provider_pool(provider_name)
         if not pool:
@@ -3413,7 +3799,37 @@ class ModelClientPool:
         if not pool.clients:
             raise HTTPException(status_code=400, detail=f"渠道 '{provider_name}' 未配置任何账号")
 
-        client = await pool.get_initialized_provider()
+        wanted = (account_username or "").strip()
+        # 本次实际用来拉列表的账号：get_initialized_provider 是轮询挑号，调用方
+        # 无从预知，只能在这里回读。账号多的渠道排查「拉到的模型不对/少了」时，
+        # 前端要显示到底是哪个账号干的（备注优先，见 _account_display_name）。
+        used_username = ""
+        client = None
+        if wanted:
+            for c in pool.clients:
+                if str(c.username or "").strip() != wanted:
+                    continue
+                if not c.provider.is_init():
+                    try:
+                        await asyncio.wait_for(c.provider.init_auth(False), timeout=30)
+                    except asyncio.TimeoutError:
+                        raise HTTPException(status_code=503, detail=f"账号 '{wanted}' 初始化超时，请稍后重试")
+                    except Exception as e:
+                        raise HTTPException(status_code=503, detail=f"账号 '{wanted}' 初始化失败: {e}")
+                if not c.provider.is_init():
+                    raise HTTPException(status_code=503, detail=f"账号 '{wanted}' 未完成初始化，请重新登录后再试")
+                c.auth_ok = True
+                c.auth_checked_at = time.time()
+                c.auth_error = ""
+                client = c.provider
+                used_username = str(c.username or "")
+                break
+            if client is None:
+                raise HTTPException(status_code=400, detail=f"渠道 '{provider_name}' 下找不到账号 '{wanted}'")
+        else:
+            client = await pool.get_initialized_provider()
+            if client is not None:
+                used_username = str(getattr(client, "username", "") or "")
         if client is None:
             # 定时 init 失败/被跳过（渠道禁用、账号 switch off、登录一次性失败）后池里可能没有
             # 已初始化账号；拉模型列表属 Path A（bypass 渠道/账号开关），先按需兜底初始化，
@@ -3429,6 +3845,7 @@ class ModelClientPool:
                         c.auth_checked_at = time.time()
                         c.auth_error = ""
                         client = c.provider
+                        used_username = str(c.username or "")
                         break
                 except asyncio.TimeoutError:
                     last_init_error = "初始化超时"
@@ -3449,17 +3866,19 @@ class ModelClientPool:
                 detail += f"，最后错误: {last_init_error}"
             raise HTTPException(status_code=503, detail=detail)
 
+        # 标记只代表本次调用的结果，调用前清掉上一轮残留。
+        client._last_fetch_models_error = ""
+        cls._reset_models_fetch_proxy_decision()
         models = await client.fetch_upstream_model_list()
         if not models:
             fetch_err = getattr(client, "_last_fetch_models_error", "") or ""
             if fetch_err:
-                # 上游真的请求失败（网络/HTTP 错误）：502
+                # 上游真的请求失败（网络/超时/HTTP 错误/格式不符）：502
                 logger.warning(f"[{provider_name}] 上游模型列表获取失败: {fetch_err}")
                 raise HTTPException(status_code=502, detail=f"上游模型列表获取失败: {fetch_err}")
-            # 上游返回 200 但无可导入模型（例如全部被策略过滤、或上游列表为空）：
-            # 返回空列表给前端，不报错，由前端提示“无可用模型”。
-            logger.info(f"[{provider_name}] 上游返回 200 但模型列表为空，返回空列表给前端")
-            return {"provider": provider_name, "upstream_models": []}
+            # 上游正常返回空列表（本次没有模型）：返回空列表给前端，不报错。
+            logger.info(f"[{provider_name}] 上游返回空模型列表，返回空列表给前端")
+            return {"provider": provider_name, "account": used_username, "upstream_models": []}
 
         existing_rows = await PostgresClient.list_provider_models(provider_name)
         # provider_models 行以 upstream_model_id 为键
@@ -3467,6 +3886,7 @@ class ModelClientPool:
 
         return {
             "provider": provider_name,
+            "account": used_username,
             "upstream_models": cls._build_upstream_model_rows(provider_name, models, tracked_map),
         }
 
@@ -3507,10 +3927,28 @@ class ModelClientPool:
                     client = await pool.get_initialized_provider()
                     if client is None:
                         continue
+                    # 标记只代表本次调用的结果，调用前清掉上一轮残留（代码渠道的
+                    # fetch_models 由作者实现，不一定成功时清空）。
+                    client._last_fetch_models_error = ""
+                    cls._reset_models_fetch_proxy_decision()
                     upstream = await client.fetch_upstream_model_list()
                 except Exception:
                     logger.error(f"获取 {provider_name} 上游模型列表失败: {traceback.format_exc()}")
                     continue
+
+                # 本次拉取可不可信，只看渠道报的失败标记：请求/取值任一步抛异常都会写它。
+                # 有标记 = 本次不可信，整轮不增、不改、不删（一次网络抖动不该清空模型表）；
+                # 没标记 = 正常返回，返回什么就按什么处理，空列表也照常对账（含全量下线）。
+                fetch_err = getattr(client, "_last_fetch_models_error", "") or ""
+                if fetch_err:
+                    logger.warning(
+                        f"[{provider_name}] 上游模型列表拉取失败，跳过本轮同步（不增/不改/不删）: {fetch_err}"
+                    )
+                    continue
+
+                # 本轮拉取可信（上面已放过失败标记）：记下「最近一次从上游拉取」的时间。
+                # 拉不到/报错的分支直接 continue，不写这里——时间戳代表的是成功的拉取。
+                await PostgresClient.touch_provider_models_synced_at(provider_name)
 
                 existing = await PostgresClient.list_provider_models(provider_name)
                 existing_map = {r["upstream_model_id"]: r["model_id"] for r in existing}
@@ -3519,69 +3957,139 @@ class ModelClientPool:
                 # 改名时原样保留——upsert 的 ON CONFLICT 会用传入值整覆盖，不传就清空。
                 existing_extra = {r["upstream_model_id"]: (r.get("extra_config") or {}) for r in existing}
                 # 与管理端「获取上游模型」同一份整形结果（_build_upstream_model_rows）：
-                # is_regex 是规则命中标记，regex_model_id 是替换后的名字。同步就是消费
-                # 这两个字段，不再自己重算一遍判定——预览看到的过滤与改名就是真正落库的。
+                # 每行带 upstream_model_id / model_id / regex_model_id / is_regex 四个字段。
+                # 已入库行两个名字都=库内现名（规则不追溯改名）。
                 rows = cls._build_upstream_model_rows(provider_name, upstream or [], existing_map)
-                if not rows:
-                    # 统一规则：只有真正解析出至少一个模型才允许做对账。
-                    # 请求失败、空响应、空列表、响应结构异常、列表项均无有效 ID，
-                    # 一律视为本次没有正常返回，整轮不增、不改、不删。
-                    fetch_err = getattr(client, "_last_fetch_models_error", "") or ""
-                    logger.warning(
-                        f"[{provider_name}] 上游未正常返回模型列表，跳过本轮同步（不增/不改/不删）"
-                        + (f": {fetch_err}" if fetch_err else "")
-                    )
-                    continue
                 upstream_ids = {row["upstream_model_id"] for row in rows}
-                # 规则就是过滤条件：is_regex=False 的行丢掉，留下的取 regex_model_id
-                # （替换后的名字）落库——deepseek-v4-flash-free 被规则搜到才留下并改名，
-                # 原版 deepseek-v4-flash / big-pickle 没被搜到就不进库。没配规则时不过滤，
-                # 全量保留并沿用 model_id（已跟踪行保留手工改名），否则没规则的渠道会被清空。
+                # 定时任务不看任何「开关」（那是前端显示态），只看渠道配没配规则：
+                # 配了 → 新模型只保留 is_regex=true 的行，名字取 regex_model_id；
+                # 没配 → 全量保留，名字取 model_id。
+                # 已入库行两个字段都=库内名 → 走哪个都不改名。
+                #
+                # 已入库行**永远保留**（哪怕规则改版后不再命中）：规则是「新模型要不要进库」
+                # 的准入条件，不是「已入库的模型要不要活着」的条件。早先按 is_regex 一刀切
+                # 会让「规则改版 → 行不再命中 → 连续两轮被删 → 又回来按规则重建」把管理员
+                # 手改的名字冲回规则算的结果（用户报「一重启模型就改回过滤后的名字」）。
                 if cls._channel_has_rewrite_rules(provider_name):
                     targets = {
-                        row["upstream_model_id"]: row["regex_model_id"]
-                        for row in rows if row["is_regex"]
+                        row["upstream_model_id"]: (
+                            row["regex_model_id"] if row["is_regex"] else row["model_id"]
+                        )
+                        for row in rows
+                        # 新模型按规则命中准入；已入库行一律留下（名字取库内现名）。
+                        if row["is_regex"] or row["upstream_model_id"] in existing_ids
                     }
                 else:
                     targets = {row["upstream_model_id"]: row["model_id"] for row in rows}
                 kept_ids = set(targets)
                 to_add = kept_ids - existing_ids
-                # to_remove 含两类：上游已下线的，以及已入库但不再满足规则的（被规则丢掉的）。
-                to_remove = existing_ids - kept_ids
-                # 已跟踪且仍保留的行重新过一遍规则：改一版规则就让库里名字跟着变。
-                # 目标名与库内一致的行落不进 to_update，无变更的轮次不写库。
-                to_update = {
-                    uid for uid in (kept_ids & existing_ids)
-                    if targets[uid] != existing_map[uid]
+                # to_remove 的确认口径：模型要**连续两轮**都不在上游列表里才判定真下线。
+                # 直接「本轮缺了就删」有两个现网杀伤点：其一，拉列表是轮询账号，不同账号
+                # 可见集合不同（一个号有、另一个号没有），同一模型会在「删→下轮又回来」里
+                # 反复横跳；其二，上游偶发只吐部分列表。删行是整行抹掉，管理员手填的
+                # max_context_tokens / max_tokens / thinking 等会一起丢，模型再出现时走
+                # to_add 重建——而 to_add 只落展示键（_display_info_from_row），用户值就
+                # 永久没了（2026-10 现网反馈「设置了过段时间自动被清掉」的根因）。
+                # 所以：本轮缺、上轮也缺 → 确认下线才删；本轮缺、上轮还在 → 记入观察位
+                # 不删（行原样保留），下轮若真还缺再删。上游列表拉取失败的那轮走上面的
+                # continue，不碰观察位——失败轮不算「确认缺失」。
+                missing_now = existing_ids - kept_ids
+                to_remove = missing_now & cls._model_sync_absent.get(provider_name, set())
+                cls._model_sync_absent[provider_name] = missing_now
+                # 已跟踪行不进任何改名路径：targets[uid] 对已入库行恒等于 existing_map[uid]
+                # （_resolve_target_model_id 直接返回库内现名），所以本函数只有「新增」和
+                # 「下线删除」两种写库动作，永远不会改已存在行的 model_id。
+                # 想按新规则洗已有行的名字，走管理端显式操作，不由定时同步偷偷做。
+
+                # 每行上游展示键：to_add 落库时带进 extra_config，否则定时同步新增的行
+                # 「其他信息」永远空（手动导入路径是前端带 extra_config）。
+                # 只作用于新增行：已入库行的 extra_config 归管理端所有，同步整行不碰。
+                # 倍率不在展示键里——它是独立列 cost_multiplier，单独写（见下）。
+                info_by_uid = {row["upstream_model_id"]: cls._display_info_from_row(row) for row in rows}
+                # 积分倍率独立列：上游本轮声明了的才带键（没声明 = 不覆盖、不臆造）。
+                mult_by_uid = {
+                    row["upstream_model_id"]: row["cost_multiplier"]
+                    for row in rows if "cost_multiplier" in row
+                }
+                # 纯新增行没有用户值要保护，落上游声明的窗口口径（行顶层已由
+                # _window_info_from_model 平铺）无害；真下线又回来的模型也借此补回上游窗口。
+                add_window_by_uid = {
+                    row["upstream_model_id"]: {
+                        k: row[k] for k in ("max_context_tokens", "max_tokens") if k in row
+                    }
+                    for row in rows
                 }
 
                 for uid in to_add:
-                    await PostgresClient.upsert_provider_model(provider_name, uid, targets[uid])
-                for uid in to_update:
-                    # 改名沿用原行 extra_config（含行级 enabled 开关），不传会被 ON CONFLICT 清空。
+                    # 优先级：上游窗口 < 上游展示键 < 墓碑里的手填配置（手填值复活，绝不被
+                    # 上游值静默覆盖——这是本次修「设置过段时间被清掉」的最后一道兜底）。
+                    # 名字同理：墓碑存了删行前的 model_id 就按它复活——手改名（如
+                    # custom-name）不能因为「规则改版 → 行连缺两轮被删 → 又回来重建」这条
+                    # 链被冲回规则算出的名字。
+                    tomb = (cls._model_sync_deleted_extra.get(provider_name) or {}).pop(uid, None)
+                    tomb_cfg = tomb[1] if tomb else None
+                    tomb_model_id = (tomb[2] if tomb and len(tomb) > 2 else None) or ""
+                    restore_name = tomb_model_id.strip() or targets[uid]
+                    extra = {
+                        **(add_window_by_uid.get(uid) or {}),
+                        **(info_by_uid.get(uid) or {}),
+                        **(tomb_cfg or {}),
+                    }
                     await PostgresClient.upsert_provider_model(
-                        provider_name, uid, targets[uid], extra_config=existing_extra.get(uid) or {}
+                        provider_name, uid, restore_name, extra_config=extra,
+                        cost_multiplier=mult_by_uid.get(uid),
+                        cost_multiplier_set=uid in mult_by_uid,
                     )
                 for uid in to_remove:
+                    # 删行前把手填配置（非下划线键）**和当前 model_id** 存进墓碑：模型若
+                    # 再回来，to_add 时原值/原名复活。两轮确认挡掉了大部分抖动删行，但
+                    # 「规则改版后不再命中」的行必走这条路——不存名字，手改名就永久丢了。
+                    # 真·永久下线的墓碑由 TTL 清理，不无限堆积。
+                    user_cfg = {
+                        k: v for k, v in (existing_extra.get(uid) or {}).items()
+                        if not str(k).startswith("_")
+                    }
+                    tombstones = cls._model_sync_deleted_extra.setdefault(provider_name, {})
+                    tombstones[uid] = (time.time(), user_cfg, existing_map.get(uid, ""))
                     await PostgresClient.delete_provider_model(provider_name, uid)
 
-                if to_add or to_update or to_remove:
+                # 已入库行的倍率刷新（to_add 已在上一段落了独立列）：上游本轮声明了倍率
+                # 就覆盖库内值——倍率是会改动的（模型转限时免费再恢复、积分活动调档），
+                # 用户要看到最新值；上游没声明就留空/不动。与手填框的「上游覆盖」口径一致。
+                # 只刷本轮上游仍在列表里的已入库行（tracked + 本轮可见），不碰 to_remove。
+                for uid, mult in mult_by_uid.items():
+                    if uid not in existing_ids or uid in to_add:
+                        continue
+                    await PostgresClient.update_provider_model_cost_multiplier(
+                        provider_name, uid, mult,
+                    )
+
+                # 墓碑 TTL 清理：真·永久下线的模型删行后墓碑会一直留着，按 7 天到期清掉，
+                # 不让 dict 无限长。to_add 复活时已 pop，这里只兜底清过期的。
+                tombstones = cls._model_sync_deleted_extra.get(provider_name)
+                if tombstones:
+                    cutoff = time.time() - cls.MODEL_SYNC_TOMBSTONE_TTL_SECONDS
+                    stale = [uid for uid, entry in tombstones.items() if entry[0] < cutoff]
+                    for uid in stale:
+                        tombstones.pop(uid, None)
+                    if not tombstones:
+                        cls._model_sync_deleted_extra.pop(provider_name, None)
+
+                if to_add or to_remove:
                     logger.debug(
                         f"{provider_name} 同步：上游 {len(upstream_ids)} 个，"
-                        f"新增 {len(to_add)} 个，更新映射 {len(to_update)} 个，"
+                        f"新增 {len(to_add)} 个，"
                         f"删除 {len(to_remove)} 个（上游下线），表中原有 {len(existing_ids)} 个"
                     )
+                    # 实际增删改了模型行 → 记「最近一次修改模型」。定时/手动同步都算修改。
+                    await PostgresClient.touch_provider_models_updated_at(provider_name)
                     # 定时刷新拉到实际模型变更时落通知中心（best-effort，无变更不发，避免刷屏）。
                     try:
                         added = sorted(targets[uid] for uid in to_add)
-                        # 改名通知要给出「从什么变成了什么」，只报新名字看不出发生了啥。
-                        updated = sorted(f"{existing_map[uid]} → {targets[uid]}" for uid in to_update)
                         removed = sorted(existing_map[uid] for uid in to_remove)
                         parts = []
                         if added:
                             parts.append(f"新增 {len(added)} 个")
-                        if updated:
-                            parts.append(f"更新映射 {len(updated)} 个")
                         if removed:
                             parts.append(f"下线 {len(removed)} 个")
                         from user_platform.notify_core import emit_notification
@@ -3590,7 +4098,6 @@ class ModelClientPool:
                             params={
                                 "provider_name": provider_name,
                                 "added": added,
-                                "updated": updated,
                                 "removed": removed,
                             },
                             owner_type="platform",
@@ -3642,6 +4149,9 @@ class ModelClientPool:
             "client_preset": extra.get("client_preset"),
             "enable_1m_context": bool(extra.get("enable_1m_context")),
             "enabled": r.get("enabled") is not False,
+            # 积分倍率独立列（provider_models.cost_multiplier）原样带上：展示/统计用，
+            # 运行时选路不读它。None = 上游没声明且没手填。
+            "cost_multiplier": r.get("cost_multiplier"),
         }
 
     @classmethod
@@ -3715,10 +4225,11 @@ class ModelClientPool:
                     yield provider_name, pool, row
 
     @classmethod
-    def apply_cooldown_event(cls, provider: str, username: str, model_id: str | None, until: float | None, reason: str = "") -> None:
+    def apply_cooldown_event(cls, provider: str, username: str, model_id: str | None, until: float | None, reason: str = "", category: str = "") -> None:
         """pubsub 冻结事件落到对应 AccountClient 的内存状态桶。
 
         until=None 表示永久冻结（Redis 无 TTL key）；float>0 表示临时到期点。
+        category 为冻结类别（credential/quota/temporary/""），供 status 属性判账号状态。
         """
         client = cls._find_account_client(provider, username)
         if client is None:
@@ -3726,14 +4237,14 @@ class ModelClientPool:
         if until is None:
             # 永久冻结
             client.freeze(kind="account_model" if model_id else "account",
-                          model_id=model_id, seconds=None, reason=reason)
+                          model_id=model_id, seconds=None, reason=reason, category=category)
             return
         if until <= time.time():
             return
         if model_id:
-            client.set_freeze_state_raw(model_untils={model_id: until}, reason=reason)
+            client.set_freeze_state_raw(model_untils={model_id: until}, reason=reason, category=category)
         else:
-            client.set_freeze_state_raw(account_until=until, reason=reason)
+            client.set_freeze_state_raw(account_until=until, reason=reason, category=category)
 
     @classmethod
     def clear_cooldown_event(cls, provider: str, username: str, model_id: str | None = None) -> None:
@@ -5109,6 +5620,7 @@ class ModelClientPool:
             "no_model_route": "模型未配置 provider_models 路由",
             "entry_provider_missing": "专用线路 provider 不在模型路由中",
             "model_tpm_limited": "模型达到 TPM 限制",
+            "context_window_exceeded": "预估输入超过模型上下文窗口",
             "operation_mismatch": "output_modalities 不匹配当前媒体操作",
             "group_provider_filtered": "模型组 provider 白/黑名单过滤",
             "api_key_provider_filtered": "API Key provider 白/黑名单过滤",
@@ -5241,12 +5753,14 @@ class ModelClientPool:
             is_probe: 定时检测模式，与 is_test 同样绕过冻结/冷却过滤（探测的目标正是异常账号），
                      但**尊重**账号 disabled / 渠道 enabled——禁用状态不进入检测周期。
                      二者在失败收口处区分：is_test 不冻结，is_probe 走正常冻结逻辑。
-            input_token_estimate: 本次请求预估输入 token（不含输出）。>0 时按渠道模型
-                     ``extra_config.max_context_tokens`` 过滤：预估输入超过该渠道模型声明的
-                     输入窗口上限则跳过该候选（该渠道装不下，发过去必然 400）。
+            input_token_estimate: 本次请求预估输入 token（不含输出）。>0 时按输入窗口上限过滤：
+                    渠道行 ``extra_config.max_context_tokens`` 优先，未声明时回落到模型元数据的
+                    ``max_context_tokens``。预估输入超过该上限则跳过该候选（该渠道装不下，
+                    发过去必然 400）；两处都取不到（<=0）表示未知，不过滤。
         """
         now = time.time()
         route_type = "route" if route else "smart"
+        snapshot = snapshot or model_catalog.current_snapshot()
         candidates = []
         tpm_limited_models = []
         skip_reasons: dict[str, int] = defaultdict(int)
@@ -5289,6 +5803,21 @@ class ModelClientPool:
                 skip_reasons["model_tpm_limited"] += 1
                 continue
 
+            # 输入窗口兜底上限：渠道行未声明 extra_config.max_context_tokens 时，回落到
+            # 模型元数据的 max_context_tokens（同一模型在元数据侧声明的上下文窗口）。按
+            # routed_model 取一次，候选行内复用；两处都取不到（0）表示未知，不过滤。
+            metadata_ctx_limit = 0
+            if input_token_estimate > 0:
+                metadata, _ = cls._metadata_for_model(
+                    routed_model,
+                    getattr(snapshot, "metadata", None) or {},
+                    getattr(snapshot, "group_metadata", None) or {},
+                )
+                try:
+                    metadata_ctx_limit = int(metadata.get("max_context_tokens") or 0)
+                except (TypeError, ValueError):
+                    metadata_ctx_limit = 0
+
             for provider_name, pool, model_route in model_candidates:
                 if not await _timed_routing_call(
                     "candidate_operation_check_ms",
@@ -5299,14 +5828,17 @@ class ModelClientPool:
                 upstream_model_id = model_route.get("upstream_model_id") or routed_model
 
                 # 输入窗口过滤：渠道模型在 extra_config 里声明的 max_context_tokens 是该
-                # 渠道模型的输入窗口上限。预估输入 token 超过它则跳过该候选（发过去必然
-                # context_too_large）。两值任一 <=0 表示「不限制/未知」，不过滤保持原行为。
+                # 渠道模型的输入窗口上限（渠道声明优先）；未声明时按模型元数据的
+                # max_context_tokens 兜底。预估输入 token 超过该上限则跳过该候选（发过去
+                # 必然 context_too_large）。两处都取不到（<=0）表示未知，不过滤。
                 if input_token_estimate > 0:
                     extra = model_route.get("extra_config") or {}
                     try:
                         ctx_limit = int(extra.get("max_context_tokens") or 0)
                     except (TypeError, ValueError):
                         ctx_limit = 0
+                    if ctx_limit <= 0:
+                        ctx_limit = metadata_ctx_limit
                     if ctx_limit > 0 and input_token_estimate > ctx_limit:
                         skip_reasons["context_window_exceeded"] += 1
                         continue
@@ -5384,29 +5916,34 @@ class ModelClientPool:
                     if (provider_name, account_client.username) in exclude_accounts:
                         skip_reasons["excluded_account"] += 1
                         continue
-                    # 选择阶段只看内存布尔：禁用 + 冻结 + 冷却。rpm/tpm 改"触线即冻结"——
-                    # 计数在请求收尾写 Redis 并判触线，越线则给账号打 cooldown，冻结即被此处过滤。
-                    # 选账号阶段不再逐账号读 rpm/tpm 计数（零 Redis 查询）；并发在 reserve 阶段原子占用。
-                    # 禁用：仅手动测试（is_test）可选中禁用账号；探测与正常请求都跳过
-                    # （探测侧 scheduled_test_loop 组装白名单时已排除禁用账号，此处双保险）。
-                    if not is_test:
-                        if account_client.disabled:
-                            skip_reasons["account_disabled"] += 1
-                            continue
-                    # 冻结/冷却：测试与探测都绕过——探测的目标正是异常（冻结/冷却中）账号；
-                    # 正常请求跳过。is_frozen（含永久冻结状态位）也不拦探测：探测成功会清除
-                    # is_frozen，使永久冻结账号恢复；disabled 不走该路径。
+                    # 选号阶段统一读账号状态（status 属性，docs/channel-error-semantics-design.md）。
+                    # status 现算：disabled / 凭证失效 / 额度耗尽 / 永久冻结 / 临时冷却 / 未初始化 → 拦；
+                    # AUTH_FAILED / CHECKING / MODEL_FROZEN / AVAILABLE → 放行（诊断态与部分模型冻结
+                    # 不饿死好号；模型级具体冻结由下方 is_model_frozen 二维判，账号级不一刀切）。
+                    # 冻结时长刷新语义、refresh_freeze_on_failure 等底层机制未变（status 只读不改）。
+                    # 测试（is_test）旁路 disabled；探测（is_probe）旁路 disabled/冻结——探测对象正是
+                    # 异常账号，探测成功可经 clear_runtime_freeze_on_success 自动解冻。
                     if not is_test and not is_probe:
-                        if account_client.is_frozen:
-                            # 账号级冻结：临时冷却 vs 永久冻结用不同 skip_reason。
-                            if account_client.cooldown_remaining(now) > 0:
-                                skip_reasons["account_cooldown"] += 1
-                            else:
+                        if account_client.state() not in ROUTABLE_STATES:
+                            st = account_client.state()
+                            if st is AccountState.DISABLED:
+                                skip_reasons["account_disabled"] += 1
+                            elif st is AccountState.CREDENTIAL_INVALID or st is AccountState.QUOTA_EXHAUSTED:
+                                skip_reasons["account_frozen"] += 1   # 语义冻结：无到期，等重新授权/签到
+                            elif st is AccountState.FROZEN:
                                 skip_reasons["account_frozen"] += 1
+                            elif st is AccountState.COOLING:
+                                skip_reasons["account_cooldown"] += 1
+                            elif st is AccountState.UNINITIALIZED:
+                                skip_reasons["account_disabled"] += 1   # 凭证不全，等同不可用
                             continue
-                        # 模型级冻结：该账号该模型是否被冻结
+                        # 模型级冻结：该账号该模型是否被冻结（账号级未冻、只冻部分模型时不拦账号）
                         if account_client.is_model_frozen(routed_model):
                             skip_reasons["account_model_cooldown"] += 1
+                            continue
+                    elif not is_test:  # is_probe：尊重 disabled，但旁路冻结（探测对象即异常账号）
+                        if account_client.disabled:
+                            skip_reasons["account_disabled"] += 1
                             continue
 
                     for endpoint_config in channel_protocol_candidates:
@@ -5562,6 +6099,49 @@ class ModelClientPool:
         return random.choice(candidates)
 
     @classmethod
+    async def _select_largest_context(cls, candidates: list[dict], messages: list[dict] | None, session_id: str | None = None) -> dict | None:
+        """压缩专用选路：按候选的对外输入窗口从大到小排序，取第一个。
+
+        复用既有选路尾部管线（候选已在 _collect_candidates 过完冻结/冷却/TPM 等可用性），
+        这里只决定「在所有可用的压缩模型里，优先用窗口最大的那个」——窗口越大越能装下整段
+        历史。窗口取该候选 routed_model 的对外窗口上限（渠道行 extra_config.max_context_tokens
+        优先，未声明回落模型元数据 max_context_tokens，与 _collect_candidates 的过滤口径一致）；
+        未知窗口（0）排在已知窗口之后。同窗口按优先级/权重兜底，避免完全平局。
+        """
+        if not candidates:
+            return None
+
+        # 取一次共享快照供 window_of 复用（避免每个候选各取一次）。
+        snap = model_catalog.current_snapshot()
+        meta_snapshot = {
+            "metadata": getattr(snap, "metadata", None) or {},
+            "group_metadata": getattr(snap, "group_metadata", None) or {},
+        }
+
+        def window_of(c: dict) -> int:
+            routed = c.get("routed_model") or ""
+            info = c.get("route_info") or {}
+            try:
+                extra = info.get("extra_config") or {}
+                cap = int(extra.get("max_context_tokens") or 0) if isinstance(extra, dict) else 0
+            except (TypeError, ValueError):
+                cap = 0
+            if cap > 0:
+                return cap
+            try:
+                metadata, _ = cls._metadata_for_model(
+                    routed, meta_snapshot.get("metadata") or {}, meta_snapshot.get("group_metadata") or {},
+                )
+                return int(metadata.get("max_context_tokens") or 0)
+            except Exception:  # noqa: BLE001
+                return 0
+
+        return sorted(
+            candidates,
+            key=lambda c: (-window_of(c), c["account_client"].priority, -c["account_client"].weight)
+        )[0]
+
+    @classmethod
     def _estimate_prompt_tokens(cls, messages: list[dict] | None, model_id: str = "") -> int:
         """估算 prompt token：复用主流程 tokenizer（按模型规则选 tiktoken），短请求退化为字符粗估避免开销。"""
         if not messages:
@@ -5677,25 +6257,16 @@ class ModelClientPool:
     async def _try_reserve(cls, candidate: dict, messages: list[dict] | None, *, is_test: bool = False, is_probe: bool = False, token_estimate: int = 0):
         """尝试占位，返回 ``(成功元组, LimitDecision)``。
 
-        手动测试（is_test）/ 定时检测（is_probe）**跳过预占阶段**：不调
-        ``reserve_with_decision`` / ``acquire_account``，因此不进入 Lua 预占脚本，
-        冻结键 ``limit:cooldown:{provider}:{account}`` 不再被检查——从结构上消灭
-        「测试反而把被测账号冻结」的 bug。候选直接绑定目标账号执行；失败后的冻结/
-        健康度差异在执行阶段失败收口处区分（is_test 不冻结，is_probe 走正常冻结）。
+        测试（is_test）/定时检测（is_probe）**同样走预占**：任何打到上游的请求都必须占
+        每账号并发槽位——并发已满时测试/探测会被拒（reason=concurrent_limit，按预占失败
+        换候选/收口），不再照发不误。预占内部按 ``_is_test`` 标记区分口径：只占并发，
+        不写 RPM/RPD/RPH/token 账本、不查冻结键（被测目标正是冻结/冷却中的账号），
+        「测试反而把被测账号冻结/耗额度」从结构上仍然不可能。失败后的冻结/健康度差异
+        在执行阶段失败收口处区分（is_test 不冻结，is_probe 走正常冻结）。
         """
         account_client = candidate["account_client"]
         account_client._is_test = is_test or is_probe
         reserve_started = _routing_stage_started()
-        # 测试/探测：跳过预占，直接绑定候选。不写并发/RPM/TPM 账本（配额暂不处理），
-        # CandidateReservation 在无 lease 时 commit/rollback/release 均优雅降级。
-        if is_test or is_probe:
-            provider_name = candidate["provider_name"]
-            account_client.last_route_info = candidate["route_info"]
-            try:
-                return (account_client.provider, provider_name, account_client), None
-            finally:
-                _record_routing_stage("account_reserve_ms", reserve_started)
-                account_client._is_test = False
         try:
             reserve_with_decision = getattr(account_client, "reserve_with_decision", None)
             if reserve_with_decision is not None:
@@ -5709,10 +6280,12 @@ class ModelClientPool:
                 now = time.time()
                 provider_name = candidate["provider_name"]
                 account_client.last_route_info = candidate["route_info"]
-                account_client._stats.record_pick(now)
-                cls._provider_recent_picks.setdefault(provider_name, []).append(now)
-                cls._provider_pick_history.append((now, provider_name))
-                cls._clean_provider_pick_history(now)
+                if not (is_test or is_probe):
+                    # 健康度/轮换信号只由真实流量驱动（与执行层「测试不改健康度」同口径）。
+                    account_client._stats.record_pick(now)
+                    cls._provider_recent_picks.setdefault(provider_name, []).append(now)
+                    cls._provider_pick_history.append((now, provider_name))
+                    cls._clean_provider_pick_history(now)
                 return (account_client.provider, provider_name, account_client), result.decision
             # 预占拒绝不再逐条打日志：拒绝原因已在 [模型组不可用] 汇总行按 reason 计数聚合，
             # 逐候选细节会刷屏且对排查无增益。需要时看汇总行的 reason 分布即可。
@@ -5904,12 +6477,18 @@ class ModelClientPool:
         is_probe: bool = False,
         snapshot=None,
         input_token_estimate: int = 0,
+        compression_candidates: list[str] | None = None,
     ) -> tuple[BaseProvider, str, AccountClient]:
         """获取模型的可用客户端及提供商名称。
 
         渠道白/黑名单由调用方显式传入（``provider_whitelist`` / ``provider_blacklist``），
         选账号层不再从 api_key 内部推导。``account_whitelist`` / ``is_test`` / ``is_probe``
         为测试/探测专用。
+
+        ``compression_candidates``：非空时走**压缩专用选路**——候选模型改用此列表（来自被压缩
+        模型在 model_groups 上配置的 compress_models），跳过本地窗口过滤（让上游用其真实窗口
+        裁决，避免"装不下被打成 no_available_account"），并改用 _select_largest_context 按窗口
+        从大到小选。详见 dispatch_entry 的压缩识别与启用。
         """
         snapshot = snapshot or model_catalog.current_snapshot()
         exclude_accounts = exclude_accounts or []
@@ -5961,7 +6540,25 @@ class ModelClientPool:
             "fast_intelligent": cls._select_fast_intelligent,
         }
         select_fn = strategy_methods.get(strategy, cls._select_sequential)
+
+        # ── 压缩专用选路 ──
+        # 命中「上下文压缩」且该模型配了压缩模型列表时：候选模型改用压缩列表，跳过本地
+        # 窗口过滤（让上游用真实窗口裁决），改用「按窗口从大到小」的选择策略。其余可用性
+        # 过滤（冻结/冷却/TPM/账号白名单等）与普通路径完全一致，复用同一套 _collect_candidates。
+        if compression_candidates:
+            candidate_models = [
+                m for m in compression_candidates
+                if m and cls.has_model_route(m)
+            ]
+            if candidate_models:
+                is_group = False            # 压缩列表是扁平的真实模型列表，按单模型逐候选收集
+                group_whitelist, group_blacklist = (set(), set())
+                filter_nodes = [(set(), set())]
+                input_token_estimate = 0    # 关掉本地窗口过滤：让上游裁决
+                select_fn = cls._select_largest_context
+                strategy = "compression"
         # 仅智能策略读取当前 API Key 的 RPM 用量；其他策略不增加 Redis 查询。
+        # （压缩策略非 intelligent，volume_factor 保持 0.0。）
         volume_factor = await _timed_routing_call(
             "candidate_volume_factor_ms", cls._api_key_volume_factor(api_key)
         ) if strategy in {"intelligent", "fast_intelligent"} else 0.0
@@ -6122,7 +6719,17 @@ class ModelClientPool:
             cls._raise_no_available(model_id, operation, reasons)
         # 有候选但预占全部失败；按用户要求统一 429（不做 503）；
         # redis_uncertain / provider_not_initialized 用 service_busy code 区分。
-        reason_code = "service_busy" if reasons.get("redis_uncertain") or reasons.get("provider_not_initialized") else "no_available_account"
+        # context_window_exceeded 优先：请求体量超渠道能接受的输入上限（收集阶段的
+        # token 窗口过滤 + 预占阶段渠道 check_message 带出的字节闸都记这个 reason），
+        # 它是载荷问题、重试无意义——必须收口成 context_too_large/400（与入口预检同码，
+        # 见 _REASON_TO_BUSINESS_CODE），不能被下面的 no_available_account/429 覆盖掉，
+        # 否则客户端会按退避重试同一份必然超限的输入。
+        if reasons.get("context_window_exceeded"):
+            reason_code = "context_too_large"
+        elif reasons.get("redis_uncertain") or reasons.get("provider_not_initialized"):
+            reason_code = "service_busy"
+        else:
+            reason_code = "no_available_account"
         cls._raise_no_available(model_id, operation, reasons, code_override=reason_code)
 
     @classmethod
@@ -6157,21 +6764,27 @@ class ModelClientPool:
         is_probe: bool = False,
         snapshot=None,
         input_token_estimate: int = 0,
+        compression_candidates: list[str] | None = None,
     ) -> tuple[BaseProvider, str, AccountClient]:
         """获取模型客户端并保留账号并发占用，调用方需 release。
 
         渠道白/黑名单由调用方显式传入；``account_whitelist`` / ``is_test`` / ``is_probe`` 为
-        测试/探测专用。``is_probe``（定时检测）与 ``is_test`` 同样跳过选路预占，但失败时走与
+        测试/探测专用。``is_probe``（定时检测）与 ``is_test`` 同样**照常占每账号并发槽位**
+        （只是不写 RPM/TPM 账本、不查冻结键），并发已满时与正常请求一样被拒；失败时走与
         正常请求完全一致的冻结逻辑。
 
-        ``input_token_estimate``：本次请求的预估输入 token（不含输出），用于按渠道模型
-        ``extra_config.max_context_tokens`` 过滤候选。0 表示不做窗口过滤。
+        ``input_token_estimate``：本次请求的预估输入 token（不含输出），用于按输入窗口上限过滤候选：
+        渠道行 ``extra_config.max_context_tokens`` 优先，未声明时按模型元数据
+        ``max_context_tokens`` 兜底。0 表示不做窗口过滤。
+
+        ``compression_candidates``：非空时走压缩专用选路（见 _get_available_client_with_provider）。
         """
         return await cls._get_available_client_with_provider(
             model_id, exclude_accounts, messages, route, api_key, operation, session_id, request_protocol,
             provider_whitelist=provider_whitelist, provider_blacklist=provider_blacklist,
             account_whitelist=account_whitelist, is_test=is_test, is_probe=is_probe, snapshot=snapshot,
             input_token_estimate=input_token_estimate,
+            compression_candidates=compression_candidates,
         )
 
     @classmethod

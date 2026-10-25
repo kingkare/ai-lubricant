@@ -182,7 +182,9 @@ class AgentBackgroundOrchestrator:
             from agent.agent_main import GenericAgent
 
             agent = GenericAgent(agent_id=agent_id)
-            await agent.run_task(prompt, max_turns=40)
+            # 轮数上限沿用 Agent 统一链（Agent 行 max_turns → 固定默认），不再单设
+            # 无人值守短上限——旧值 40 与交互态脱节，同一 Agent 两套上限。
+            await agent.run_task(prompt)
         except Exception as exc:  # noqa: BLE001 — background dispatch must not crash the worker
             logger.warning("[agent-bg] dispatch failed agent=%s: %s", agent_id, exc)
 

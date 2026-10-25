@@ -1,0 +1,126 @@
+
+
+############ /api/ml/v1/cloud-disk/list ############
+
+--- occ 1 @ 242801 ---
+or("获取配额信息失败:",e),{code:9999,msg:"获取配额信息失败",data:{}}}},Tf=async(e={})=>{try{const t={page_size:e.page_size,page_token:e.page_token||"",dir_path:e.dir_path||"/",keyword:e.keyword||"",sort_by:e.sort_by||"modified_at",sort_order:e.sort_order||"desc",dirs_only:e.dirs_only||!1,recursive:e.recursive||!1},n=await S.http.get("/api/ml/v1/cloud-disk/list",{params:t});return n.code===0&&n.data?{code:n.code||0,msg:n.msg||"获取我的云盘列表失败",data:n.data||{}}:{code:9999,msg:"获取我的云盘列表失败",data:{}}}catch(t){return console.error("获取我的云盘列表失败:",t),{code:9999,ms
+
+
+############ /api/ml/v1/cloud-disk/upload-url ############
+
+--- occ 1 @ 244716 ---
+n{code:n.code||0,msg:n.msg||"复制成功",data:n.data??{}}}catch(t){return console.error("复制失败:",t),{code:9999,msg:"复制失败",data:{}}}},Rf=async(e={},t)=>{const n=e.files||[],a=e.dir_path||"/";n.forEach(r=>Gt("started",{size:r.file_size,dirPath:a},t));try{const r={dir_path:e.dir_path||"",files:e.files||[]},o=(await S.http.post("/api/ml/v1/cloud-disk/upload-url",{data:r})).urls||[];return n.forEach((s,l)=>{const d=o[l];!d?.skipped&&!d?.upload_url&&Gt("failed",{size:s.file_size,dirPath:a},t)}),{urls:o}}catch(r){return console.error("获取上传云盘文件地址失败:
+
+
+############ /api/ml/v1/cloud-disk/download-url ############
+
+--- occ 1 @ 245097 ---
+n.forEach((s,l)=>{const d=o[l];!d?.skipped&&!d?.upload_url&&Gt("failed",{size:s.file_size,dirPath:a},t)}),{urls:o}}catch(r){return console.error("获取上传云盘文件地址失败:",r),n.forEach(i=>Gt("failed",{size:i.file_size,dirPath:a,error:r},t)),{urls:[]}}},Lf=async(e={})=>{try{const t={file_keys:e.file_keys||[]},n=await S.http.post("/api/ml/v1/cloud-disk/download-url",{data:t});return{code:n.code||0,msg:n.msg||"获取文件下载链接失败",data:n.data??{}}}catch(t){return console.error("获取文件下载链接失败:",t),{code:9999,msg:"获取文件下载链接失败",data:{}}}},Mf=async(e={})=>{try{cons
+
+
+############ /api/ml/v1/cloud-disk/mkdir ############
+
+--- occ 1 @ 243147 ---
+",{params:t});return n.code===0&&n.data?{code:n.code||0,msg:n.msg||"获取我的云盘列表失败",data:n.data||{}}:{code:9999,msg:"获取我的云盘列表失败",data:{}}}catch(t){return console.error("获取我的云盘列表失败:",t),{code:9999,msg:"获取我的云盘列表失败",data:{}}}},Cf=async(e={})=>{try{const t={dir_path:e.dir_path||"",dir_name:e.dir_name||""},n=await S.http.post("/api/ml/v1/cloud-disk/mkdir",{data:t});return{code:n.code||0,msg:n.msg||"创建文件夹成功",data:n.data??{}}}catch(t){return console.error("创建文件夹失败:",t),{code:9999,msg:"创建文件夹失败",data:{}}}},_f=async(e={})=>{try{const t={file_keys:e
+
+
+############ /api/ml/v1/cloud-disk/rename ############
+
+--- occ 1 @ 243724 ---
+/api/ml/v1/cloud-disk/delete",{data:t});return{code:n.code||0,msg:n.msg||"删除成功",data:n.data??{}}}catch(t){return console.error("删除失败:",t),{code:9999,msg:"删除失败",data:{}}}},xf=async(e={})=>{try{const t={src_key:e.src_key||"",new_name:e.new_name||"",conflict_strategy:e.conflict_strategy||"overwrite"},n=await S.http.post("/api/ml/v1/cloud-disk/rename",{data:t});return{code:n.code||0,msg:n.msg||"操作成功",data:n.data??{}}}catch(t){return console.error("操作失败:",t),{code:9999,msg:"操作失败",data:{}}}},Ef=async(e={})=>{try{const t={src_keys:e.src_keys
+
+
+############ /api/ml/v1/cloud-disk/move ############
+
+--- occ 1 @ 244044 ---
+/api/ml/v1/cloud-disk/rename",{data:t});return{code:n.code||0,msg:n.msg||"操作成功",data:n.data??{}}}catch(t){return console.error("操作失败:",t),{code:9999,msg:"操作失败",data:{}}}},Ef=async(e={})=>{try{const t={src_keys:e.src_keys||[],dst_dir:e.dst_dir||"",conflict_strategy:e.conflict_strategy||"overwrite"},n=await S.http.post("/api/ml/v1/cloud-disk/move",{data:t});return{code:n.code||0,msg:n.msg||"操作成功",data:n.data??{}}}catch(t){return console.error("操作失败:",t),{code:9999,msg:"操作失败",data:{}}}},Pf=async(e={})=>{try{const t={src_keys:e.src_keys||
+
+
+############ /api/ml/v1/cloud-disk/copy ############
+
+--- occ 1 @ 244353 ---
+http.post("/api/ml/v1/cloud-disk/move",{data:t});return{code:n.code||0,msg:n.msg||"操作成功",data:n.data??{}}}catch(t){return console.error("操作失败:",t),{code:9999,msg:"操作失败",data:{}}}},Pf=async(e={})=>{try{const t={src_keys:e.src_keys||[],dst_dir:e.dst_dir||"",conflict_strategy:e.conflict_strategy||""},n=await S.http.post("/api/ml/v1/cloud-disk/copy",{data:t});return{code:n.code||0,msg:n.msg||"复制成功",data:n.data??{}}}catch(t){return console.error("复制失败:",t),{code:9999,msg:"复制失败",data:{}}}},Rf=async(e={},t)=>{const n=e.files||[],a=e.dir_path
+
+
+############ /api/ml/v1/cloud-disk/delete ############
+
+--- occ 1 @ 243404 ---
+h:e.dir_path||"",dir_name:e.dir_name||""},n=await S.http.post("/api/ml/v1/cloud-disk/mkdir",{data:t});return{code:n.code||0,msg:n.msg||"创建文件夹成功",data:n.data??{}}}catch(t){return console.error("创建文件夹失败:",t),{code:9999,msg:"创建文件夹失败",data:{}}}},_f=async(e={})=>{try{const t={file_keys:e.file_keys||[]},n=await S.http.post("/api/ml/v1/cloud-disk/delete",{data:t});return{code:n.code||0,msg:n.msg||"删除成功",data:n.data??{}}}catch(t){return console.error("删除失败:",t),{code:9999,msg:"删除失败",data:{}}}},xf=async(e={})=>{try{const t={src_key:e.src_key||
+
+
+############ /api/ml/v1/cloud-disk/quota ############
+
+--- occ 1 @ 242308 ---
+scene_code:"compute_cloud_backend_upload",scene_name:"云盘_上传",event_time:Date.now(),...r})},su={started:"conduct",succeeded:"normal",failed:"abnormality"},Gt=(e,t,n)=>{n==="item"?ru(e,{itemType:"file",dirPath:t.dirPath,itemId:t.itemId,error:t.error}):n==="upload"&&ou(su[e],t)},cu=async()=>{try{const e=await S.http.get("/api/ml/v1/cloud-disk/quota");return e.code===0&&e.data?{code:e.code||0,msg:e.msg||"获取配额信息失败",data:e.data||{}}:{code:9999,msg:"获取配额信息失败",data:{}}}catch(e){return console.error("获取配额信息失败:",e),{code:9999,msg:"获取配额信息失败",dat
+
+
+############ /api/ml/v1/cloud-disk/check ############
+
+--- occ 1 @ 245394 ---
+},n=await S.http.post("/api/ml/v1/cloud-disk/download-url",{data:t});return{code:n.code||0,msg:n.msg||"获取文件下载链接失败",data:n.data??{}}}catch(t){return console.error("获取文件下载链接失败:",t),{code:9999,msg:"获取文件下载链接失败",data:{}}}},Mf=async(e={})=>{try{const t={dst_dir:e.dst_dir||"",file_names:e.file_names||[]},n=await S.http.post("/api/ml/v1/cloud-disk/check",{data:t});return{code:n.code||0,msg:n.msg||"获取文件下载链接失败",data:n.data??{}}}catch(t){return console.error("获取文件下载链接失败:",t),{code:9999,msg:"获取文件下载链接失败",data:{}}}},Df=async(e,t,n,a,r)=>{try{const 
+
+
+############ /api/ml/v1/cloud-disk/default-name-list ############
+
+--- occ 1 @ 245982 ---
+":n||"application/octet-stream"},signal:a,onUploadProgress:o=>{if(r&&o.total){const s=Math.round(o.loaded*100/o.total);r(s)}},timeout:0});return i.status===200||i.status===204}catch(i){return console.error("上传文件失败:",i),!1}},If=async(e={})=>{try{const t={dir_path:e.dir_path||"/",is_dir:e.is_dir||!1},n=await S.http.get("/api/ml/v1/cloud-disk/default-name-list",{params:t});return n.code===0&&n.data?{code:n.code||0,msg:n.msg||"获取文件名称失败",data:n.data||{}}:{code:9999,msg:"获取文件名称失败",data:{}}}catch(t){return console.error("获取文件名称失败:",t),{code:
+
+
+############ /api/ml/v1/dev-machine/create ############
+
+--- occ 1 @ 237899 ---
+Reject:t},typeof window>"u"&&e({loadRemote:function(){return Promise.resolve(void 0)},loadShare:function(){return Promise.resolve(void 0)}})}const ni=hn.initPromise,tu=ni.then(e=>e.loadRemote("discovery_host/PlatformSDK")),$t=await ni.then(e=>tu),S=$t.__esModule?$t.default:$t,pf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/create",{data:e})}catch(t){return console.error("创建开发机失败:",t),{code:500,msg:"创建开发机失败，请稍后重试",data:null}}},ka=async e=>{try{const t=await S.http.get("/api/ml/v1/dev-machine/list",{params:e}),{code:n,
+
+
+############ /api/ml/v1/dev-machine/start ############
+
+--- occ 1 @ 238854 ---
+a:e})}catch(t){return console.error("停止开发机失败:",t),{code:500,msg:"停止失败，请稍后重试",data:{status:""}}}},yf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/rename",{data:e})}catch(t){return console.error("重命名开发机失败:",t),{code:500,msg:"重命名失败，请稍后重试",data:{id:0,name:""}}}},bf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/start",{data:e})}catch(t){return console.error("启动开发机失败:",t),{code:500,msg:"启动失败，请稍后重试",data:{status:""}}}},wf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/enter",{data:e})}catch(
+
+
+############ /api/ml/v1/dev-machine/stop ############
+
+--- occ 1 @ 238501 ---
+r.total||0}}return{list:[],total:0}}catch(t){return console.error("获取开发机列表失败:",t),{list:[],total:0}}},gf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/delete",{data:e})}catch(t){return console.error("删除开发机失败:",t),{code:500,msg:"删除失败，请稍后重试",data:{status:""}}}},vf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/stop",{data:e})}catch(t){return console.error("停止开发机失败:",t),{code:500,msg:"停止失败，请稍后重试",data:{status:""}}}},yf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/rename",{data:e})}catch(
+
+
+############ /api/ml/v1/dev-machine/delete ############
+
+--- occ 1 @ 238326 ---
+，请稍后重试",data:null}}},ka=async e=>{try{const t=await S.http.get("/api/ml/v1/dev-machine/list",{params:e}),{code:n,data:a}=t;if(n===0&&a){const r=a;return{list:r.list||[],total:r.total||0}}return{list:[],total:0}}catch(t){return console.error("获取开发机列表失败:",t),{list:[],total:0}}},gf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/delete",{data:e})}catch(t){return console.error("删除开发机失败:",t),{code:500,msg:"删除失败，请稍后重试",data:{status:""}}}},vf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/stop",{data:e})}catch(
+
+
+############ /api/ml/v1/dev-machine/rename ############
+
+--- occ 1 @ 238674 ---
+e",{data:e})}catch(t){return console.error("删除开发机失败:",t),{code:500,msg:"删除失败，请稍后重试",data:{status:""}}}},vf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/stop",{data:e})}catch(t){return console.error("停止开发机失败:",t),{code:500,msg:"停止失败，请稍后重试",data:{status:""}}}},yf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/rename",{data:e})}catch(t){return console.error("重命名开发机失败:",t),{code:500,msg:"重命名失败，请稍后重试",data:{id:0,name:""}}}},bf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/start",{data:e})}
+
+
+############ /api/ml/v1/dev-machine/enter ############
+
+--- occ 1 @ 239028 ---
+ta:e})}catch(t){return console.error("重命名开发机失败:",t),{code:500,msg:"重命名失败，请稍后重试",data:{id:0,name:""}}}},bf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/start",{data:e})}catch(t){return console.error("启动开发机失败:",t),{code:500,msg:"启动失败，请稍后重试",data:{status:""}}}},wf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/enter",{data:e})}catch(t){return console.error("获取开发机进入链接失败:",t),{code:500,msg:"获取链接失败，请稍后重试",data:{codeserver:"",jupyterlab:""}}}},Ta=async()=>{try{const e=await S.http.get("/api/ml/v1/dev-machine
+
+
+############ /api/ml/v1/dev-machine/list ############
+
+--- occ 1 @ 238070 ---
+then(e=>e.loadRemote("discovery_host/PlatformSDK")),$t=await ni.then(e=>tu),S=$t.__esModule?$t.default:$t,pf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/create",{data:e})}catch(t){return console.error("创建开发机失败:",t),{code:500,msg:"创建开发机失败，请稍后重试",data:null}}},ka=async e=>{try{const t=await S.http.get("/api/ml/v1/dev-machine/list",{params:e}),{code:n,data:a}=t;if(n===0&&a){const r=a;return{list:r.list||[],total:r.total||0}}return{list:[],total:0}}catch(t){return console.error("获取开发机列表失败:",t),{list:[],total:0}}},gf=asyn
+
+
+############ /api/ml/v1/dev-machine/renewal ############
+
+
+############ /api/ml/v1/dev-machine/monitor ############
+
+
+############ /api/ml/v1/dev-machine/dev-log ############
+
+
+############ /api/ml/v1/dev-machine/remaining-time ############
+
+
+############ /api/ml/v1/dev-machine/user_resource ############
+
+--- occ 1 @ 239226 ---
+urn console.error("启动开发机失败:",t),{code:500,msg:"启动失败，请稍后重试",data:{status:""}}}},wf=async e=>{try{return await S.http.post("/api/ml/v1/dev-machine/enter",{data:e})}catch(t){return console.error("获取开发机进入链接失败:",t),{code:500,msg:"获取链接失败，请稍后重试",data:{codeserver:"",jupyterlab:""}}}},Ta=async()=>{try{const e=await S.http.get("/api/ml/v1/dev-machine/user_resource");return e.code===0&&e.data?{code:e.code,msg:e.msg||"获取资源信息成功",data:{user_ssoid:e.data.user_ssoid,computility_point_total:e.data.computility_point_total||0,computility_point_used:e.da

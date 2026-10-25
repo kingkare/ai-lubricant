@@ -197,6 +197,7 @@ async def admin_node_terminal(websocket: WebSocket, node_id: str) -> None:
 async def admin_list_node_terminals(
     node_id: str, user: User = Depends(_require_admin_http)
 ) -> dict:
+    """列节点当前打开的主机终端（运行内容、属主、状态）。仅管理员。"""
     from .node_client.terminal import request_terminals
 
     base, token = _control_endpoint_for(user)
@@ -207,6 +208,7 @@ async def admin_list_node_terminals(
 async def admin_interrupt_node_terminal(
     node_id: str, terminal_id: str, user: User = Depends(_require_admin_http)
 ) -> dict:
+    """中断终端里正在运行的命令（最高权限操作，记审计）。仅管理员。"""
     from .node_client.terminal import request_terminals
 
     base, token = _control_endpoint_for(user)
@@ -220,6 +222,7 @@ async def admin_interrupt_node_terminal(
 async def admin_close_node_terminal(
     node_id: str, terminal_id: str, user: User = Depends(_require_admin_http)
 ) -> dict:
+    """关闭一个终端（破坏性操作，记审计）。仅管理员。"""
     from .node_client.terminal import request_terminals
 
     base, token = _control_endpoint_for(user)

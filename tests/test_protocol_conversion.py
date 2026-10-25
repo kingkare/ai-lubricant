@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from fastapi import HTTPException
@@ -192,8 +193,9 @@ def test_raw_anthropic_body_passthrough_preserves_messages_and_overrides_model_s
     assert payload["model"] == "routed-model"
     assert payload["stream"] is False
     assert payload["messages"] is raw["messages"]
-    assert "You are Claude Code" in payload["system"]
-    assert str(raw["system"]) in payload["system"]
+    # 非客户端模拟（client_preset=none）：不追加 Claude Code 身份首句，system 原样透传
+    assert "You are Claude Code" not in json.dumps(payload["system"], ensure_ascii=False)
+    assert payload["system"] == raw["system"]
     assert payload["tools"] is raw["tools"]
 
 
@@ -809,6 +811,51 @@ def test_anthropic_to_openai_messages_orphan_tool_result_no_id_as_name():
     tool_msg = next(m for m in messages if m.get("role") == "tool")
     assert tool_msg.get("name") != tool_msg["tool_call_id"]
     assert "name" not in tool_msg
+
+
+def test_anthropic_to_openai_messages_tool_without_input_schema_gets_valid_empty_schema():
+    """跨协议转换：工具条目缺 input_schema 时，parameters 必须兜底成合法 JSON Schema。
+
+    复现线上 400 code=11129（WorkBuddy 国际版 /v2/chat/completions
+    "invalid function call parameters"）：Claude Code 的 web_search 是
+    {"name":"web_search","type":"web_search_20250305","max_uses":8}，不带
+    input_schema；旧代码 tool.get("input_schema", {}) 落成空对象 {}，上游判非法。
+    """
+    body = {
+        "model": "opus",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "search something"}],
+        "tool_choice": {"type": "tool", "name": "web_search"},
+        "tools": [{"name": "web_search", "type": "web_search_20250305", "max_uses": 8}],
+    }
+
+    _messages, kwargs = anthropic_to_openai_messages(body)
+
+    fn = kwargs["tools"][0]["function"]
+    assert fn["name"] == "web_search"
+    # 空对象 {} 非法；必须是带 type/properties 的合法空 schema
+    assert fn["parameters"] != {}
+    assert fn["parameters"] == {"type": "object", "properties": {}}
+
+
+def test_anthropic_to_openai_messages_preserves_real_input_schema():
+    """回归：带 input_schema 的普通工具，parameters 原样保留，不被空 schema 兜底覆盖。"""
+    schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    }
+    body = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"name": "get_weather", "description": "w", "input_schema": schema}],
+    }
+
+    _messages, kwargs = anthropic_to_openai_messages(body)
+
+    fn = kwargs["tools"][0]["function"]
+    assert fn["parameters"] == schema
 
 
 def test_responses_to_openai_messages_tool_result_carries_tool_name():

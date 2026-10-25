@@ -80,6 +80,11 @@ def _user_resp(user: User) -> UserResp:
 
 @router.post("/password-login", response_model=UserResp)
 async def password_login(body: PasswordLoginReq, response: Response) -> UserResp:
+    """邮箱密码登录。
+
+    先过人机验证闸（``captcha_required`` 关闭时跳过）；成功后签发会话并下发
+    HttpOnly cookie。账号停用 403，邮箱或密码错误 401。
+    """
     await _require_captcha(body.captcha_token)
     try:
         authed, cookie = await auth_service.password_login(body.email, body.password)
@@ -292,6 +297,7 @@ def _web_resp(data: dict) -> dict:
 
 @router.post("/logout")
 async def logout(request: Request, response: Response, user: User = Depends(get_current_user)) -> dict:
+    """退出登录：销毁当前会话 cookie 并记审计。"""
     cookie = request.cookies.get(USER_SESSION_COOKIE) or ""
     await auth_service.logout(str(user.id), cookie)
     response.delete_cookie(key=USER_SESSION_COOKIE, path="/")
@@ -361,6 +367,11 @@ class RuntimeKeyListItem(BaseModel):
 async def create_runtime_key(
     body: IssueRuntimeKeyReq, request: Request, user: User = Depends(get_current_user)
 ) -> RuntimeKeyResp:
+    """为当前用户签发运行时 API Key（可选绑 vm_id）。
+
+    响应里的 ``key`` 是明文，仅此一次；审计只记 id/name 不落密钥。
+    该 Key 是主 ``api_keys`` 表加了 ``user_id`` 标签的普通行，路由/限额/计费不变。
+    """
     from db import PostgresClient
 
     row = await PostgresClient.issue_runtime_api_key(
@@ -390,6 +401,7 @@ async def create_runtime_key(
 async def list_runtime_keys(
     user: User = Depends(get_current_user),
 ) -> list[RuntimeKeyListItem]:
+    """列当前用户的运行时 Key（密钥打码返回）。"""
     from db import PostgresClient
 
     rows = await PostgresClient.list_api_keys_by_user(str(user.id))
@@ -410,6 +422,7 @@ async def list_runtime_keys(
 async def delete_runtime_key(
     key_id: int, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除自己的运行时 Key（他人 Key 视作不存在，404）并记审计。"""
     from db import PostgresClient
 
     deleted = await PostgresClient.delete_runtime_api_key_for_user(key_id, str(user.id))

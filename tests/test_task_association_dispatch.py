@@ -306,14 +306,8 @@ async def test_unconfigured_proxy_yields_empty(tortoise_db, monkeypatch):
     assert env == []
 
 
-# ── credential note ─────────────────────────────────────────────────────────
-def test_credential_note_prefixes_content():
-    out = task_service_module._with_git_credential_note("fix the bug")
-    assert out.endswith("fix the bug")
-    assert out.startswith(task_service_module._GIT_CREDENTIAL_NOTE)
-    # The note tells the agent not to scrape .git/config for a credential.
-    assert ".git/config" in out
-
-
-def test_credential_note_on_empty_content():
-    assert task_service_module._with_git_credential_note("") == task_service_module._GIT_CREDENTIAL_NOTE
+# ── credential note（已删除：每轮前置的仓库凭据说明已按用户要求移除） ──────
+def test_credential_note_helper_removed():
+    # 助手不再给每轮 human turn 前置任何说明文本；投递内容即用户原文。
+    assert not hasattr(task_service_module, "_with_git_credential_note")
+    assert not hasattr(task_service_module, "_GIT_CREDENTIAL_NOTE")

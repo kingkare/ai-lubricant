@@ -81,6 +81,7 @@ class SubscriptionRulePatchReq(BaseModel):
 # ---- Event types / parameterized subscription rules -----------------------
 @router.get("/subscription-rules")
 async def list_subscription_rules(user: User = Depends(get_current_user)) -> dict:
+    """获取当前用户的通知订阅规则列表。"""
     return _ok(await notify_service.list_rules(str(user.id), owner_type="user"))
 
 
@@ -90,6 +91,10 @@ async def create_subscription_rule(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """新增订阅规则（事件类型 → 渠道）。
+
+    ``channel_id`` 与 ``event_type`` 必须有效，否则返回 400；写审计日志。
+    """
     result = await notify_service.create_rule(
         str(user.id), body.model_dump(exclude_none=True), owner_type="user"
     )
@@ -106,6 +111,10 @@ async def update_subscription_rule(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """更新一条订阅规则（部分字段）。
+
+    规则不存在或无效返回 404；写审计日志。
+    """
     ok = await notify_service.update_rule(
         str(user.id), rule_id, body.model_dump(exclude_none=True), owner_type="user"
     )
@@ -121,6 +130,10 @@ async def delete_subscription_rule(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """删除一条订阅规则。
+
+    规则不存在返回 404；写审计日志。
+    """
     ok = await notify_service.delete_rule(str(user.id), rule_id, owner_type="user")
     if not ok:
         raise HTTPException(status_code=404, detail="订阅规则不存在")
@@ -130,6 +143,10 @@ async def delete_subscription_rule(
 
 @router.get("/event-types")
 async def list_event_types(user: User = Depends(get_current_user)) -> dict:
+    """获取可订阅的通知事件类型目录。
+
+    仅返回用户可配置的事件；平台专属事件（冻结/安全/API Key 等）会被过滤。
+    """
     # User-side console may only configure user-scoped events (task/node online);
     # admin-only platform events (freeze/security/api_key…) are filtered out.
     # Sync method (static catalogue, no DB) — must not be awaited.
@@ -139,6 +156,10 @@ async def list_event_types(user: User = Depends(get_current_user)) -> dict:
 # ---- Channels -------------------------------------------------------------
 @router.get("/channels")
 async def list_channels(user: User = Depends(get_current_user)) -> dict:
+    """获取当前用户可见的通知渠道列表。
+
+    管理员可见所有渠道；普通用户仅可见自己拥有的，渠道密钥已脱敏。
+    """
     return _ok(await notify_service.list_channels(str(user.id), role=user.role))
 
 
@@ -146,6 +167,11 @@ async def list_channels(user: User = Depends(get_current_user)) -> dict:
 async def create_channel(
     body: CreateChannelReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """创建通知渠道（webhook 等）。
+
+    可携带 ``event_types``，由服务层同步维护订阅行；参数无效返回 400。
+    渠道密钥脱敏存储；写审计日志。
+    """
     try:
         result = await notify_service.create_channel(
             str(user.id), body.model_dump(exclude_none=True)
@@ -163,6 +189,10 @@ async def create_channel(
 async def update_channel(
     channel_id: str, body: UpdateChannelReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """更新通知渠道（部分字段）。
+
+    渠道不存在或无权访问返回 404；写审计日志。
+    """
     ok = await notify_service.update_channel(
         str(user.id), channel_id, body.model_dump(exclude_none=True), role=user.role
     )
@@ -180,6 +210,10 @@ async def update_channel(
 async def delete_channel(
     channel_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除通知渠道。
+
+    渠道不存在或无权访问返回 404；写审计日志。
+    """
     ok = await notify_service.delete_channel(str(user.id), channel_id, role=user.role)
     if not ok:
         raise HTTPException(status_code=404, detail="渠道不存在或无权访问")
@@ -218,6 +252,10 @@ async def test_channel(
 # ---- Subscriptions --------------------------------------------------------
 @router.get("/channels/{channel_id}/subscriptions")
 async def list_subscriptions(channel_id: str, user: User = Depends(get_current_user)) -> dict:
+    """获取某渠道下的订阅列表。
+
+    渠道不存在或无权访问返回 404。
+    """
     rows = await notify_service.list_subscriptions(str(user.id), channel_id, role=user.role)
     if rows is None:
         raise HTTPException(status_code=404, detail="渠道不存在或无权访问")
@@ -228,6 +266,10 @@ async def list_subscriptions(channel_id: str, user: User = Depends(get_current_u
 async def create_subscription(
     channel_id: str, body: CreateSubscriptionReq, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """为某渠道新增一条订阅。
+
+    渠道不存在或无权访问返回 404；写审计日志。
+    """
     sub = await notify_service.create_subscription(
         str(user.id), channel_id, body.model_dump(exclude_none=True), role=user.role
     )
@@ -245,6 +287,10 @@ async def create_subscription(
 async def delete_subscription(
     channel_id: str, sub_id: str, request: Request, user: User = Depends(get_current_user)
 ) -> dict:
+    """删除某渠道下的一条订阅。
+
+    订阅不存在或无权访问返回 404；写审计日志。
+    """
     ok = await notify_service.delete_subscription(
         str(user.id), channel_id, sub_id, role=user.role
     )
@@ -260,6 +306,10 @@ async def delete_subscription(
 # ---- Send logs ------------------------------------------------------------
 @router.get("/channels/{channel_id}/send-logs")
 async def list_send_logs(channel_id: str, user: User = Depends(get_current_user)) -> dict:
+    """获取某渠道的发送日志列表。
+
+    渠道不存在或无权访问返回 404。
+    """
     rows = await notify_service.list_send_logs(str(user.id), channel_id, role=user.role)
     if rows is None:
         raise HTTPException(status_code=404, detail="渠道不存在或无权访问")

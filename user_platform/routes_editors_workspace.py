@@ -348,6 +348,7 @@ async def _resolve_editor_workspace_ws(editor_id: str, user: User) -> tuple[dict
 async def list_editor_terminals(
     editor_id: str, user: User = Depends(get_current_user)
 ) -> dict:
+    """列出编辑器工作区内的终端会话列表（经控制面代理）。"""
     _, node_session_id = await _resolve_editor_workspace(editor_id, str(user.id))
     from . import config
     from .node_client.terminal import request_terminals
@@ -367,6 +368,7 @@ async def delete_editor_terminal(
     terminal_id: str,
     user: User = Depends(get_current_user),
 ) -> dict:
+    """删除编辑器工作区内的指定终端会话（经控制面代理）。"""
     _, node_session_id = await _resolve_editor_workspace(editor_id, str(user.id))
     from . import config
     from .node_client.terminal import request_terminals

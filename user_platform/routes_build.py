@@ -67,15 +67,54 @@ WDA_RECIPE = {
     "timeout_seconds": 1800,  # 30 min：xcodebuild 首次编译较慢
 }
 
-# recipe_kind -> recipe。本轮只 WDA；后续 recipe 只加一条。
+# recipe_kind -> recipe。WDA（git clone）+ 设备代理验证 app（archive 下载）。
+#
+# 设备代理验证 app（ios-device-proxy/）的源码随主仓走，不单独建仓：recipe 用
+# archive 源直接从 GitHub codeload 拉主仓 tarball，source_subdir 指到子目录。
+# 签名仍走 go-ios/ASC 路径（与本 recipe 无关），这里只编译打包出 unsigned.ipa。
+# source_url 可被请求体覆盖（start_project_build 的 source_url/source_subdir），
+# 所以换分支/换仓/换镜像不必改代码。
+DEVICE_PROXY_RECIPE = {
+    "source_kind": "archive",
+    # 默认指 GitHub codeload（公开仓镜像）。内网部署改 recipe 的 source_url，或在
+    # 请求体用 source_url 覆盖——内网源（如 gitea 地址）务必同时开 source_no_proxy，
+    # 否则 url_prefix 型出口代理会把内网地址拼成畸形 URL（ghfast.top/http://10.31...）。
+    "source_url": "https://codeload.github.com/wuxin-gh/ai-lubricant/tar.gz/refs/heads/main",
+    "source_ref": "",
+    "source_subdir": "ios-device-proxy",
+    # 内网源不走节点出口代理；GitHub 源被镜像代理改写是正路，故默认关。
+    "source_no_proxy": False,
+    "artifact_name": "device-proxy-unsigned",
+    "artifact_version": "0.1.0",
+    "steps": [
+        # 只编译不签名：与 WDA recipe 同口径，CODE_SIGN_* 全关。
+        "xcodebuild -project DeviceProxy.xcodeproj -scheme DeviceProxy "
+        "-destination 'generic/platform=iOS' "
+        "-derivedDataPath build "
+        "CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO",
+        "mkdir -p Payload && cp -R build/Build/Products/*-iphoneos/DeviceProxy.app Payload/",
+        "zip -qry unsigned.ipa Payload",
+    ],
+    "artifact_glob": "unsigned.ipa",
+    "timeout_seconds": 1800,
+}
+
 _RECIPES: dict[str, dict[str, Any]] = {
     "xcode_wda": WDA_RECIPE,
+    "device_proxy": DEVICE_PROXY_RECIPE,
 }
 
 
 class StartBuildReq(BaseModel):
     recipe_kind: str
     node_id: str
+    # 可选覆盖（archive recipe 换源）：不填走 recipe 默认。source_kind 支持
+    # "git"/"archive"；source_subdir 仅 archive 有意义（归档内子目录）。
+    # source_no_proxy=True = 内网源不走节点出口代理（镜像代理会改写坏内网地址）。
+    source_url: str | None = None
+    source_ref: str | None = None
+    source_subdir: str | None = None
+    source_no_proxy: bool | None = None
 
 
 # 模块级 build_id -> owner + 产物元数据（上传端点回填 sha/路径）。与 registry
@@ -143,11 +182,22 @@ async def start_project_build(
         "owner_user_id": str(user.id),
         "node_id": node_id,
         "project_id": project_id,
+        "recipe_kind": body.recipe_kind,
         "artifact_name": recipe["artifact_name"],
         "artifact_version": recipe["artifact_version"],
         "artifact_sha256": None,  # 构建完成后由上传端点回填
         "storage_path": None,
     }
+
+    # 可选覆盖：请求体给了就优先（archive recipe 换源/换镜像用）。空串=不覆盖。
+    source_url = (body.source_url or "").strip() or recipe["source_url"]
+    source_ref = (body.source_ref or "").strip() or recipe.get("source_ref", "")
+    source_subdir = (body.source_subdir or "").strip() or recipe.get("source_subdir", "")
+    source_kind = recipe.get("source_kind", "git")
+    # source_no_proxy：请求体显式给了就用它（None=没传，走 recipe 默认）。
+    source_no_proxy = (
+        recipe.get("source_no_proxy", False) if body.source_no_proxy is None else body.source_no_proxy
+    )
 
     from .node_client import get_node_client, NodeServerUnavailable, RPCError
 
@@ -157,8 +207,8 @@ async def start_project_build(
             node_id,
             build_id,
             recipe_kind=body.recipe_kind,
-            source_url=recipe["source_url"],
-            source_ref=recipe["source_ref"],
+            source_url=source_url,
+            source_ref=source_ref,
             steps=recipe["steps"],
             artifact_glob=recipe["artifact_glob"],
             upload_url=upload_url,
@@ -166,6 +216,9 @@ async def start_project_build(
             timeout_seconds=int(recipe["timeout_seconds"]),
             artifact_name=recipe["artifact_name"],
             artifact_version=recipe["artifact_version"],
+            source_kind=source_kind,
+            source_subdir=source_subdir,
+            source_no_proxy=source_no_proxy,
         )
     except NodeServerUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -305,6 +358,12 @@ async def download_project_build_artifact(build_id: str, user: User = Depends(ge
         raise HTTPException(status_code=404, detail="产物文件不存在（构建可能尚未完成）")
 
     version = cfg.get("artifact_version") or ""
-    # 市场契约名：device-control-<version>-ios.ipa（运营方下载后可直接拖入上传弹框）
-    filename = f"device-control-{version}-ios.ipa" if version else "wda-unsigned.ipa"
+    # 市场契约名：device-control-<version>-ios.ipa（运营方下载后可直接拖入上传弹框）。
+    # 设备代理验证 app 走同一下载端点，用独立前缀避免与 WDA runner 混淆。
+    if cfg.get("recipe_kind") == "device_proxy":
+        filename = f"device-proxy-{version or '0.1.0'}-ios.ipa"
+    elif version:
+        filename = f"device-control-{version}-ios.ipa"
+    else:
+        filename = "wda-unsigned.ipa"
     return FileResponse(storage_path, media_type="application/octet-stream", filename=filename)

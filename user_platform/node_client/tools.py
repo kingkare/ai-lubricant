@@ -359,6 +359,7 @@ class TerminalCommandBatch:
         shell_flavor: str,
         auto_allow_keys: Optional[set[str]] = None,
         timeout_seconds: int = CONFIRMATION_TIMEOUT_SECONDS,
+        auto_approve: "bool | Callable[[], bool]" = False,
     ) -> None:
         self._conversation_id = conversation_id
         self._node_id = node_id
@@ -366,6 +367,10 @@ class TerminalCommandBatch:
         self._emit = emit
         self._shell_flavor = shell_flavor
         self._auto_allow_keys = set(auto_allow_keys) if auto_allow_keys else set()
+        # auto 模式放行开关：对话里用户显式选「自动」执行模式时由注册入口传入，
+        # 预扫全部记 allow、不弹卡（含危险结构与多段链）；审计仍记 auto_allowed。
+        # 传 callable 时**每次 prepare 现取**（读会话活状态），回合中途切 auto 立即生效。
+        self._auto_approve = auto_approve
         # 注册表到期时刻与本地 wait_for 必须同值，否则两边各按各的到期。
         # 0 = 不过期，wait_for 侧转成 None（永久等待）。
         self._timeout_seconds = int(timeout_seconds)
@@ -380,6 +385,11 @@ class TerminalCommandBatch:
         与 ApprovalRegistry.create 同口径——负数不是哨兵，仍是「立即到期」。
         """
         return None if self._timeout_seconds == 0 else self._timeout_seconds
+
+    def _is_auto(self) -> bool:
+        """是否 auto 模式（callable 每次现取 = 读会话活状态；bool = 快照）。"""
+        aa = self._auto_approve
+        return bool(aa() if callable(aa) else aa)
 
     async def prepare(self, tool_calls: list[dict]) -> None:
         """Scan a turn's tool calls and raise one approval if any command needs it."""
@@ -401,6 +411,11 @@ class TerminalCommandBatch:
                 commands.append(cmd)
 
         if not commands:
+            return
+        # auto 模式：全部自动放行，不建审批卡也不等裁决。
+        # emit=None（无人值守）时仍 fail closed：没有事件出口就没有「用户在场」。
+        if self._is_auto() and self._emit is not None:
+            self._decisions = [(c, "allow", True) for c in commands]
             return
         needs = [
             c for c in commands
@@ -477,6 +492,7 @@ def register_node_shell_exec(
     executor: Optional[TerminalExecutor] = None,
     auto_allow_keys: Optional[set[str]] = None,
     timeout_seconds: int = CONFIRMATION_TIMEOUT_SECONDS,
+    auto_approve: bool = False,
 ) -> "TerminalCommandBatch":
     """Register the terminal-bound node shell tool.
 
@@ -502,6 +518,7 @@ def register_node_shell_exec(
         shell_flavor=shell_flavor,
         auto_allow_keys=auto_allow_keys,
         timeout_seconds=timeout_seconds,
+        auto_approve=auto_approve,
     )
 
     async def _run(command: str, *, auto_allowed: bool = False) -> dict[str, Any]:
@@ -552,6 +569,9 @@ def register_node_shell_exec(
         # No batch decision (e.g. a lone tool call outside the pre-scan): safe
         # commands run directly, otherwise raise a single-command approval.
         # A policy auto-allow hit skips the card but is still audited as such.
+        # auto 模式放行：不做确认判定直接执行，审计记 auto_allowed。
+        if batch._is_auto():
+            return await _run(command, auto_allowed=True)
         if not command_requires_confirmation(command, shell_flavor, batch._auto_allow_keys):
             auto = (
                 batch._auto_allow_keys

@@ -134,12 +134,22 @@ class ApprovalRegistry:
         commands: list[str] | None = None,
         metadata: dict | None = None,
     ) -> PendingAction:
+        batch = [str(item).strip() for item in (commands or [command]) if str(item).strip()]
+        canonical = "\n".join(batch) if batch else command
+        command_hash = hash_command(canonical)
+        # 同一会话里「完全相同的待裁决命令」复用一个 action：模型每轮都会重新
+        # 发起同一批 tool_call，不复用的话同一个审批点会堆出一张又一张新卡
+        # （uuid4 每次不同 → 面板按 confirmationId 去重永远判新）。复用后所有
+        # 等待方挂在同一个 future 上，用户裁决一次即全部唤醒。
+        existing = self.find_pending(
+            conversation_id=conversation_id, tool_name=tool_name, command_hash=command_hash,
+        )
+        if existing is not None:
+            return existing
         confirmation_id = uuid.uuid4().hex
         now = time.time()
         loop = asyncio.get_event_loop()
         future: asyncio.Future = loop.create_future()
-        batch = [str(item).strip() for item in (commands or [command]) if str(item).strip()]
-        canonical = "\n".join(batch) if batch else command
         # 只有恰好 timeout_seconds==0 表示「不过期」：落成 expires_at=0 哨兵，
         # is_expired / reap_expired 都把它当永不过期，to_dict 原样发 0，前端归一层
         # 同样用 0 表示不过期。负数不是哨兵，仍是「已经过期」的正常时刻——调用方
@@ -151,7 +161,7 @@ class ApprovalRegistry:
             node_id=node_id,
             tool_name=tool_name,
             command=canonical,
-            command_hash=hash_command(canonical),
+            command_hash=command_hash,
             requester=requester,
             shell_flavor=shell_flavor,
             created_at=now,
@@ -166,18 +176,73 @@ class ApprovalRegistry:
     def get(self, confirmation_id: str) -> Optional[PendingAction]:
         return self._pending.get((confirmation_id or "").strip())
 
-    def list_pending(self, conversation_id: str) -> list[PendingAction]:
+    def find_pending(
+        self, *, conversation_id: str, tool_name: str, command_hash: str,
+    ) -> Optional[PendingAction]:
+        """查找同一会话里完全相同的**未裁决**待办（复用而非新建，见 create）。
+
+        过期/已裁决的不算：那类要新建一张（用户对同一命令的下一次请求是新的决定）。
+        """
         cid = (conversation_id or "").strip()
-        return [a for a in self._pending.values() if a.conversation_id == cid]
+        for action in self._pending.values():
+            if (
+                action.resolved is None
+                and action.conversation_id == cid
+                and action.tool_name == tool_name
+                and action.command_hash == command_hash
+                and not action.is_expired()
+            ):
+                return action
+        return None
+
+    def list_pending(self, conversation_id: str) -> list[PendingAction]:
+        """本会话**仍未裁决且未过期**的待办。
+
+        这是刷新/重连后「恢复审批卡」的数据源，只该回真正需要用户动作的卡。
+        早先只按 conversation_id 过滤、把已 resolved 的 action 也发回前端，于是
+        用户刚批准、一刷新卡片又以 pending 出现（三端同根）。已裁决的留在
+        ``_pending`` 只为守 future/审计，不参与 pending 投影。
+        """
+        cid = (conversation_id or "").strip()
+        now = time.time()
+        return [
+            a for a in self._pending.values()
+            if a.conversation_id == cid and a.resolved is None and not a.is_expired(now)
+        ]
+
+    def allow_pending(self, conversation_id: str) -> list[PendingAction]:
+        """把某会话当前所有未裁决待办一次性放行，返回被放行的 action 列表。
+
+        用于「切到自动模式后立即生效」：用户切 auto 时，本轮可能已经挂着审批卡，
+        不可能等下一次发送才生效——这里把在途的 pending 全部按 allow 唤醒。
+
+        返回 action 列表而非条数：调用方要据此向各端广播 ``approval_resolved``，
+        把已经挂在前端的旧卡翻成「已允许」（否则旧卡一直挂到流结束被误判过期）。
+        """
+        cid = (conversation_id or "").strip()
+        released: list[PendingAction] = []
+        for action in list(self._pending.values()):
+            if action.conversation_id != cid or action.resolved is not None:
+                continue
+            action.resolved = "allow"
+            if not action.future.done():
+                action.future.set_result("allow")
+            released.append(action)
+        return released
 
     def resolve(self, confirmation_id: str, result: str) -> Optional[PendingAction]:
         """Mark the action resolved and wake the waiting tool.
 
-        Returns the action if it existed and was unresolved, else None (caller
-        surfaces 404/409).
+        Returns the action if it existed, was unresolved **and not yet expired**,
+        else None (caller surfaces 404/409). Expired-but-not-yet-reaped actions
+        must not be resolvable: without the ``is_expired`` guard a card the client
+        already flipped to「已过期」 could still be allowed on a late click — the
+        deadline governs, not reap timing.
         """
         action = self._pending.get((confirmation_id or "").strip())
         if action is None or action.resolved is not None:
+            return None
+        if action.is_expired():
             return None
         action.resolved = result
         if not action.future.done():
@@ -207,6 +272,28 @@ approval_registry = ApprovalRegistry()
 
 # Event sink type: an async callable that receives one SSE event dict.
 EventSink = Callable[[dict], "asyncio.Awaitable[None]"]
+
+
+async def publish_approval_resolved(
+    conv_id: str, confirmation_id: str, result: str, *, tool_name: str = "",
+) -> None:
+    """向会话广播一条 ``approval_resolved``，让已挂卡的前端把卡翻成裁决态。
+
+    ``confirmation_required`` 是「建卡」，这条是它的对称事件——用户在别处裁决、
+    或切 auto 触发 ``allow_pending`` 批量放行时，本会话所有订阅者（发起标签页、
+    同 client 其它标签页、控制台、手机）都得把对应 id 的卡更新掉，否则那张卡会
+    一直挂在 pending 直到流结束被误判过期。广播失败绝不影响裁决主流程。
+    """
+    try:
+        from agent import conversation_hub
+        await conversation_hub.publish(conv_id, {
+            "type": "approval_resolved",
+            "confirmation_id": confirmation_id,
+            "result": result,
+            "tool_name": tool_name,
+        })
+    except Exception:  # noqa: BLE001 — 广播失败不能影响裁决
+        pass
 
 
 async def emit_confirmation_required(

@@ -73,12 +73,92 @@ def test_openai_sse_error_detects_bare_json_after_heartbeat():
             ": PING\n\n" + json.dumps(upstream_error)
         )
 
-    assert exc_info.value.status_code == 502
+    # code 是字符串（供应商没映射到 HTTP 状态码）→ 统一 400，不再塌缩 502 冻号到今天；
+    # detail 仍是完整错误体。超限归一由出口 canonicalize 兜。
+    assert exc_info.value.status_code == 400
     assert exc_info.value.detail == upstream_error
 
 
 def test_openai_sse_error_ignores_non_error_bare_json():
     CustomProvider._check_openai_sse_error(': PING\n\n{"status":"ok"}')
+
+
+# ==================== 业务码→HTTP 状态码：映射了尊重、没映射统一 400 ====================
+
+def test_sse_error_unmapped_business_code_maps_400_with_envelope():
+    """龙虾 200+error 帧业务码 40201（真实现网报文 2026-10-11「免费额度已用完，请升级套餐」）：
+    供应商没把它映射成 HTTP 状态码 → 统一 400（不命中冻结规则、换候选、耗尽后框架兜底 429），
+    detail 归一成标准 error 信封且**保留业务码**。"""
+    frame = ('event:error\ndata:{"type":"error","error":{"type":"proxy_error",'
+             '"message":"免费额度已用完，请升级套餐","code":40201}}')
+    with pytest.raises(HTTPException) as exc_info:
+        CustomProvider._check_openai_sse_error(frame)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == {
+        "error": {
+            "message": "免费额度已用完，请升级套餐",
+            "type": "proxy_error",
+            "code": "40201",
+        }
+    }
+
+
+def test_sse_error_mapped_http_status_is_respected():
+    """上游 code 本就是合法 HTTP 状态（429/500）→ 原样尊重，不改写。"""
+    for code, expected in (("429", 429), (500, 500), (404, 404)):
+        frame = f'event:error\ndata:{{"error":{{"message":"m","type":"t","code":{json.dumps(code)}}}}}'
+        with pytest.raises(HTTPException) as exc_info:
+            CustomProvider._check_openai_sse_error(frame)
+        assert exc_info.value.status_code == expected, (code, expected)
+
+
+def test_bare_json_unmapped_code_maps_400_keeps_body_detail():
+    """裸 JSON 尾帧同口径：code 越界/字符串 → 400；detail 仍是完整错误体。"""
+    upstream_error = {
+        "error": {"message": "免费额度已用完，请升级套餐", "type": "proxy_error", "code": 40201}
+    }
+    with pytest.raises(HTTPException) as exc_info:
+        CustomProvider._check_openai_sse_error(": PING\n\n" + json.dumps(upstream_error))
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == upstream_error
+
+
+def test_raise_upstream_error_drills_nested_body_and_envelopes():
+    """spec 常把整包 body（{"type":"error","error":{...}}）传给 _raise_upstream_error，
+    必须向下钻一层取到业务码/文案，缺 code 也归 400（不再是 502）。"""
+    with pytest.raises(HTTPException) as nested:
+        CustomProvider._raise_upstream_error(
+            {"type": "error", "error": {"type": "proxy_error", "message": "积分不足", "code": 40201}}
+        )
+    assert nested.value.status_code == 400
+    assert nested.value.detail == {"error": {"message": "积分不足", "type": "proxy_error", "code": "40201"}}
+
+    # 完全没给 code 的字符串错误体：同样 400 + 信封（不是 502）
+    with pytest.raises(HTTPException) as plain:
+        CustomProvider._raise_upstream_error("backend exploded")
+    assert plain.value.status_code == 400
+    assert plain.value.detail["error"]["message"] == "backend exploded"
+
+
+def test_raise_upstream_error_degraded_still_503():
+    """degraded function 是既有的确定性归类（上游函数临时不可用），优先于「没映射→400」。"""
+    with pytest.raises(HTTPException) as exc_info:
+        CustomProvider._raise_upstream_error(
+            {"message": "Function id 'x': DEGRADED function cannot be invoked"}
+        )
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["error"]["code"] == "upstream_function_degraded"
+
+
+def test_raise_upstream_error_explicit_default_status_is_kept():
+    """媒体生成把真实 HTTP response.status 作 default_status 传入——上游给了合法 4xx/5xx
+    时尊重，越界业务码才落 default（这里显式传 502 → 仍 502，不受新默认影响）。"""
+    with pytest.raises(HTTPException) as exc_info:
+        CustomProvider._raise_upstream_error({"code": 40201, "message": "boom"}, 502)
+    assert exc_info.value.status_code == 502
+    with pytest.raises(HTTPException) as mapped:
+        CustomProvider._raise_upstream_error({"code": 429, "message": "rate limited"}, 502)
+    assert mapped.value.status_code == 429
 
 
 class CloudflareErrorsProvider(CustomProvider):
@@ -114,9 +194,10 @@ def test_non_stream_cloudflare_errors_array_is_raised_and_normalized():
 
     assert exc_info.value.status_code == 503
     message = exc_info.value.detail
-    assert "上游函数临时不可用，已按上游异常处理" in message
-    assert "Function id" not in message
-    assert "DEGRADED function cannot be invoked" not in message
+    # detail 归一成标准 error 信封；断言取 message 字段（不再是纯字符串）。
+    assert message["error"]["message"] == "上游函数临时不可用，已按上游异常处理"
+    assert "Function id" not in message["error"]["message"]
+    assert "DEGRADED function cannot be invoked" not in message["error"]["message"]
 
 
 def test_extract_upstream_error_matches_cloudflare_errors_shape():
@@ -712,9 +793,10 @@ def test_anthropic_passthrough_stream_raises_on_openai_style_error_frame():
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(collect())
 
-    assert exc_info.value.status_code == 502
+    assert exc_info.value.status_code == 400
     detail = exc_info.value.detail
-    assert "Console API returned 429" in detail
+    # code "upstream_error" 不是合法 HTTP 状态码（供应商没映射）→ 统一 400；detail 归信封。
+    assert detail["error"]["message"] == "Console API returned 429"
 
 
 def test_anthropic_passthrough_stream_raises_on_bare_json_error_body():
@@ -745,7 +827,8 @@ def test_anthropic_passthrough_stream_raises_on_bare_json_error_body():
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(collect())
 
-    assert exc_info.value.status_code == 502
+    # code "server_error" 不是合法 HTTP 状态码 → 400（未映射统一收口），detail 仍是完整错误体。
+    assert exc_info.value.status_code == 400
     assert exc_info.value.detail == {
         "error": {
             "code": "server_error",
@@ -797,7 +880,7 @@ def test_responses_passthrough_stream_raises_on_bare_json_error_body():
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(collect())
 
-    assert exc_info.value.status_code == 502
+    assert exc_info.value.status_code == 400
 
 
 def test_bare_json_check_ignores_normal_sse_and_non_error_json():
@@ -833,8 +916,10 @@ def test_anthropic_stream_chat_raises_on_openai_style_error_frame():
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(collect())
 
-    assert exc_info.value.status_code == 429
-    assert "Rate limit exceeded" in exc_info.value.detail
+    # 严格统一口径：code "rate_limit_exceeded" 不是合法 HTTP 状态码（供应商没映射）→ 400。
+    # 框架换候选/冻结兜底在 classify_failure / apply_freeze_policy，provider 层不伪造 429。
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["error"]["message"] == "Rate limit exceeded"
 
 
 

@@ -116,7 +116,13 @@ class MailClient:
                     payload = json.loads(text)
                 except Exception as exc:
                     raise MailClientError("上游邮件服务返回了非 JSON 响应") from exc
+        except MailClientError:
+            raise
         except aiohttp.ClientError as exc:
+            raise MailClientError(f"无法连接上游邮件服务: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            # 经共享 ProxyManager 出站时（node/browser/url_prefix 模式）底层可能抛
+            # 非 aiohttp 异常；统一收敛成 MailClientError，调用方口径不变。
             raise MailClientError(f"无法连接上游邮件服务: {exc}") from exc
         if not isinstance(payload, dict):
             raise MailClientError("上游邮件服务返回格式无效")
