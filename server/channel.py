@@ -76,9 +76,14 @@ def resolve_upstream_stream(value, client_stream: bool) -> bool:
 # 过滤」的需求只能靠只搜索规则表达。
 MODEL_ID_RULE_FIELDS = ("name", "enabled", "pattern", "replacement", "search_only")
 MODEL_ID_TEMPLATE_FIELDS = ("kind", "template_id", "enabled")
+MODEL_ID_MULTIPLIER_FIELDS = ("kind", "name", "enabled", "op", "value")
 
 MODEL_ID_ENTRY_RULE = "rule"
 MODEL_ID_ENTRY_TEMPLATE = "template"
+MODEL_ID_ENTRY_MULTIPLIER = "multiplier"
+
+# 倍率过滤支持的比较运算符。命中即保留该模型（与「只搜索」同款准入语义）。
+_MULTIPLIER_OPS = (">", ">=", "<", "<=", "==")
 
 # 全局模型规则模版缓存：{template_id: [rule, ...]}。真相源是 app_config 表的
 # model_rule_templates，由 admin 写入后经 runtime_sync 广播回灌到这里。
@@ -140,7 +145,8 @@ def normalize_model_id_rewrite_rules(raw) -> list[dict]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        if str(item.get("kind") or MODEL_ID_ENTRY_RULE) == MODEL_ID_ENTRY_TEMPLATE:
+        kind = str(item.get("kind") or MODEL_ID_ENTRY_RULE)
+        if kind == MODEL_ID_ENTRY_TEMPLATE:
             template_id = str(item.get("template_id") or "").strip()
             if not template_id:
                 continue
@@ -148,6 +154,24 @@ def normalize_model_id_rewrite_rules(raw) -> list[dict]:
                 "kind": MODEL_ID_ENTRY_TEMPLATE,
                 "template_id": template_id,
                 "enabled": item.get("enabled", True) is not False,
+            })
+            continue
+        if kind == MODEL_ID_ENTRY_MULTIPLIER:
+            # 倍率过滤条目：op 必须是支持的比较符，value 必须是有限数字。
+            # 坏条目静默丢弃（运行时读配置不该因一条坏规则整体失败；保存侧
+            # compile_model_id_rewrite_rules 会显式报错拒绝）。
+            op = str(item.get("op") or "").strip()
+            if op not in _MULTIPLIER_OPS:
+                continue
+            value = item.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            entries.append({
+                "kind": MODEL_ID_ENTRY_MULTIPLIER,
+                "name": str(item.get("name") or "").strip(),
+                "enabled": item.get("enabled", True) is not False,
+                "op": op,
+                "value": float(value),
             })
             continue
         pattern = item.get("pattern")
@@ -165,8 +189,18 @@ def normalize_model_id_rewrite_rules(raw) -> list[dict]:
 
 
 def is_model_id_template_entry(entry) -> bool:
-    """条目是否为模版引用。kind 缺省视为内联规则。"""
+    """条目是否为模版引用。kind 缺省视为内联规则。
+
+    注意：倍率过滤条目（kind="multiplier"）**不是**模版引用——它走
+    is_model_id_multiplier_entry 判定。两者都是「非内联改名规则」，展开与校验
+    时各自分支处理，不能混为一谈（模版引用要查模版缓存、倍率条目直接参与判定）。
+    """
     return isinstance(entry, dict) and entry.get("kind") == MODEL_ID_ENTRY_TEMPLATE
+
+
+def is_model_id_multiplier_entry(entry) -> bool:
+    """条目是否为倍率过滤规则。"""
+    return isinstance(entry, dict) and entry.get("kind") == MODEL_ID_ENTRY_MULTIPLIER
 
 
 def expand_model_id_rewrite_rules(raw) -> list[dict]:
@@ -199,13 +233,25 @@ def compile_model_id_rewrite_rules(raw) -> tuple[list[dict], list[str]]:
     保存前用这个做校验：任何一条正则不合法都应当被拒绝，而不是等到模型同步时
     才炸。错误信息带上行号与规则名，便于前端定位是哪一条坏了。
 
-    只校验内联规则的正则。模版引用不校验 template_id 是否存在——模版可以后建，
-    渠道也可能随渠道模板跨实例导入，引用先落库、模版后同步是合法状态。
+    只校验内联规则的正则与倍率条目的 op/value。模版引用不校验 template_id 是否存在
+    ——模版可以后建，渠道也可能随渠道模板跨实例导入，引用先落库、模版后同步是合法状态。
     """
     entries = normalize_model_id_rewrite_rules(raw)
     errors: list[str] = []
+    # 倍率条目的坏 op/value 会被 normalize 静默丢掉——保存侧必须显式报错，
+    # 否则用户配的过滤规则无声消失，还以为生效了。
+    for idx, item in enumerate(raw if isinstance(raw, list) else [], start=1):
+        if not isinstance(item, dict) or str(item.get("kind") or "") != MODEL_ID_ENTRY_MULTIPLIER:
+            continue
+        op = str(item.get("op") or "").strip()
+        value = item.get("value")
+        label = str(item.get("name") or "").strip() or f"第 {idx} 条"
+        if op not in _MULTIPLIER_OPS:
+            errors.append(f"{label}: 倍率比较符不合法（支持 {'/'.join(_MULTIPLIER_OPS)}）")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            errors.append(f"{label}: 倍率阈值必须是数字")
     for idx, entry in enumerate(entries, start=1):
-        if is_model_id_template_entry(entry):
+        if is_model_id_template_entry(entry) or is_model_id_multiplier_entry(entry):
             continue
         try:
             re.compile(entry["pattern"])
@@ -222,6 +268,8 @@ def apply_model_id_rewrite_rules(model_id: str, rules, *, strip_prefix: bool = T
     模版引用在这里展开（活引用，取当前模版内容）。
     只搜索规则（search_only）不参与改名，整条跳过——它只做过滤，判定在
     model_id_matches_search_rules。
+    倍率过滤规则（multiplier）不参与改名，整条跳过——它只做过滤，判定在
+    model_matches_multiplier_rules。
     单条规则抛异常时跳过该条并记日志，不让一个坏规则打断整轮模型同步。
     结果为空则回退到改写前的值，避免把模型名抹成空串。
     """
@@ -229,7 +277,7 @@ def apply_model_id_rewrite_rules(model_id: str, rules, *, strip_prefix: bool = T
     if not result:
         return result
     for rule in expand_model_id_rewrite_rules(rules):
-        if not rule["enabled"] or rule.get("search_only"):
+        if not rule["enabled"] or rule.get("search_only") or is_model_id_multiplier_entry(rule):
             continue
         try:
             rewritten = re.sub(rule["pattern"], rule["replacement"], result)
@@ -267,6 +315,37 @@ def model_id_matches_search_rules(model_id: str, rules) -> bool:
                 f"pattern={rule['pattern']!r}: {exc}"
             )
             continue
+    return False
+
+
+def model_matches_multiplier_rules(multiplier: float | None, rules) -> bool:
+    """倍率过滤规则是否命中（命中即保留该模型，与「只搜索」同款准入语义）。
+
+    - 没有倍率过滤规则 = 不过滤（返回 False 但调用方按「没配规则」跳过倍率维度，
+      用 has_multiplier_rules 区分「配了没命中」与「没配」）。
+    - 倍率值为 None（上游没声明、库内也没手填）= 不命中（不保留）——严格过滤，
+      不臆造 1.0 把没倍率的模型放进来。
+    - 多条倍率规则之间是 OR：任一条满足即保留（与多条只搜索规则同款）。
+    """
+    if multiplier is None:
+        return False
+    for rule in expand_model_id_rewrite_rules(rules):
+        if not rule["enabled"] or not is_model_id_multiplier_entry(rule):
+            continue
+        op = str(rule.get("op") or "").strip()
+        value = rule.get("value")
+        if op not in _MULTIPLIER_OPS or not isinstance(value, (int, float)):
+            continue
+        if op == ">=" and multiplier >= value:
+            return True
+        if op == ">" and multiplier > value:
+            return True
+        if op == "<=" and multiplier <= value:
+            return True
+        if op == "<" and multiplier < value:
+            return True
+        if op == "==" and multiplier == value:
+            return True
     return False
 
 
@@ -660,9 +739,11 @@ class Channel:
             image_path=merged.get("image_path") or "/v1/images/generations",
             video_path=merged.get("video_path") or "/v1/videos/generations",
             speech_path=merged.get("speech_path") or "/v1/audio/speech",
+            embeddings_path=merged.get("embeddings_path") or "/v1/embeddings",
             supports_tts=bool(merged.get("supports_tts", False)),
             supports_image_generation=bool(merged.get("supports_image_generation", False)),
             supports_video_generation=bool(merged.get("supports_video_generation", False)),
+            supports_embeddings=bool(merged.get("supports_embeddings", False)),
             upstream_stream=upstream_stream,
             auto_update_models=merged.get("auto_update_models", True),
             model_id_rewrite_rules=normalize_model_id_rewrite_rules(merged.get("model_id_rewrite_rules")),
@@ -821,6 +902,29 @@ class Channel:
     def matches_search_rules(self, model_id: str) -> bool:
         """「只搜索」规则是否命中全量模型名——命中的行在自动更新/导入预览时保留。"""
         return model_id_matches_search_rules(model_id, self.model_id_rewrite_rules)
+
+    def matches_multiplier_rules(self, multiplier: float | None) -> bool:
+        """倍率过滤规则是否命中——命中的行在自动更新/导入预览时保留。"""
+        return model_matches_multiplier_rules(multiplier, self.model_id_rewrite_rules)
+
+    def has_name_filter_rules(self) -> bool:
+        """是否配了生效中的**名称维度**规则（改名或只搜索）。
+
+        倍率维度单独由 has_multiplier_rules 判定——两个维度在准入时是 AND：
+        只有配了名称维度才要求名称命中，否则名称维度视为放行（否则纯倍率
+        过滤会把所有模型都挡掉）。
+        """
+        return any(
+            rule["enabled"] and not is_model_id_multiplier_entry(rule)
+            for rule in expand_model_id_rewrite_rules(self.model_id_rewrite_rules)
+        )
+
+    def has_multiplier_rules(self) -> bool:
+        """是否配了生效中的倍率过滤规则。"""
+        return any(
+            rule["enabled"] and is_model_id_multiplier_entry(rule)
+            for rule in expand_model_id_rewrite_rules(self.model_id_rewrite_rules)
+        )
 
     # ── 渠道级 TTFT/响应时间统计 ──
     def record_ttft(self, ttft_ms: int | float | None) -> None:

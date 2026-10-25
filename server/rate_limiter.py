@@ -86,6 +86,7 @@ _MEDIA_OPERATION_CONFIG = {
     "image_generation": {"method": "generate_image", "modality": "image"},
     "video_generation": {"method": "generate_video", "modality": "video"},
     "tts_generation": {"method": "generate_speech", "modality": "audio"},
+    "embedding": {"method": "create_embedding", "modality": "embedding"},
 }
 
 # 冻结/冷却原因在下游（Redis 冷却记录、内存 cooldown_reason、日志、管理端展示）展示时的最大长度。
@@ -2406,27 +2407,48 @@ class ModelClientPool:
 
     @classmethod
     def _channel_has_rewrite_rules(cls, provider_name: str) -> bool:
-        """本渠道是否配了生效中的改写规则；拿不到渠道对象时按「没配」处理。"""
+        """本渠道是否配了生效中的改写/过滤规则；拿不到渠道对象时按「没配」处理。
+
+        倍率过滤规则也算「配了规则」——自动更新要按它过滤，不能视同没配置。
+        """
         pool = cls.get_provider_pool(provider_name)
         channel = getattr(pool, "channel", None) if pool else None
         return bool(channel is not None and channel.has_model_id_rewrite_rules())
 
     @classmethod
-    def _is_regex_hit(cls, provider_name: str, raw_model_id: str) -> bool:
+    def _is_regex_hit(cls, provider_name: str, raw_model_id: str, cost_multiplier: float | None = None) -> bool:
         """规则是否命中了这个模型——命中即该模型保留（定时同步的过滤条件）。
 
-        两种命中：改写规则改了名字（只切 owner/ 前缀不算，那是无配置时的默认
-        形态），或「只搜索」规则命中了全量名。这是**内部判定**，不再作为字段发给
-        前端——前端按「勾选过滤与否」二选一显示 model_id / regex_model_id 即可。
+        两个维度 AND：名称维度与倍率维度都放行才算命中。
+
+        - 名称维度：配了名称规则（改名/只搜索）才要求命中——改写规则改了名字
+          （只切 owner/ 前缀不算，那是无配置时的默认形态），或「只搜索」规则命中了
+          全量名。没配名称规则 = 名称维度放行。
+        - 倍率维度：配了倍率过滤规则才要求命中（倍率值满足任一比较条件）。没配
+          倍率规则 = 倍率维度放行；配了但上游没给倍率值（None）= 不命中。
+
+        这样「只配倍率过滤」能独立工作（名称维度没配 = 放行），也不会被无关的
+        改名规则放行——普通改名规则不构成命中，只有「改了名字」或「只搜索命中」
+        才算名称命中。
+
+        这是**内部判定**，不再作为字段发给前端——前端按「勾选过滤与否」二选一显示
+        model_id / regex_model_id 即可。
         """
         pool = cls.get_provider_pool(provider_name)
         channel = getattr(pool, "channel", None) if pool else None
         if channel is None:
             # 拿不到渠道对象时无规则可判，按「没命中」处理（与旧口径一致）。
             return False
-        if channel.public_model_id(raw_model_id) != strip_model_owner_prefix(raw_model_id):
-            return True
-        return channel.matches_search_rules(raw_model_id)
+        if channel.has_name_filter_rules():
+            name_hit = (
+                channel.public_model_id(raw_model_id) != strip_model_owner_prefix(raw_model_id)
+                or channel.matches_search_rules(raw_model_id)
+            )
+            if not name_hit:
+                return False
+        if channel.has_multiplier_rules() and not channel.matches_multiplier_rules(cost_multiplier):
+            return False
+        return True
 
     @staticmethod
     def _display_info_from_row(row: dict) -> dict:
@@ -2549,7 +2571,9 @@ class ModelClientPool:
             if not upstream_id:
                 continue
             tracked = upstream_id in tracked_map
-            is_regex = cls._is_regex_hit(provider_name, public_model_id)
+            # 倍率过滤需要上游本轮声明的倍率值；先取出来给命中判定用（后面落库也用它）。
+            cost_multiplier = cls._cost_multiplier_from_row(model)
+            is_regex = cls._is_regex_hit(provider_name, public_model_id, cost_multiplier)
             if tracked:
                 # 库里有这行：两个名字都是库内现名，规则只作用于新进模型，不追溯改名。
                 model_id = regex_model_id = tracked_map[upstream_id]
@@ -2565,8 +2589,7 @@ class ModelClientPool:
             extra_info = cls._display_info_from_row(model)
             # 积分倍率是独立列：spec 顶层 _cost_multiplier → 行顶层 cost_multiplier
             # （非下划线键，不会被收进 extra_config 展示快照）。上游没声明就不带这个键，
-            # 前端据此保留库内手填值，不臆造 1.0。
-            cost_multiplier = cls._cost_multiplier_from_row(model)
+            # 前端据此保留库内手填值，不臆造 1.0。已在上面算过（给 _is_regex_hit 用）。
             rows.append({
                 "upstream_model_id": upstream_id,
                 "model_id": model_id,
@@ -5890,6 +5913,7 @@ class ModelClientPool:
                     "image_generation": "image",
                     "video_generation": "video",
                     "tts_generation": "speech",
+                    "embedding": "embedding",
                 }.get(operation or "", "chat")
                 channel_protocol_candidates = None
                 if operation_kind == "chat" and channel is not None:
